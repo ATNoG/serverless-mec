@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: live-capture
+  labels:
+    app: live-capture
+spec:
+  selector:
+    matchLabels:
+      app: live-capture
+  template:
+    metadata:
+      labels:
+        app: live-capture
+    spec:
+      # See all node interfaces and get node network namespace
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: user-container
+          image: pmacoutinho/its-live-capture:latest
+          env:
+            - name: IFACE
+              value: "eth0"  # capture from all host interfaces
+            - name: BPF
+              value: "(ether proto 0x8947 or (vlan and ether[16:2]==0x8947)) or udp port 2001"
+            - name: LOG_EVERY
+              value: "10"
+            - name: CE_TYPE
+              value: "its.cam"
+            # Optional: include full frame hex in NDJSON (can be large)
+            #- name: INCLUDE_RAW_HEX
+            #  value: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_RAW"]   # needed for AF_PACKET capture
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: varlog
+          emptyDir: {}

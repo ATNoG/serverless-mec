@@ -1,0 +1,16 @@
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: cam-stationtype-5
+  namespace: default
+spec:
+  broker: default
+  filters:
+    - exact:
+        type: its.cam
+        stationtype: "5"
+  subscriber:
+    ref:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      name: cam-stationtype-5-logger

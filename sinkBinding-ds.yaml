@@ -1,0 +1,17 @@
+apiVersion: sources.knative.dev/v1
+kind: SinkBinding
+metadata:
+  name: cam-sniffer-sink
+  namespace: default
+spec:
+  sink:
+    ref:
+      apiVersion: eventing.knative.dev/v1
+      kind: Broker
+      name: default
+      namespace: default
+  subject:
+    apiVersion: apps/v1
+    kind: DaemonSet
+    name: live-capture
+    namespace: default
