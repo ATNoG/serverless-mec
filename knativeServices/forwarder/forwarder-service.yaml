@@ -1,0 +1,28 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: mqtt-forwarder
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"
+    spec:
+      containers:
+        - image: pmacoutinho/mqtt-forwarder:latest
+          env:
+            - name: MQTT_HOST
+              value: mosquitto.default.svc.cluster.local
+            - name: MQTT_PORT
+              value: "1883"
+            - name: MQTT_QOS
+              value: "0"
+            - name: MQTT_RETAIN
+              value: "false"
+            - name: MQTT_TOPIC_TEMPLATE
+              value: "its/{type}/st{stationtype}"
+            - name: PUBLISH_MODE
+              value: "data"   # or "event"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }

@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mosquitto
+  labels: { app: mosquitto }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mosquitto }
+  template:
+    metadata:
+      labels: { app: mosquitto }
+    spec:
+      containers:
+        - name: mosquitto
+          image: eclipse-mosquitto:2
+          ports:
+            - containerPort: 1883
+          volumeMounts:
+            - name: cfg
+              mountPath: /mosquitto/config
+          readinessProbe:
+            tcpSocket: { port: 1883 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+      volumes:
+        - name: cfg
+          configMap:
+            name: mosquitto-config
+            items:
+              - key: mosquitto.conf
+                path: mosquitto.conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mosquitto
+  labels: { app: mosquitto }
+spec:
+  selector: { app: mosquitto }
+  ports:
+    - name: mqtt
+      port: 1883
+      targetPort: 1883
+      protocol: TCP
