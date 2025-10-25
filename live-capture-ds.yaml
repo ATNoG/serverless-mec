@@ -20,7 +20,7 @@ spec:
         runAsUser: 0
       containers:
         - name: user-container
-          image: pmacoutinho/its-live-capture:latest
+          image: ghcr.io/pmacoutinho/its-live-capture:latest
           env:
             - name: IFACE
               value: "eth0"  # capture from all host interfaces

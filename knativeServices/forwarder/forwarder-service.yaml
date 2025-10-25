@@ -9,7 +9,7 @@ spec:
         autoscaling.knative.dev/minScale: "1"
     spec:
       containers:
-        - image: pmacoutinho/mqtt-forwarder:latest
+        - image: ghcr.io/pmacoutinho/mqtt-forwarder:latest
           env:
             - name: MQTT_HOST
               value: mosquitto.default.svc.cluster.local
