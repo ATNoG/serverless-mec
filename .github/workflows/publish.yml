@@ -85,6 +85,21 @@ jobs:
       - name: Inspect image manifest
         run: docker buildx imagetools inspect "${{ matrix.image }}:${{ github.ref_name }}"
 
+      - name: Select primary tag for checks
+        id: picktag
+        run: |
+          first_tag="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
+          echo "tag=$first_tag" >> "$GITHUB_OUTPUT"
+
+      # Fail fast if either arch is missing in the manifest list
+      - name: Verify multi-arch (amd64 + arm64 present)
+        run: |
+          docker buildx imagetools inspect "${{ steps.picktag.outputs.tag }}" > inspect.txt
+          echo "Inspecting: ${{ steps.picktag.outputs.tag }}"
+          grep -q 'linux/amd64' inspect.txt || { echo "::error::linux/amd64 not present in manifest"; cat inspect.txt; exit 1; }
+          grep -q 'linux/arm64' inspect.txt || { echo "::error::linux/arm64 not present in manifest"; cat inspect.txt; exit 1; }
+          echo "✅ linux/amd64 and linux/arm64 found."
+
       # Nice summary in the Actions UI with image, digest, and tags
       - name: Publish summary
         run: |
