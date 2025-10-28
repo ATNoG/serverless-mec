@@ -19,6 +19,7 @@ BPF = os.getenv(
     "BPF",
     "(ether proto 0x8947 or (vlan and ether[16:2]==0x8947)) or udp port 2001",
 )
+DISPLAY_FILTER = os.getenv("DISPLAY_FILTER", "").strip() or None
 LOG_EVERY = int(os.getenv("LOG_EVERY", "10"))
 CE_TYPE = os.getenv("CE_TYPE", "its.cam")
 INCLUDE_RAW_HEX = os.getenv("INCLUDE_RAW_HEX", "").lower() in ("1", "true", "yes")
@@ -161,8 +162,13 @@ def run_live():
     # You can add additional '-o' preferences here if needed.
     custom_params = ["-p"]
 
-    cap = pyshark.LiveCapture(interface=IFACE, bpf_filter=BPF, custom_parameters=custom_params)
 
+    cap = pyshark.LiveCapture(
+        interface=IFACE,
+        bpf_filter=BPF,
+        display_filter=DISPLAY_FILTER,
+        custom_parameters=custom_params,
+    )
     processed = 0
     outfile_path = "/var/log/cam.ndjson"
     # Keep the file open for append; if log shipping is used, you can write to stdout instead.
