@@ -3,7 +3,7 @@ import os
 import sys
 import json
 import uuid
-import shutil
+import time
 import logging
 from datetime import datetime, timezone
 
@@ -14,18 +14,15 @@ from cloudevents.http import CloudEvent, to_structured  # official SDK
 # -------------------------
 # Config via environment
 # -------------------------
-IFACE = os.getenv("IFACE", "eth0").strip()
+IFACE = os.getenv("IFACE", "eth0")
 BPF = os.getenv(
     "BPF",
     "(ether proto 0x8947 or (vlan and ether[16:2]==0x8947)) or udp port 2001",
-).strip()
-DISPLAY_FILTER = os.getenv("DISPLAY_FILTER", "").strip() or None
+)
 LOG_EVERY = int(os.getenv("LOG_EVERY", "10"))
 CE_TYPE = os.getenv("CE_TYPE", "its.cam")
 INCLUDE_RAW_HEX = os.getenv("INCLUDE_RAW_HEX", "").lower() in ("1", "true", "yes")
 SINK_URL = os.getenv("K_SINK", "").strip()
-STDOUT_NDJSON = os.getenv("STDOUT_NDJSON", "1") in ("1", "true", "yes")
-PROMISCUOUS = os.getenv("PROMISCUOUS", "0") in ("1", "true", "yes")
 
 # Generate a reasonable CloudEvent source string
 HOST_ID = os.getenv("K8S_NODE_NAME") or os.getenv("NODE_NAME") or os.getenv("HOSTNAME") or "host"
@@ -48,7 +45,11 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 def _val_to_str(x):
+    """
+    Convert a pyshark field value to a printable JSON-safe value.
+    """
     try:
+        # pyshark LayerField often has .show or .showname_value / .value
         if hasattr(x, "show"):
             return x.show
         if hasattr(x, "showname_value"):
@@ -57,9 +58,13 @@ def _val_to_str(x):
             return x.value
     except Exception:
         pass
+    # Fallback
     return str(x)
 
 def extract_layer_fields(layer) -> dict:
+    """
+    Extract all fields from a pyshark layer (e.g., 'its') into a dict.
+    """
     out = {}
     names = getattr(layer, "field_names", []) or []
     for name in names:
@@ -67,26 +72,37 @@ def extract_layer_fields(layer) -> dict:
         if v is None:
             continue
         if isinstance(v, list):
-            out[name] = _val_to_str(v[0]) if len(v) == 1 else [_val_to_str(e) for e in v]
+            if len(v) == 1:
+                out[name] = _val_to_str(v[0])
+            else:
+                out[name] = [_val_to_str(e) for e in v]
         else:
             out[name] = _val_to_str(v)
     return out
 
 def packet_to_record(pkt) -> dict | None:
+    """
+    Build the NDJSON record for a packet (only if it has an ITS layer).
+    """
+    # Require the ITS dissector layer
     try:
         its_layer = pkt["its"]
     except KeyError:
         return None
 
+    cam_fields = extract_layer_fields(its_layer)
+
     rec = {
         "timestamp": now_iso(),
-        "frame_number": getattr(pkt, "number", None),
+        "frame_number": getattr(pkt, "number", None) or getattr(pkt, "frame_info", {}).number if hasattr(pkt, "frame_info") else None,
         "cam_layer": "its",
-        "cam_fields": extract_layer_fields(its_layer),
+        "cam_fields": cam_fields,
     }
 
     if INCLUDE_RAW_HEX:
+        # Best effort: raw frame hex via packet layers
         try:
+            # pyshark can expose frame_raw in some versions; otherwise skip
             raw = getattr(pkt.frame_raw, "value", None)
             if raw:
                 rec["frame_raw_hex"] = raw
@@ -103,6 +119,10 @@ SESSION = requests.Session()
 def post_cloudevent_structured(sink_url: str, event_type: str, source: str, data: dict,
                                subject: str | None = None, event_id: str | None = None,
                                event_time: str | None = None, timeout: float = 5.0):
+    """
+    Send a structured CloudEvent using the official SDK.
+    Promotes cam_fields.stationtype into a CE extension (stationtype)
+    """
     st = None
     try:
         st = data.get("cam_fields", {}).get("stationtype")
@@ -119,13 +139,13 @@ def post_cloudevent_structured(sink_url: str, event_type: str, source: str, data
     }
     if subject:
         attrs["subject"] = subject
-        
+
     # Add as CloudEvent extension (must be lowercase key)
     if st is not None:
         attrs["stationtype"] = str(st)
 
     event = CloudEvent(attrs, data)
-    headers, body = to_structured(event)
+    headers, body = to_structured(event)  # sets Content-Type: application/cloudevents+json
     resp = SESSION.post(sink_url, headers=headers, data=body, timeout=timeout)
     resp.raise_for_status()
 
@@ -133,33 +153,19 @@ def post_cloudevent_structured(sink_url: str, event_type: str, source: str, data
 # Live capture loop
 # -------------------------
 def run_live():
-    # Diagnostics
-    tshark_path = shutil.which("tshark")
-    if not tshark_path:
-        log.error("tshark is not installed in the image. Please ensure 'tshark' is present.")
-    log.info(f">> LIVE capture iface='{IFACE}' promisc={'on' if PROMISCUOUS else 'off'}")
-    log.info(f">> BPF='{BPF}'")
-    if DISPLAY_FILTER:
-        log.info(f">> DISPLAY_FILTER='{DISPLAY_FILTER}'")
     sink_on = bool(SINK_URL)
-    log.info(f">> CloudEvents sink: {'on' if sink_on else 'off'} -> {SINK_URL or '-'}")
+    log.info(f">> LIVE capture iface='{IFACE}' bpf='{BPF}' sink={'on' if sink_on else 'off'}")
 
-    # Build custom parameters; toggle promiscuous with env
     # tshark params:
     # -p : disable promiscuous mode (avoid needing NET_ADMIN)
-    custom_params = []
-    if not PROMISCUOUS:
-        custom_params.append("-p")
+    # You can add additional '-o' preferences here if needed.
+    custom_params = ["-p"]
 
-    cap = pyshark.LiveCapture(
-        interface=IFACE,
-        bpf_filter=BPF,
-        display_filter=DISPLAY_FILTER,
-        custom_parameters=custom_params,
-    )
+    cap = pyshark.LiveCapture(interface=IFACE, bpf_filter=BPF, custom_parameters=custom_params)
 
     processed = 0
-    outfile_path = os.getenv("OUT_PATH", "/var/log/cam.ndjson")
+    outfile_path = "/var/log/cam.ndjson"
+    # Keep the file open for append; if log shipping is used, you can write to stdout instead.
     out = open(outfile_path, "a", buffering=1)
 
     try:
@@ -169,10 +175,7 @@ def run_live():
                 continue
 
             # Write NDJSON
-            line = json.dumps(rec, ensure_ascii=False)
-            out.write(line + "\n")
-            if STDOUT_NDJSON:
-                print(line, flush=True)
+            out.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
             # Post CloudEvent if configured
             if sink_on:
@@ -189,8 +192,11 @@ def run_live():
                     log.warning(f"[WARN] CloudEvent POST failed: {e}")
 
             processed += 1
-            if LOG_EVERY > 0 and processed % LOG_EVERY == 0:
+            if processed % LOG_EVERY == 0:
                 log.info(f"[{now_iso()}] processed {processed} CAM packets (file=on, sink={'on' if sink_on else 'off'})")
+
+    except KeyboardInterrupt:
+        pass
     finally:
         try:
             out.flush()
@@ -209,5 +215,5 @@ if __name__ == "__main__":
     try:
         run_live()
     except Exception as e:
-        logging.exception(e)
+        log.exception(e)
         sys.exit(1)
