@@ -39,7 +39,7 @@ spec:
             - name: STDOUT_NDJSON
               value: "1"
             - name: PROMISCUOUS
-              value: "0"
+              value: "1"
             # Optional: include full frame hex in NDJSON (can be large)
             #- name: INCLUDE_RAW_HEX
             #  value: "1"
