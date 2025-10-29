@@ -22,14 +22,24 @@ spec:
         - name: user-container
           image: ghcr.io/pmacoutinho/its-live-capture:latest
           env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: IFACE
-              value: "eth0"  # capture from all host interfaces
+              value: "any"  # capture from all host interfaces
             - name: BPF
-              value: "(ether proto 0x8947 or (vlan and ether[16:2]==0x8947)) or udp port 2001"
+              value: "((link[0:2]=0x8947 or (link[0:2]=0x8100 and link[22:2]=0x8947) or link[14:2]=0x8947 or (link[14:2]=0x8100 and link[18:2]=0x8947) or link[12:2]=0x8947 or (link[12:2]=0x8100 and link[16:2]=0x8947)) or udp port 2001)"
+            - name: DISPLAY_FILTER
+              value: ""
             - name: LOG_EVERY
               value: "10"
             - name: CE_TYPE
               value: "its.cam"
+            - name: STDOUT_NDJSON
+              value: "1"
+            - name: PROMISCUOUS
+              value: "0"
             # Optional: include full frame hex in NDJSON (can be large)
             #- name: INCLUDE_RAW_HEX
             #  value: "1"
@@ -37,7 +47,7 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-              add: ["NET_RAW"]   # needed for AF_PACKET capture
+              add: ["NET_RAW"]  # needed for AF_PACKET capture
           volumeMounts:
             - name: varlog
               mountPath: /var/log
