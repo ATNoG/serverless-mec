@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
 # Default args can be overridden by k8s args/env
-ENV IFACE=eth0 \
+ENV IFACE=any \
     BPF="ether proto 0x8947" \
     OUT_PATH=/var/log/cam.ndjson \
     LOG_EVERY=50
