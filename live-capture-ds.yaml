@@ -46,8 +46,7 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
-              drop: ["ALL"]
-              add: ["NET_RAW"]  # needed for AF_PACKET capture
+              add: ["NET_RAW", "NET_ADMIN"]  # needed for AF_PACKET capture
           volumeMounts:
             - name: varlog
               mountPath: /var/log
