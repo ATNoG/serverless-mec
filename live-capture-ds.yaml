@@ -37,16 +37,17 @@ spec:
             - name: CE_TYPE
               value: "its.cam"
             - name: STDOUT_NDJSON
-              value: "1"
+              value: "0"
             - name: PROMISCUOUS
-              value: "1"
+              value: "0"
             # Optional: include full frame hex in NDJSON (can be large)
             #- name: INCLUDE_RAW_HEX
             #  value: "1"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
-              add: ["NET_RAW", "NET_ADMIN"]  # needed for AF_PACKET capture
+              drop: ["ALL"]
+              add: ["NET_RAW"]  # needed for AF_PACKET capture
           volumeMounts:
             - name: varlog
               mountPath: /var/log
