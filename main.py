@@ -1,5 +1,6 @@
-import sys
+#!/usr/bin/env python3
 import os
+import sys
 import json
 import uuid
 import shutil
@@ -138,6 +139,9 @@ def post_cloudevent_structured(
     resp = SESSION.post(sink_url, headers=headers, data=body, timeout=timeout)
     resp.raise_for_status()
 
+# -------------------------
+# Live capture loop
+# -------------------------
 def run_live():
     # Diagnostics
     tshark_path = shutil.which("tshark")
@@ -151,9 +155,12 @@ def run_live():
         f"monitor={'on' if MONITOR else 'off'}"
     )
 
+    # If we're capturing 802.11/radiotap, the Ethernet-only BPF does not apply.
+    # Use a decode-time display filter instead so tshark/pyshark can find 'its' behind LLC/SNAP.
     bpf_effective = None if CAPTURE_80211 and BPF == ETHER_BPF_DEFAULT else (BPF or None)
     disp_effective = DISPLAY_FILTER
     if CAPTURE_80211 and disp_effective is None:
+        # Keep UDP 2001 as a fallback as well
         disp_effective = "its || udp.port == 2001"
 
     log.info(f">> BPF='{bpf_effective or '-'}'")
@@ -162,9 +169,13 @@ def run_live():
     sink_on = bool(SINK_URL)
     log.info(f">> CloudEvents sink: {'on' if sink_on else 'off'} -> {SINK_URL or '-'}")
 
+    # Build custom parameters; toggle promiscuous with env
+    # tshark params:
+    # -p : disable promiscuous mode (avoid needing NET_ADMIN)
     custom_params = []
     if not PROMISCUOUS:
         custom_params.append("-p")
+    # -I : enable monitor mode on wifi (radiotap/802.11) if supported
     if MONITOR:
         custom_params.append("-I")
 
@@ -183,11 +194,13 @@ def run_live():
             if rec is None:
                 continue
 
+            # Write NDJSON
             line = json.dumps(rec, ensure_ascii=False)
 
             if STDOUT_NDJSON:
                 print(line, flush=True)
 
+            # Post CloudEvent if configured
             if SINK_URL:
                 try:
                     post_cloudevent_structured(SINK_URL, CE_TYPE, CE_SOURCE, rec)
