@@ -6,7 +6,6 @@ import uuid
 import shutil
 import logging
 from datetime import datetime, timezone
-from typing import Optional
 
 import requests
 import pyshark
@@ -16,21 +15,17 @@ from cloudevents.http import CloudEvent, to_structured  # official SDK
 # Config via environment
 # -------------------------
 IFACE = os.getenv("IFACE", "eth0").strip()
-ETHER_BPF_DEFAULT = "(ether proto 0x8947 or (vlan and ether[16:2]==0x8947)) or udp port 2001"
-BPF = os.getenv("BPF", ETHER_BPF_DEFAULT).strip()
+BPF = os.getenv(
+    "BPF",
+    "(ether proto 0x8947 or (vlan and ether[16:2]==0x8947)) or udp port 2001",
+).strip()
 DISPLAY_FILTER = os.getenv("DISPLAY_FILTER", "").strip() or None
 LOG_EVERY = int(os.getenv("LOG_EVERY", "10"))
 CE_TYPE = os.getenv("CE_TYPE", "its.cam")
 INCLUDE_RAW_HEX = os.getenv("INCLUDE_RAW_HEX", "").lower() in ("1", "true", "yes")
 SINK_URL = os.getenv("K_SINK", "").strip()
-STDOUT_NDJSON = os.getenv("STDOUT_NDJSON", "1").lower() in ("1", "true", "yes")
-PROMISCUOUS = os.getenv("PROMISCUOUS", "0").lower() in ("1", "true", "yes")
-OUT_PATH = os.getenv("OUT_PATH", "/var/log/cam.ndjson")
-
-# Enable 802.11/radiotap live capture
-CAPTURE_80211 = os.getenv("CAPTURE_80211", "0").lower() in ("1", "true", "yes")
-# Ask tshark to enable monitor mode on supported wifi interfaces
-MONITOR = os.getenv("MONITOR", "0").lower() in ("1", "true", "yes")
+STDOUT_NDJSON = os.getenv("STDOUT_NDJSON", "1") in ("1", "true", "yes")
+PROMISCUOUS = os.getenv("PROMISCUOUS", "0") in ("1", "true", "yes")
 
 # Generate a reasonable CloudEvent source string
 HOST_ID = os.getenv("K8S_NODE_NAME") or os.getenv("NODE_NAME") or os.getenv("HOSTNAME") or "host"
@@ -53,18 +48,16 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 def _val_to_str(x):
-    # best-effort stringify pyshark field values
     try:
         if hasattr(x, "show"):
             return x.show
+        if hasattr(x, "showname_value"):
+            return x.showname_value
         if hasattr(x, "value"):
             return x.value
     except Exception:
         pass
-    try:
-        return str(x)
-    except Exception:
-        return repr(x)
+    return str(x)
 
 def extract_layer_fields(layer) -> dict:
     out = {}
@@ -74,13 +67,12 @@ def extract_layer_fields(layer) -> dict:
         if v is None:
             continue
         if isinstance(v, list):
-            out[name] = [_val_to_str(i) for i in v]
+            out[name] = _val_to_str(v[0]) if len(v) == 1 else [_val_to_str(e) for e in v]
         else:
             out[name] = _val_to_str(v)
     return out
 
-def packet_to_record(pkt) -> Optional[dict]:
-    # Expect Wireshark's "its" dissector to be present when 0x8947 is decoded
+def packet_to_record(pkt) -> dict | None:
     try:
         its_layer = pkt["its"]
     except KeyError:
@@ -108,29 +100,27 @@ def packet_to_record(pkt) -> Optional[dict]:
 # -------------------------
 SESSION = requests.Session()
 
-def post_cloudevent_structured(
-    sink_url: str,
-    event_type: str,
-    source: str,
-    data: dict,
-    timeout: float = 5.0,
-) -> None:
-    """Send JSON payload as a structured CloudEvent."""
-    # Optional extension: stationtype if available in record
+def post_cloudevent_structured(sink_url: str, event_type: str, source: str, data: dict,
+                               subject: str | None = None, event_id: str | None = None,
+                               event_time: str | None = None, timeout: float = 5.0):
     st = None
     try:
         st = data.get("cam_fields", {}).get("stationtype")
     except Exception:
-        st = None
+        pass
 
     attrs = {
         "specversion": "1.0",
         "type": event_type,
         "source": source,
-        "id": str(uuid.uuid4()),
-        "time": now_iso(),
+        "id": event_id or str(uuid.uuid4()),
+        "time": event_time or now_iso(),
         "datacontenttype": "application/json",
     }
+    if subject:
+        attrs["subject"] = subject
+        
+    # Add as CloudEvent extension (must be lowercase key)
     if st is not None:
         attrs["stationtype"] = str(st)
 
@@ -147,25 +137,10 @@ def run_live():
     tshark_path = shutil.which("tshark")
     if not tshark_path:
         log.error("tshark is not installed in the image. Please ensure 'tshark' is present.")
-
-    log.info(
-        f">> LIVE capture iface='{IFACE}' "
-        f"promisc={'on' if PROMISCUOUS else 'off'} "
-        f"802.11={'on' if CAPTURE_80211 else 'off'} "
-        f"monitor={'on' if MONITOR else 'off'}"
-    )
-
-    # If we're capturing 802.11/radiotap, the Ethernet-only BPF does not apply.
-    # Use a decode-time display filter instead so tshark/pyshark can find 'its' behind LLC/SNAP.
-    bpf_effective = None if CAPTURE_80211 and BPF == ETHER_BPF_DEFAULT else (BPF or None)
-    disp_effective = DISPLAY_FILTER
-    if CAPTURE_80211 and disp_effective is None:
-        # Keep UDP 2001 as a fallback as well
-        disp_effective = "its || udp.port == 2001"
-
-    log.info(f">> BPF='{bpf_effective or '-'}'")
-    if disp_effective:
-        log.info(f">> DISPLAY_FILTER='{disp_effective}'")
+    log.info(f">> LIVE capture iface='{IFACE}' promisc={'on' if PROMISCUOUS else 'off'}")
+    log.info(f">> BPF='{BPF}'")
+    if DISPLAY_FILTER:
+        log.info(f">> DISPLAY_FILTER='{DISPLAY_FILTER}'")
     sink_on = bool(SINK_URL)
     log.info(f">> CloudEvents sink: {'on' if sink_on else 'off'} -> {SINK_URL or '-'}")
 
@@ -175,14 +150,11 @@ def run_live():
     custom_params = []
     if not PROMISCUOUS:
         custom_params.append("-p")
-    # -I : enable monitor mode on wifi (radiotap/802.11) if supported
-    if MONITOR:
-        custom_params.append("-I")
 
     cap = pyshark.LiveCapture(
         interface=IFACE,
-        bpf_filter=bpf_effective,
-        display_filter=disp_effective,
+        bpf_filter=BPF,
+        display_filter=DISPLAY_FILTER,
         custom_parameters=custom_params,
     )
 
@@ -196,21 +168,26 @@ def run_live():
 
             # Write NDJSON
             line = json.dumps(rec, ensure_ascii=False)
-
             if STDOUT_NDJSON:
                 print(line, flush=True)
 
             # Post CloudEvent if configured
-            if SINK_URL:
+            if sink_on:
                 try:
-                    post_cloudevent_structured(SINK_URL, CE_TYPE, CE_SOURCE, rec)
+                    subject = str(rec.get("frame_number")) if rec.get("frame_number") is not None else None
+                    post_cloudevent_structured(
+                        sink_url=SINK_URL,
+                        event_type=CE_TYPE,
+                        source=CE_SOURCE,
+                        data=rec,
+                        subject=subject,
+                    )
                 except Exception as e:
-                    log.warning(f"Failed to send CloudEvent: {e}")
+                    log.warning(f"[WARN] CloudEvent POST failed: {e}")
 
             processed += 1
-            if LOG_EVERY and processed % LOG_EVERY == 0:
-                log.info(f"processed={processed}")
-
+            if LOG_EVERY > 0 and processed % LOG_EVERY == 0:
+                log.info(f"[{now_iso()}] processed {processed} CAM packets (file=on, sink={'on' if sink_on else 'off'})")
     finally:
         try:
             cap.close()
@@ -223,8 +200,6 @@ def run_live():
 if __name__ == "__main__":
     try:
         run_live()
-    except KeyboardInterrupt:
-        pass
     except Exception as e:
         logging.exception(e)
         sys.exit(1)
