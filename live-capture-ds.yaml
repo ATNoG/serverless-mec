@@ -15,13 +15,7 @@ spec:
     spec:
       # See all node interfaces and get node network namespace
       hostNetwork: true
-      dnsPolicy: None
-      dnsConfig:
-        nameservers: ["10.42.0.2"] 
-        searches:
-          - knative-eventing.svc.cluster.local
-          - svc.cluster.local
-          - cluster.local
+      dnsPolicy: ClusterFirstWithHostNet
       securityContext:
         runAsUser: 0
       containers:
@@ -33,7 +27,7 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: IFACE
-              value: "any"  # capture from all host interfaces
+              value: "cw-mon-rxa"
             - name: BPF
               value: ""
             - name: DISPLAY_FILTER
@@ -46,18 +40,16 @@ spec:
               value: "0"
             - name: PROMISCUOUS
               value: "1"
-            - name: CAPTURE_80211
-              value: "1"
-            - name: MONITOR
-              value: "0"
+            - name: K_SINK
+              value: "http://10.42.1.7:8080/default/default"
             # Optional: include full frame hex in NDJSON (can be large)
             #- name: INCLUDE_RAW_HEX
             #  value: "1"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
-              drop: ["ALL"]
-              add: ["NET_RAW", "NET_ADMIN"]  # needed for AF_PACKET capture
+              drop: ["ALL"]   
+              add: ["NET_RAW"]  # needed for AF_PACKET capture
           volumeMounts:
             - name: varlog
               mountPath: /var/log
