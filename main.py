@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 
 import requests
 import pyshark
-from cloudevents.conversion import to_structured  # official SDK
+
+from cloudevents.http import CloudEvent
+from cloudevents.conversion import to_structured
 
 # -------------------------
 # Config via environment
