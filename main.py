@@ -15,6 +15,27 @@ from cloudevents.http import CloudEvent
 from cloudevents.conversion import to_structured
 
 # -------------------------
+# Helper to resolve broker
+# -------------------------
+def resolve_kafka_broker():
+    """Try to resolve the broker service; fallback to backend pod IP."""
+    try:
+        import socket
+        socket.gethostbyname("kafka-broker-ingress.knative-eventing.svc.cluster.local")
+        return "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
+    except Exception:
+        try:
+            ip = subprocess.check_output([
+                "kubectl", "-n", "knative-eventing", "get", "endpoints",
+                "kafka-broker-ingress", "-o", "jsonpath={.subsets[*].addresses[*].ip}"
+            ]).decode().strip()
+            if ip:
+                return f"http://{ip}:8080/default/default"
+        except Exception:
+            pass
+    return None
+
+# -------------------------
 # Config via environment
 # -------------------------
 IFACE = os.getenv("IFACE", "eth0").strip()
@@ -196,27 +217,6 @@ def run_live():
             cap.close()
         except Exception:
             pass
-
-# -------------------------
-# Get the Kafka Broker for K_SINK
-# -------------------------
-def resolve_kafka_broker():
-    """Try to resolve the broker service; fallback to backend pod IP."""
-    try:
-        import socket
-        socket.gethostbyname("kafka-broker-ingress.knative-eventing.svc.cluster.local")
-        return "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
-    except Exception:
-        try:
-            ip = subprocess.check_output([
-                "kubectl", "-n", "knative-eventing", "get", "endpoints",
-                "kafka-broker-ingress", "-o", "jsonpath={.subsets[*].addresses[*].ip}"
-            ]).decode().strip()
-            if ip:
-                return f"http://{ip}:8080/default/default"
-        except Exception:
-            pass
-    return None
 
 # -------------------------
 # Main
