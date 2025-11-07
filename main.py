@@ -5,6 +5,7 @@ import json
 import uuid
 import shutil
 import logging
+import subprocess
 from datetime import datetime, timezone
 
 import requests
@@ -25,7 +26,7 @@ DISPLAY_FILTER = os.getenv("DISPLAY_FILTER", "").strip() or None
 LOG_EVERY = int(os.getenv("LOG_EVERY", "10"))
 CE_TYPE = os.getenv("CE_TYPE", "its.cam")
 INCLUDE_RAW_HEX = os.getenv("INCLUDE_RAW_HEX", "").lower() in ("1", "true", "yes")
-SINK_URL = os.getenv("K_SINK", "").strip()
+SINK_URL = SINK_URL = os.getenv("K_SINK", "").strip() or resolve_kafka_broker()
 STDOUT_NDJSON = os.getenv("STDOUT_NDJSON", "1") in ("1", "true", "yes")
 PROMISCUOUS = os.getenv("PROMISCUOUS", "0") in ("1", "true", "yes")
 
@@ -195,6 +196,27 @@ def run_live():
             cap.close()
         except Exception:
             pass
+
+# -------------------------
+# Get the Kafka Broker for K_SINK
+# -------------------------
+def resolve_kafka_broker():
+    """Try to resolve the broker service; fallback to backend pod IP."""
+    try:
+        import socket
+        socket.gethostbyname("kafka-broker-ingress.knative-eventing.svc.cluster.local")
+        return "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
+    except Exception:
+        try:
+            ip = subprocess.check_output([
+                "kubectl", "-n", "knative-eventing", "get", "endpoints",
+                "kafka-broker-ingress", "-o", "jsonpath={.subsets[*].addresses[*].ip}"
+            ]).decode().strip()
+            if ip:
+                return f"http://{ip}:8080/default/default"
+        except Exception:
+            pass
+    return None
 
 # -------------------------
 # Main
