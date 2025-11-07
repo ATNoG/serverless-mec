@@ -14,25 +14,25 @@ import pyshark
 from cloudevents.http import CloudEvent
 from cloudevents.conversion import to_structured
 
-# -------------------------
-# Helper to resolve broker
-# -------------------------
 def resolve_kafka_broker():
-    """Try to resolve the broker service; fallback to backend pod IP."""
+    import socket, requests, os
     try:
-        import socket
         socket.gethostbyname("kafka-broker-ingress.knative-eventing.svc.cluster.local")
         return "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
     except Exception:
         try:
-            ip = subprocess.check_output([
-                "kubectl", "-n", "knative-eventing", "get", "endpoints",
-                "kafka-broker-ingress", "-o", "jsonpath={.subsets[*].addresses[*].ip}"
-            ]).decode().strip()
-            if ip:
-                return f"http://{ip}:8080/default/default"
-        except Exception:
-            pass
+            token = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
+            api_server = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+            ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+            url = f"https://{api_server}/api/v1/namespaces/knative-eventing/services/kafka-broker-ingress"
+            resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, verify=ca_path, timeout=3)
+            resp.raise_for_status()
+            svc = resp.json()
+            cluster_ip = svc["spec"].get("clusterIP")
+            if cluster_ip:
+                return f"http://{cluster_ip}/default/default"
+        except Exception as e:
+            print(f"API-based broker resolution failed: {e}")
     return None
 
 # -------------------------
