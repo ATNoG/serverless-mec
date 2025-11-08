@@ -40,10 +40,8 @@ spec:
               value: "0"
             - name: PROMISCUOUS
               value: "1"
-            - name: K8S_NODE_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.hostIP
+            - name: K_SINK
+              value: "http://10.42.1.7:8080/default/default"
             # Optional: include full frame hex in NDJSON (can be large)
             #- name: INCLUDE_RAW_HEX
             #  value: "1"

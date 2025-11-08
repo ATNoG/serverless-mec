@@ -14,27 +14,6 @@ import pyshark
 from cloudevents.http import CloudEvent
 from cloudevents.conversion import to_structured
 
-def resolve_kafka_broker():
-    import socket, requests, os
-    try:
-        socket.gethostbyname("kafka-broker-ingress.knative-eventing.svc.cluster.local")
-        return "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
-    except Exception:
-        try:
-            token = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
-            api_server = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
-            ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-            url = f"https://{api_server}/api/v1/namespaces/knative-eventing/services/kafka-broker-ingress"
-            resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, verify=ca_path, timeout=3)
-            resp.raise_for_status()
-            svc = resp.json()
-            cluster_ip = svc["spec"].get("clusterIP")
-            if cluster_ip:
-                return f"http://{cluster_ip}/default/default"
-        except Exception as e:
-            print(f"API-based broker resolution failed: {e}")
-    return None
-
 # -------------------------
 # Config via environment
 # -------------------------
@@ -47,7 +26,7 @@ DISPLAY_FILTER = os.getenv("DISPLAY_FILTER", "").strip() or None
 LOG_EVERY = int(os.getenv("LOG_EVERY", "10"))
 CE_TYPE = os.getenv("CE_TYPE", "its.cam")
 INCLUDE_RAW_HEX = os.getenv("INCLUDE_RAW_HEX", "").lower() in ("1", "true", "yes")
-SINK_URL = SINK_URL = os.getenv("K_SINK", "").strip() or resolve_kafka_broker()
+SINK_URL = SINK_URL = os.getenv("K_SINK", "").strip()
 STDOUT_NDJSON = os.getenv("STDOUT_NDJSON", "1") in ("1", "true", "yes")
 PROMISCUOUS = os.getenv("PROMISCUOUS", "0") in ("1", "true", "yes")
 
