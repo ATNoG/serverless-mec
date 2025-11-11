@@ -26,7 +26,7 @@ DISPLAY_FILTER = os.getenv("DISPLAY_FILTER", "").strip() or None
 LOG_EVERY = int(os.getenv("LOG_EVERY", "10"))
 CE_TYPE = os.getenv("CE_TYPE", "its.cam")
 INCLUDE_RAW_HEX = os.getenv("INCLUDE_RAW_HEX", "").lower() in ("1", "true", "yes")
-SINK_URL = SINK_URL = os.getenv("K_SINK", "").strip()
+SINK_URL = os.getenv("K_SINK", "").strip()
 STDOUT_NDJSON = os.getenv("STDOUT_NDJSON", "1") in ("1", "true", "yes")
 PROMISCUOUS = os.getenv("PROMISCUOUS", "0") in ("1", "true", "yes")
 
