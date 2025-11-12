@@ -7,6 +7,7 @@ import shutil
 import logging
 import subprocess
 from datetime import datetime, timezone
+import threading
 
 import requests
 import pyshark
@@ -31,7 +32,12 @@ STDOUT_NDJSON = os.getenv("STDOUT_NDJSON", "1") in ("1", "true", "yes")
 PROMISCUOUS = os.getenv("PROMISCUOUS", "0") in ("1", "true", "yes")
 
 # Generate a reasonable CloudEvent source string
-HOST_ID = os.getenv("K8S_NODE_NAME") or os.getenv("NODE_NAME") or os.getenv("HOSTNAME") or "host"
+HOST_ID = (
+    os.getenv("K8S_NODE_NAME")
+    or os.getenv("NODE_NAME")
+    or os.getenv("HOSTNAME")
+    or "host"
+)
 CE_SOURCE = f"sniffer://{HOST_ID}/{IFACE}"
 
 # -------------------------
@@ -103,9 +109,16 @@ def packet_to_record(pkt) -> dict | None:
 # -------------------------
 SESSION = requests.Session()
 
-def post_cloudevent_structured(sink_url: str, event_type: str, source: str, data: dict,
-                               subject: str | None = None, event_id: str | None = None,
-                               event_time: str | None = None, timeout: float = 5.0):
+def post_cloudevent_structured(
+    sink_url: str,
+    event_type: str,
+    source: str,
+    data: dict,
+    subject: str | None = None,
+    event_id: str | None = None,
+    event_time: str | None = None,
+    timeout: float = 5.0,
+):
     st = None
     try:
         st = data.get("cam_fields", {}).get("stationtype")
@@ -122,7 +135,7 @@ def post_cloudevent_structured(sink_url: str, event_type: str, source: str, data
     }
     if subject:
         attrs["subject"] = subject
-        
+
     # Add as CloudEvent extension (must be lowercase key)
     if st is not None:
         attrs["stationtype"] = str(st)
@@ -133,10 +146,61 @@ def post_cloudevent_structured(sink_url: str, event_type: str, source: str, data
     resp.raise_for_status()
 
 # -------------------------
-# Live capture loop
+# Capture logic
 # -------------------------
+def capture_on_interface(iface):
+    """Capture packets from a single interface in its own thread."""
+    log.info(f">> Starting capture on interface '{iface}'")
+
+    custom_params = []
+    if not PROMISCUOUS:
+        custom_params.append("-p")
+
+    cap = pyshark.LiveCapture(
+        interface=iface,
+        bpf_filter=BPF,
+        display_filter=DISPLAY_FILTER,
+        custom_parameters=custom_params,
+    )
+
+    processed = 0
+    sink_on = bool(SINK_URL)
+
+    try:
+        for pkt in cap.sniff_continuously():
+            rec = packet_to_record(pkt)
+            if rec is None:
+                continue
+
+            line = json.dumps(rec, ensure_ascii=False)
+            if STDOUT_NDJSON:
+                print(line, flush=True)
+
+            if sink_on:
+                try:
+                    subject = str(rec.get("frame_number")) if rec.get("frame_number") else None
+                    post_cloudevent_structured(
+                        sink_url=SINK_URL,
+                        event_type=CE_TYPE,
+                        source=f"sniffer://{HOST_ID}/{iface}",
+                        data=rec,
+                        subject=subject,
+                    )
+                except Exception as e:
+                    log.warning(f"[{iface}] CloudEvent POST failed: {e}")
+
+            processed += 1
+            if LOG_EVERY > 0 and processed % LOG_EVERY == 0:
+                log.info(
+                    f"[{now_iso()}] [{iface}] processed {processed} CAM packets (sink={'on' if sink_on else 'off'})"
+                )
+    finally:
+        try:
+            cap.close()
+        except Exception:
+            pass
+
 def run_live():
-    # Diagnostics
     tshark_path = shutil.which("tshark")
     if not tshark_path:
         log.error("tshark is not installed in the image. Please ensure 'tshark' is present.")
@@ -147,55 +211,25 @@ def run_live():
     sink_on = bool(SINK_URL)
     log.info(f">> CloudEvents sink: {'on' if sink_on else 'off'} -> {SINK_URL or '-'}")
 
-    # Build custom parameters; toggle promiscuous with env
-    # tshark params:
-    # -p : disable promiscuous mode (avoid needing NET_ADMIN)
-    custom_params = []
-    if not PROMISCUOUS:
-        custom_params.append("-p")
-
-    cap = pyshark.LiveCapture(
-        interface=IFACE,
-        bpf_filter=BPF,
-        display_filter=DISPLAY_FILTER,
-        custom_parameters=custom_params,
-    )
-
-    processed = 0
-
-    try:
-        for pkt in cap.sniff_continuously():
-            rec = packet_to_record(pkt)
-            if rec is None:
-                continue
-
-            # Write NDJSON
-            line = json.dumps(rec, ensure_ascii=False)
-            if STDOUT_NDJSON:
-                print(line, flush=True)
-
-            # Post CloudEvent if configured
-            if sink_on:
-                try:
-                    subject = str(rec.get("frame_number")) if rec.get("frame_number") is not None else None
-                    post_cloudevent_structured(
-                        sink_url=SINK_URL,
-                        event_type=CE_TYPE,
-                        source=CE_SOURCE,
-                        data=rec,
-                        subject=subject,
-                    )
-                except Exception as e:
-                    log.warning(f"[WARN] CloudEvent POST failed: {e}")
-
-            processed += 1
-            if LOG_EVERY > 0 and processed % LOG_EVERY == 0:
-                log.info(f"[{now_iso()}] processed {processed} CAM packets (file=on, sink={'on' if sink_on else 'off'})")
-    finally:
-        try:
-            cap.close()
-        except Exception:
-            pass
+    # detect and capture on multiple interfaces if IFACE == "*"
+    if IFACE == "*":
+        log.info(">> Enumerating all available interfaces for capture...")
+        all_interfaces = pyshark.LiveCapture().interfaces
+        interfaces = [i for i in all_interfaces if i != "lo"]
+        if not interfaces:
+            log.error("No interfaces found for capture.")
+            return
+        log.info(f">> Capturing on interfaces: {interfaces}")
+        threads = []
+        for iface in interfaces:
+            t = threading.Thread(target=capture_on_interface, args=(iface,), daemon=True)
+            t.start()
+            threads.append(t)
+        # keep main thread alive
+        for t in threads:
+            t.join()
+    else:
+        capture_on_interface(IFACE)
 
 # -------------------------
 # Main
