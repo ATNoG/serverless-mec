@@ -40,8 +40,6 @@ spec:
               value: "0"
             - name: PROMISCUOUS
               value: "1"
-            - name: K_SINK
-              value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
             # Optional: include full frame hex in NDJSON (can be large)
             #- name: INCLUDE_RAW_HEX
             #  value: "1"
