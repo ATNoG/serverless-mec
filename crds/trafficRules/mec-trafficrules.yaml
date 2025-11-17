@@ -1,0 +1,26 @@
+# File: mec-trafficrules.yaml
+apiVersion: mec.etsi.org/v1alpha1
+kind: TrafficRule
+metadata:
+  name: live-capture-cam-traffic
+  namespace: default
+spec:
+  trafficRuleId: "live-capture-cam-traffic"
+  filterType: "FLOW"
+  priority: 200
+  trafficFilter:
+    srcAddress: []
+    dstAddress: []
+    srcPort: []
+    dstPort: []
+    protocol:
+      - "UDP"
+    dscp: []
+    direction: "BIDIRECTIONAL"
+    tunnelInfo: {}
+  action: "DUPLICATE_AS_IS"
+  dstInterface:
+    interfaceType: "TRUSTED"
+  applicationRef:
+    name: "live-capture"
+    namespace: "default"

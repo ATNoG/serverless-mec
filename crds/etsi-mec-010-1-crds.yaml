@@ -1,0 +1,329 @@
+# ---------------------------------------------
+# MobileEdgeApplication (ETSI: MobileEdgeApplication IOC)
+# ---------------------------------------------
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: mobileedgeapplications.mec.etsi.org
+spec:
+  group: mec.etsi.org
+  scope: Namespaced
+  names:
+    plural: mobileedgeapplications
+    singular: mobileedgeapplication
+    kind: MobileEdgeApplication
+    shortNames: [mea, meapp]
+    categories: [mec]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: AppState
+          type: string
+          jsonPath: .status.appState
+        - name: Instantiation
+          type: string
+          jsonPath: .status.instantiationState
+        - name: Operational
+          type: string
+          jsonPath: .status.operationalState
+        - name: Provider
+          type: string
+          jsonPath: .spec.appProvider
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              description: "Attributes taken from ETSI GS MEC 010-1 MobileEdgeApplication."
+              required:
+                - appDId
+                - appName
+                - appProvider
+                - appSoftVersion
+                - appDVersion
+              properties:
+                appDId:
+                  type: string
+                  description: "Identifier of the mobile edge application descriptor (appDId)."
+                appName:
+                  type: string
+                  description: "Human readable name of the MEC application."
+                appProvider:
+                  type: string
+                  description: "Provider of the MEC application."
+                appSoftVersion:
+                  type: string
+                  description: "Version of the MEC application software."
+                appDVersion:
+                  type: string
+                  description: "Version of the application descriptor."
+                appInfoName:
+                  type: string
+                  description: "Human readable product name."
+                appDescription:
+                  type: string
+                  description: "Human readable description of the MEC application."
+                appInstanceId:
+                  type: string
+                  description: "Application instance identifier."
+                # Relationships per 010-1: usedTrafficRule / usedDNSRule / related*Services
+                usedTrafficRules:
+                  type: array
+                  description: "References to TrafficRule resources used by this app (active rules only)."
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                usedDNSRules:
+                  type: array
+                  description: "References to DNSRule resources used by this app (active rules only)."
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                relatedMepServices:
+                  type: array
+                  description: "Mobile edge platform services related to this application."
+                  items:
+                    type: string
+                relatedMeaServices:
+                  type: array
+                  description: "Mobile edge application services related to this application."
+                  items:
+                    type: string
+            status:
+              type: object
+              description: "Lifecycle per 010-1: instantiationState, appState, operationalState."
+              properties:
+                instantiationState:
+                  type: string
+                  enum: ["NOT_INSTANTIATED", "INSTANTIATED"]
+                appState:
+                  type: string
+                  enum: ["STARTED", "STOPPED"]
+                  description: "When NOT_INSTANTIATED, this may be absent."
+                operationalState:
+                  type: string
+                  enum: ["ACTIVE", "INACTIVE"]
+                  description: "READ-ONLY indicator of operational state."
+---
+# ---------------------------------------------
+# TrafficRule (ETSI: TrafficRule IOC)
+# ---------------------------------------------
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: trafficrules.mec.etsi.org
+spec:
+  group: mec.etsi.org
+  scope: Namespaced
+  names:
+    plural: trafficrules
+    singular: trafficrule
+    kind: TrafficRule
+    shortNames: [trule, trafrule]
+    categories: [mec]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: App
+          type: string
+          jsonPath: .spec.applicationRef.name
+        - name: Priority
+          type: integer
+          jsonPath: .spec.priority
+        - name: FilterType
+          type: string
+          jsonPath: .spec.filterType
+        - name: Action
+          type: string
+          jsonPath: .spec.action
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              description: "Filter rule specifying which IP packets are redirected to the associated application."
+              required: [trafficRuleId, filterType, priority, trafficFilter, action, dstInterface, applicationRef]
+              properties:
+                trafficRuleId:
+                  type: string
+                  description: "Identifier of the traffic rule."
+                filterType:
+                  type: string
+                  enum: ["FLOW", "PACKET"]
+                  description: "Definition of filter type."
+                priority:
+                  type: integer
+                  minimum: 0
+                  description: "Higher number wins on conflicts (per spec precedence)."
+                trafficFilter:
+                  type: object
+                  description: "STRUCT modeled after TrafficRuleDescriptor (ETSI GS MEC 010-2)."
+                  properties:
+                    srcAddress:
+                      type: array
+                      items: { type: string }
+                    dstAddress:
+                      type: array
+                      items: { type: string }
+                    srcPort:
+                      type: array
+                      items: { type: string, pattern: "^[0-9]+(-[0-9]+)?$" }
+                    dstPort:
+                      type: array
+                      items: { type: string, pattern: "^[0-9]+(-[0-9]+)?$" }
+                    protocol:
+                      type: array
+                      items: { type: string }
+                    dscp:
+                      type: array
+                      items:
+                        type: integer
+                        minimum: 0
+                        maximum: 63
+                    direction:
+                      type: string
+                      enum: ["UPLINK", "DOWNLINK", "BIDIRECTIONAL"]
+                    tunnelInfo:
+                      type: object
+                      properties:
+                        tunnelType: { type: string }
+                        tunnelDstAddress: { type: string }
+                        tunnelSrcAddress: { type: string }
+                        gtpTEID: { type: string }
+                action:
+                  type: string
+                  enum:
+                    - "DROP"
+                    - "FORWARD"
+                    - "DECAPSULATED"
+                    - "FORWARD_AS_IS"
+                    - "PASSTHROUGH"
+                    - "DUPLICATED_DECAPSULATED"
+                    - "DUPLICATE_AS_IS"
+                  description: "Action applied when the filter matches."
+                dstInterface:
+                  type: object
+                  description: "Destination interface (modeled after DstInterface in 010-2)."
+                  required: [interfaceType]
+                  properties:
+                    interfaceType:
+                      type: string
+                      description: "e.g., 'TUNNEL', 'N6_LAN', 'TRUSTED'."
+                    tunnelInfo:
+                      type: object
+                      properties:
+                        tunnelType: { type: string }
+                        localAddress: { type: string }
+                        remoteAddress: { type: string }
+                        gtpTEID: { type: string }
+                applicationRef:
+                  type: object
+                  description: "The MobileEdgeApplication this TrafficRule is associated with."
+                  required: [name]
+                  properties:
+                    name: { type: string }
+                    namespace: { type: string }
+            status:
+              type: object
+              properties:
+                active:
+                  type: boolean
+                  description: "Controller/Operator may set true when applied."
+---
+# ---------------------------------------------
+# DNSRule (ETSI: DNSRule IOC)
+# ---------------------------------------------
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: dnsrules.mec.etsi.org
+spec:
+  group: mec.etsi.org
+  scope: Namespaced
+  names:
+    plural: dnsrules
+    singular: dnsrule
+    kind: DNSRule
+    shortNames: [drule, dnsr]
+    categories: [mec]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: App
+          type: string
+          jsonPath: .spec.applicationRef.name
+        - name: Domain
+          type: string
+          jsonPath: .spec.domainName
+        - name: IP
+          type: string
+          jsonPath: .spec.ipAddress
+        - name: IPType
+          type: string
+          jsonPath: .spec.ipAddressType
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              description: "DNS rule specifying domain resolution toward a MobileEdgeApplication."
+              required: [dnsRuleId, domainName, ipAddressType, ipAddress, applicationRef]
+              properties:
+                dnsRuleId:
+                  type: string
+                  description: "Identifier of the DNS rule."
+                domainName:
+                  type: string
+                  description: "FQDN of the DNS rule."
+                ipAddressType:
+                  type: string
+                  enum: ["IPv4", "IPv6"]
+                  description: "Type of the IP address."
+                ipAddress:
+                  type: string
+                  description: "Address to which the domain resolves."
+                timeToLive:
+                  type: integer
+                  minimum: 0
+                  description: "TTL (optional in the spec)."
+                applicationRef:
+                  type: object
+                  description: "The MobileEdgeApplication this DNSRule is associated with."
+                  required: [name]
+                  properties:
+                    name: { type: string }
+                    namespace: { type: string }
+            status:
+              type: object
+              properties:
+                active:
+                  type: boolean
+                  description: "Controller/Operator may set true when applied."
