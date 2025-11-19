@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY sniffer.py .
 
 ENV IFACE=eth0 \
     BPF="ether proto 0x8947" \
