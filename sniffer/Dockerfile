@@ -16,4 +16,4 @@ ENV IFACE=eth0 \
     BPF="ether proto 0x8947" \
     LOG_EVERY=50
 
-ENTRYPOINT ["python", "main.py"]
+ENTRYPOINT ["python", "sniffer.py"]
