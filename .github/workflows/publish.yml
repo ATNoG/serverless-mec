@@ -27,7 +27,7 @@ jobs:
         include:
           - name: its-live-capture
             context: ./
-            file: ./Dockerfile
+            file: ./sniffer/Dockerfile
             image: ghcr.io/pmacoutinho/its-live-capture
 
           - name: mqtt-forwarder
