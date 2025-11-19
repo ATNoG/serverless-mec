@@ -103,21 +103,36 @@ spec:
                     type: string
                 relatedMeaServices:
                   type: array
-                  description: "Mobile edge application services related to this application."
                   items:
                     type: string
-                workloadRef:
+                service:
                   type: object
-                  description: "Optional reference to the Kubernetes workload implementing this MobileEdgeApplication (vendor-specific extension; not defined in ETSI GS MEC 010-1)."
+                  description: "Vendor-specific Knative configuration used to realize this MEC application as a Knative Service and Trigger (not defined in ETSI GS MEC 010-1)."
                   properties:
-                    apiVersion:
-                      type: string
-                    kind:
-                      type: string
-                    name:
-                      type: string
-                    namespace:
-                      type: string
+                    container:
+                      type: object
+                      description: "Container configuration for the Knative Service implementing this MEC application."
+                      required: [image]
+                      properties:
+                        image:
+                          type: string
+                          description: "Container image for the Knative Service."
+                        env:
+                          type: array
+                          description: "Optional environment variables to inject into the container."
+                          items:
+                            type: object
+                            required: [name, value]
+                            properties:
+                              name:
+                                type: string
+                              value:
+                                type: string
+                    filterAttributes:
+                      type: object
+                      description: "Filters for the Knative Trigger (maps to spec.filter.attributes)."
+                      additionalProperties:
+                        type: string
             status:
               type: object
               description: "Lifecycle per 010-1: instantiationState, appState, operationalState."

@@ -2,50 +2,23 @@
 apiVersion: mec.etsi.org/v1alpha1
 kind: MobileEdgeApplication
 metadata:
-  name: live-capture
-  namespace: default
-spec:
-  appDId: "live-capture-appd-v1"
-  appName: "live-capture"
-  appProvider: "example.mec"
-  appSoftVersion: "1.0.0"
-  appDVersion: "1.0.0"
-  appInfoName: "Live CAM Packet Capture"
-  appDescription: "DaemonSet that captures CAM messages from node interfaces and emits CloudEvents (type its.cam) to the Knative Kafka Broker 'default'."
-  appInstanceId: "live-capture-ds-default"
-  usedTrafficRules:
-    - name: live-capture-cam-traffic
-      namespace: default
-  relatedMepServices:
-    - knative-kafka-broker.default
-  relatedMeaServices:
-    - cam-logger
-  workloadRef:
-    apiVersion: apps/v1
-    kind: DaemonSet
-    name: live-capture
-    namespace: default
----
-apiVersion: mec.etsi.org/v1alpha1
-kind: MobileEdgeApplication
-metadata:
   name: cam-logger
   namespace: default
 spec:
+  # --- ETSI bits ---
   appDId: "cam-logger-appd-v1"
   appName: "cam-logger"
   appProvider: "example.mec"
   appSoftVersion: "1.0.0"
   appDVersion: "1.0.0"
   appInfoName: "CAM Event Logger"
-  appDescription: "Knative Service that receives filtered CAM CloudEvents (type its.cam) from the Knative Kafka Broker 'default' and logs them."
-  appInstanceId: "cam-logger-svc-default"
-  relatedMepServices:
-    - knative-kafka-broker.default
-  relatedMeaServices:
-    - live-capture
-  workloadRef:
-    apiVersion: serving.knative.dev/v1
-    kind: Service
-    name: cam-logger
-    namespace: default
+  appDescription: "Receives CAM CloudEvents and logs them."
+  # --- Vendor-specific block ---
+  service:
+    container:
+      image: gcr.io/knative-releases/knative.dev/eventing/cmd/event_display
+      env:
+        - name: LOG_FORMAT
+          value: "pretty"
+    filterAttributes:
+      type: its.cam
