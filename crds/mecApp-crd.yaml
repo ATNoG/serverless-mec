@@ -1,18 +1,18 @@
 # File: mecApp-crd.yaml
 # ---------------------------------------------
-# MobileEdgeApplication (ETSI: MobileEdgeApplication IOC)
+# EdgeApplication (ETSI: EdgeApplication IOC)
 # ---------------------------------------------
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: mobileedgeapplications.mec.etsi.org
+  name: edgeapplications.mec.atnog.org
 spec:
-  group: mec.etsi.org
+  group: mec.atnog.org
   scope: Namespaced
   names:
-    plural: mobileedgeapplications
-    singular: mobileedgeapplication
-    kind: MobileEdgeApplication
+    plural: edgeapplications
+    singular: edgeapplication
+    kind: EdgeApplication
     shortNames: [mea, meapp]
     categories: [mec]
   versions:
@@ -41,36 +41,36 @@ spec:
           properties:
             spec:
               type: object
-              description: "Attributes taken from ETSI GS MEC 010-1 MobileEdgeApplication."
+              description: "Attributes taken from ETSI GS MEC 010-1 EdgeApplication."
               required:
-                - appDId
-                - appName
-                - appProvider
-                - appSoftVersion
-                - appDVersion
+                - dId
+                - name
+                - provider
+                - softVersion
+                - dVersion
               properties:
-                appDId:
+                dId:
                   type: string
-                  description: "Identifier of the mobile edge application descriptor (appDId)."
-                appName:
+                  description: "Identifier of the edge application descriptor (dId)."
+                name:
                   type: string
                   description: "Human readable name of the MEC application."
-                appProvider:
+                provider:
                   type: string
                   description: "Provider of the MEC application."
-                appSoftVersion:
+                softVersion:
                   type: string
                   description: "Version of the MEC application software."
-                appDVersion:
+                dVersion:
                   type: string
                   description: "Version of the application descriptor."
-                appInfoName:
+                infoName:
                   type: string
                   description: "Human readable product name."
-                appDescription:
+                description:
                   type: string
                   description: "Human readable description of the MEC application."
-                appInstanceId:
+                instanceId:
                   type: string
                   description: "Application instance identifier."
                 # Relationships per 010-1: usedTrafficRule / usedDNSRule / related*Services
@@ -98,7 +98,7 @@ spec:
                         type: string
                 relatedMepServices:
                   type: array
-                  description: "Mobile edge platform services related to this application."
+                  description: "Edge platform services related to this application."
                   items:
                     type: string
                 relatedMeaServices:
@@ -128,7 +128,7 @@ spec:
                                 type: string
                               value:
                                 type: string
-                    filterAttributes:
+                    triggerFilters:
                       type: object
                       description: "Filters for the Knative Trigger (maps to spec.filter.attributes)."
                       additionalProperties:
@@ -155,9 +155,9 @@ spec:
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: trafficrules.mec.etsi.org
+  name: trafficrules.mec.atnog.org
 spec:
-  group: mec.etsi.org
+  group: mec.atnog.org
   scope: Namespaced
   names:
     plural: trafficrules
@@ -283,7 +283,7 @@ spec:
                           type: string
                 applicationRef:
                   type: object
-                  description: "The MobileEdgeApplication this TrafficRule is associated with."
+                  description: "The EdgeApplication this TrafficRule is associated with."
                   required: [name]
                   properties:
                     name:
@@ -303,9 +303,9 @@ spec:
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: dnsrules.mec.etsi.org
+  name: dnsrules.mec.atnog.org
 spec:
-  group: mec.etsi.org
+  group: mec.atnog.org
   scope: Namespaced
   names:
     plural: dnsrules
@@ -339,7 +339,7 @@ spec:
           properties:
             spec:
               type: object
-              description: "DNS rule specifying domain resolution toward a MobileEdgeApplication."
+              description: "DNS rule specifying domain resolution toward a EdgeApplication."
               required: [dnsRuleId, domainName, ipAddressType, ipAddress, applicationRef]
               properties:
                 dnsRuleId:
@@ -361,7 +361,7 @@ spec:
                   description: "TTL (optional in the spec)."
                 applicationRef:
                   type: object
-                  description: "The MobileEdgeApplication this DNSRule is associated with."
+                  description: "The EdgeApplication this DNSRule is associated with."
                   required: [name]
                   properties:
                     name:

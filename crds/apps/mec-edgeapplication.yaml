@@ -1,18 +1,18 @@
 # File: mec-mobileedgeapplications.yaml
-apiVersion: mec.etsi.org/v1alpha1
-kind: MobileEdgeApplication
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
 metadata:
   name: cam-logger
   namespace: default
 spec:
   # --- ETSI bits ---
-  appDId: "cam-logger-appd-v1"
-  appName: "cam-logger"
-  appProvider: "example.mec"
-  appSoftVersion: "1.0.0"
-  appDVersion: "1.0.0"
-  appInfoName: "CAM Event Logger"
-  appDescription: "Receives CAM CloudEvents and logs them."
+  dId: "cam-logger-appd-v1"
+  name: "cam-logger"
+  provider: "example.mec"
+  softVersion: "1.0.0"
+  dVersion: "1.0.0"
+  infoName: "CAM Event Logger"
+  description: "Receives CAM CloudEvents and logs them."
   # --- Vendor-specific block ---
   service:
     container:
@@ -20,5 +20,5 @@ spec:
       env:
         - name: LOG_FORMAT
           value: "pretty"
-    filterAttributes:
+    triggerFilters:
       type: its.cam
