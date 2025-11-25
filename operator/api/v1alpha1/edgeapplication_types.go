@@ -173,6 +173,82 @@ type EdgeApplicationList struct {
 	Items           []EdgeApplication `json:"items"`
 }
 
+// DeepCopyInto performs a deep copy of EdgeApplicationSpec into out.
+func (in *EdgeApplicationSpec) DeepCopyInto(out *EdgeApplicationSpec) {
+	*out = *in
+
+	// Deep copy slices
+	if in.UsedTrafficRules != nil {
+		out.UsedTrafficRules = make([]EdgeRuleRef, len(in.UsedTrafficRules))
+		copy(out.UsedTrafficRules, in.UsedTrafficRules)
+	}
+
+	if in.UsedDNSRules != nil {
+		out.UsedDNSRules = make([]EdgeRuleRef, len(in.UsedDNSRules))
+		copy(out.UsedDNSRules, in.UsedDNSRules)
+	}
+
+	if in.RelatedMepServices != nil {
+		out.RelatedMepServices = append([]string(nil), in.RelatedMepServices...)
+	}
+
+	if in.RelatedMeaServices != nil {
+		out.RelatedMeaServices = append([]string(nil), in.RelatedMeaServices...)
+	}
+
+	// Deep copy Service (container + env + triggerFilters)
+	if in.Service != nil {
+		out.Service = &KnativeServiceSpec{
+			Container: KnativeContainerSpec{
+				Image: in.Service.Container.Image,
+				Env:   nil,
+			},
+			TriggerFilters: nil,
+		}
+
+		if in.Service.Container.Env != nil {
+			out.Service.Container.Env = make([]NameValuePair, len(in.Service.Container.Env))
+			copy(out.Service.Container.Env, in.Service.Container.Env)
+		}
+
+		if in.Service.TriggerFilters != nil {
+			out.Service.TriggerFilters = make(map[string]string, len(in.Service.TriggerFilters))
+			for k, v := range in.Service.TriggerFilters {
+				out.Service.TriggerFilters[k] = v
+			}
+		}
+	}
+}
+
+// DeepCopy creates a new deep-copied EdgeApplicationSpec.
+func (in *EdgeApplicationSpec) DeepCopy() *EdgeApplicationSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(EdgeApplicationSpec)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto performs a deep copy of EdgeApplicationStatus into out.
+func (in *EdgeApplicationStatus) DeepCopyInto(out *EdgeApplicationStatus) {
+	*out = *in
+	if in.Conditions != nil {
+		out.Conditions = make([]metav1.Condition, len(in.Conditions))
+		copy(out.Conditions, in.Conditions)
+	}
+}
+
+// DeepCopy creates a new deep-copied EdgeApplicationStatus.
+func (in *EdgeApplicationStatus) DeepCopy() *EdgeApplicationStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(EdgeApplicationStatus)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func init() {
 	SchemeBuilder.Register(&EdgeApplication{}, &EdgeApplicationList{})
 }
