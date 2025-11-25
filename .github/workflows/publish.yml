@@ -35,6 +35,11 @@ jobs:
             file: ./knativeServices/forwarder/Dockerfile
             image: ghcr.io/pmacoutinho/mqtt-forwarder
 
+          - name: serverless-mec-operator
+            context: ./operator
+            file: ./operator/Dockerfile
+            image: ghcr.io/pmacoutinho/serverless-mec-operator
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -98,7 +103,7 @@ jobs:
           echo "Inspecting: ${{ steps.picktag.outputs.tag }}"
           grep -q 'linux/amd64' inspect.txt || { echo "::error::linux/amd64 not present in manifest"; cat inspect.txt; exit 1; }
           grep -q 'linux/arm64' inspect.txt || { echo "::error::linux/arm64 not present in manifest"; cat inspect.txt; exit 1; }
-          echo "✅ linux/amd64 and linux/arm64 found."
+          echo "linux/amd64 and linux/arm64 found."
 
       # Nice summary in the Actions UI with image, digest, and tags
       - name: Publish summary
