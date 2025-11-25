@@ -2,12 +2,12 @@
 apiVersion: mec.atnog.org/v1alpha1
 kind: EdgeApplication
 metadata:
-  name: cam-logger
+  name: operator-test
   namespace: default
 spec:
   # --- ETSI bits ---
-  dId: "cam-logger-appd-v1"
-  name: "cam-logger"
+  dId: "operator-test-appd-v1"
+  name: "operator-test"
   provider: "example.mec"
   softVersion: "1.0.0"
   dVersion: "1.0.0"

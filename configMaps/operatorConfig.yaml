@@ -1,9 +1,0 @@
-# File: operatorConfig.yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: mec-operator-config
-  namespace: default    # or whatever namespace the operator is in
-data:
-  default-broker-name: default
-  default-broker-namespace: default

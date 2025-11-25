@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- mec_v1alpha1_edgeapplication.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

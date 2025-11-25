@@ -1,0 +1,10 @@
+# Ignore Go test files
+**/*_test.go
+
+# Ignore build output and local stuff
+bin/
+dist/
+vendor/
+.coverage
+.idea/
+.vscode/
