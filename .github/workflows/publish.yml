@@ -1,21 +1,3 @@
-name: Publish multi-image Docker build to GHCR
-
-on:
-  push:
-    branches: [ "main" ]
-    tags: [ "v*.*.*" ]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: write
-  id-token: write
-
-# Avoid overlapping publishes from the same ref
-concurrency:
-  group: docker-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -29,16 +11,20 @@ jobs:
             context: ./sniffer
             file: ./sniffer/Dockerfile
             image: ghcr.io/pmacoutinho/its-live-capture
+            platforms: linux/amd64,linux/arm64
 
           - name: mqtt-forwarder
             context: ./knativeServices/forwarder
             file: ./knativeServices/forwarder/Dockerfile
             image: ghcr.io/pmacoutinho/mqtt-forwarder
+            platforms: linux/amd64,linux/arm64
 
           - name: serverless-mec-operator
             context: ./operator
             file: ./operator/Dockerfile
             image: ghcr.io/pmacoutinho/serverless-mec-operator
+            # operator only needs amd64
+            platforms: linux/amd64
 
     steps:
       - name: Checkout
@@ -83,7 +69,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platforms }}
           sbom: true
           provenance: true
 
@@ -96,8 +82,9 @@ jobs:
           first_tag="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
           echo "tag=$first_tag" >> "$GITHUB_OUTPUT"
 
-      # Fail fast if either arch is missing in the manifest list
+      # Only verify multi-arch when we actually built multiple platforms
       - name: Verify multi-arch (amd64 + arm64 present)
+        if: contains(matrix.platforms, 'linux/arm64')
         run: |
           docker buildx imagetools inspect "${{ steps.picktag.outputs.tag }}" > inspect.txt
           echo "Inspecting: ${{ steps.picktag.outputs.tag }}"
@@ -105,7 +92,6 @@ jobs:
           grep -q 'linux/arm64' inspect.txt || { echo "::error::linux/arm64 not present in manifest"; cat inspect.txt; exit 1; }
           echo "linux/amd64 and linux/arm64 found."
 
-      # Nice summary in the Actions UI with image, digest, and tags
       - name: Publish summary
         run: |
           {
