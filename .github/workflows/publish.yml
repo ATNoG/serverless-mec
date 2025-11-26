@@ -101,6 +101,7 @@ jobs:
 
       # Fail fast if either arch is missing in the manifest list
       - name: Verify multi-arch (amd64 + arm64 present)
+        if: contains(matrix.platforms, 'linux/arm64')
         run: |
           docker buildx imagetools inspect "${{ steps.picktag.outputs.tag }}" > inspect.txt
           echo "Inspecting: ${{ steps.picktag.outputs.tag }}"
