@@ -138,15 +138,17 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		},
 	}
 
-	if err := ctrl.SetControllerReference(&app, desiredSvc, r.Scheme); err != nil {
-		return ctrl.Result{}, err
-	}
-
+	// 3a. Create / update Knative Service, but PRESERVE existing spec fields
+	//     (annotations, autoscaling settings, etc) that we don't control.
 	var existingSvc servingv1.Service
 	if err := r.Get(ctx, types.NamespacedName{
 		Name: svcName, Namespace: svcNs,
 	}, &existingSvc); err != nil {
 		if apierrors.IsNotFound(err) {
+			// Service doesn't exist: set owner and create it from desiredSvc
+			if err := ctrl.SetControllerReference(&app, desiredSvc, r.Scheme); err != nil {
+				return ctrl.Result{}, err
+			}
 			if err := r.Create(ctx, desiredSvc); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -154,9 +156,30 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{}, err
 		}
 	} else {
-		// naive update; for real-world use you'd diff before updating
-		existingSvc.Spec = desiredSvc.Spec
-		if err := r.Update(ctx, &existingSvc); err != nil {
+		// Service exists: copy it and only update the bits we own
+		updatedSvc := existingSvc.DeepCopy()
+		podSpec := &updatedSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec
+
+		// Ensure there is at least one container
+		if len(podSpec.Containers) == 0 {
+			podSpec.Containers = []corev1.Container{{}}
+		}
+
+		// Overwrite only what the EdgeApplication actually controls
+		podSpec.Containers[0].Image = app.Spec.Service.Container.Image
+		podSpec.Containers[0].Env = env
+
+		// In the future, when you add more fields (nodeSelector, tolerations, resources, affinity)
+		// to app.Spec.Service, you would set them here, e.g.:
+		//
+		// podSpec.NodeSelector = app.Spec.Service.NodeSelector
+		// podSpec.Tolerations = app.Spec.Service.Tolerations
+		// podSpec.Affinity = app.Spec.Service.Affinity
+		// podSpec.Containers[0].Resources = app.Spec.Service.Container.Resources
+		//
+		// This still preserves any extra fields Knative / users add that you don't control.
+
+		if err := r.Update(ctx, updatedSvc); err != nil {
 			return ctrl.Result{}, err
 		}
 	}

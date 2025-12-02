@@ -1,4 +1,4 @@
-apiVersion: mec.mec.etsi.org/v1alpha1
+apiVersion: mec.atnog.org/v1alpha1
 kind: EdgeApplication
 metadata:
   labels:

@@ -22,7 +22,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - mec.mec.etsi.org
+  - mec.atnog.org
   resources:
   - edgeapplications/status
   verbs:

@@ -1,0 +1,24 @@
+# File: failing-mec-mobileedgeapplications.yaml
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
+metadata:
+  name: fail-test
+  namespace: default
+spec:
+  # --- ETSI bits ---
+  dId: "fail-test-appd-v1"
+  name: "fail-test"
+  provider: "example.mec"
+  softVersion: "1.0.0"
+  dVersion: "1.0.0"
+  infoName: "Fail app creation event"
+  description: "Feeding a non existant image to see what if it fails to create an event and trigger"
+  # --- Vendor-specific block ---
+  service:
+    container:
+      image: gcr.io/knative-releases/knative.dev/eventing/cmd/fake_event_nothing_happens
+      env:
+        - name: LOG_FORMAT
+          value: "pretty"
+    triggerFilters:
+      type: its.cam

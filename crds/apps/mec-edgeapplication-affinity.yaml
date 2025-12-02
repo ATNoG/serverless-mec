@@ -1,0 +1,41 @@
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
+metadata:
+  name: cam-logger-operator
+  namespace: default
+spec:
+  dId: "cam-logger-op-v1"
+  name: "cam-logger-operator"
+  provider: "example.mec"
+  softVersion: "1.0.0"
+  dVersion: "1.0.0"
+  service:
+    container:
+      image: gcr.io/knative-releases/knative.dev/eventing/cmd/event_display
+      env:
+        - name: LOG_FORMAT
+          value: "pretty"
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "64Mi"
+        limits:
+          cpu: "500m"
+          memory: "256Mi"
+    nodeSelector:
+      snifftest: "true"
+    tolerations:
+      - key: "snifftest"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: snifftest
+                  operator: In
+                  values: ["true"]
+    triggerFilters:
+      type: its.cam

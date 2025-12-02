@@ -2,375 +2,81 @@
 # ---------------------------------------------
 # EdgeApplication (ETSI: EdgeApplication IOC)
 # ---------------------------------------------
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
 metadata:
-  name: edgeapplications.mec.atnog.org
+  name: cam-logger-operator
+  namespace: default
 spec:
-  group: mec.atnog.org
-  scope: Namespaced
-  names:
-    plural: edgeapplications
-    singular: edgeapplication
-    kind: EdgeApplication
-    shortNames: [mea, meapp]
-    categories: [mec]
-  versions:
-    - name: v1alpha1
-      served: true
-      storage: true
-      additionalPrinterColumns:
-        - name: AppState
-          type: string
-          jsonPath: .status.appState
-        - name: Instantiation
-          type: string
-          jsonPath: .status.instantiationState
-        - name: Operational
-          type: string
-          jsonPath: .status.operationalState
-        - name: Provider
-          type: string
-          jsonPath: .spec.appProvider
-      subresources:
-        status: {}
-      schema:
-        openAPIV3Schema:
-          type: object
-          required: [spec]
-          properties:
-            spec:
-              type: object
-              description: "Attributes taken from ETSI GS MEC 010-1 EdgeApplication."
-              required:
-                - dId
-                - name
-                - provider
-                - softVersion
-                - dVersion
-              properties:
-                dId:
-                  type: string
-                  description: "Identifier of the edge application descriptor (dId)."
-                name:
-                  type: string
-                  description: "Human readable name of the MEC application."
-                provider:
-                  type: string
-                  description: "Provider of the MEC application."
-                softVersion:
-                  type: string
-                  description: "Version of the MEC application software."
-                dVersion:
-                  type: string
-                  description: "Version of the application descriptor."
-                infoName:
-                  type: string
-                  description: "Human readable product name."
-                description:
-                  type: string
-                  description: "Human readable description of the MEC application."
-                instanceId:
-                  type: string
-                  description: "Application instance identifier."
-                # Relationships per 010-1: usedTrafficRule / usedDNSRule / related*Services
-                usedTrafficRules:
-                  type: array
-                  description: "References to TrafficRule resources used by this app (active rules only)."
-                  items:
-                    type: object
-                    required: [name]
-                    properties:
-                      name:
-                        type: string
-                      namespace:
-                        type: string
-                usedDNSRules:
-                  type: array
-                  description: "References to DNSRule resources used by this app (active rules only)."
-                  items:
-                    type: object
-                    required: [name]
-                    properties:
-                      name:
-                        type: string
-                      namespace:
-                        type: string
-                relatedMepServices:
-                  type: array
-                  description: "Edge platform services related to this application."
-                  items:
-                    type: string
-                relatedMeaServices:
-                  type: array
-                  items:
-                    type: string
-                service:
-                  type: object
-                  description: "Vendor-specific Knative configuration used to realize this MEC application as a Knative Service and Trigger (not defined in ETSI GS MEC 010-1)."
-                  properties:
-                    container:
-                      type: object
-                      description: "Container configuration for the Knative Service implementing this MEC application."
-                      required: [image]
-                      properties:
-                        image:
-                          type: string
-                          description: "Container image for the Knative Service."
-                        env:
-                          type: array
-                          description: "Optional environment variables to inject into the container."
-                          items:
-                            type: object
-                            required: [name, value]
-                            properties:
-                              name:
-                                type: string
-                              value:
-                                type: string
-                    triggerFilters:
-                      type: object
-                      description: "Filters for the Knative Trigger (maps to spec.filter.attributes)."
-                      additionalProperties:
-                        type: string
-            status:
-              type: object
-              description: "Lifecycle per 010-1: instantiationState, appState, operationalState."
-              properties:
-                instantiationState:
-                  type: string
-                  enum: ["NOT_INSTANTIATED", "INSTANTIATED"]
-                appState:
-                  type: string
-                  enum: ["STARTED", "STOPPED"]
-                  description: "When NOT_INSTANTIATED, this may be absent."
-                operationalState:
-                  type: string
-                  enum: ["ACTIVE", "INACTIVE"]
-                  description: "READ-ONLY indicator of operational state."
----
-# ---------------------------------------------
-# TrafficRule (ETSI: TrafficRule IOC)
-# ---------------------------------------------
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: trafficrules.mec.atnog.org
-spec:
-  group: mec.atnog.org
-  scope: Namespaced
-  names:
-    plural: trafficrules
-    singular: trafficrule
-    kind: TrafficRule
-    shortNames: [trule, trafrule]
-    categories: [mec]
-  versions:
-    - name: v1alpha1
-      served: true
-      storage: true
-      additionalPrinterColumns:
-        - name: App
-          type: string
-          jsonPath: .spec.applicationRef.name
-        - name: Priority
-          type: integer
-          jsonPath: .spec.priority
-        - name: FilterType
-          type: string
-          jsonPath: .spec.filterType
-        - name: Action
-          type: string
-          jsonPath: .spec.action
-      subresources:
-        status: {}
-      schema:
-        openAPIV3Schema:
-          type: object
-          required: [spec]
-          properties:
-            spec:
-              type: object
-              description: "Filter rule specifying which IP packets are redirected to the associated application."
-              required: [trafficRuleId, filterType, priority, trafficFilter, action, dstInterface, applicationRef]
-              properties:
-                trafficRuleId:
-                  type: string
-                  description: "Identifier of the traffic rule."
-                filterType:
-                  type: string
-                  enum: ["FLOW", "PACKET"]
-                  description: "Definition of filter type."
-                priority:
-                  type: integer
-                  minimum: 0
-                  description: "Higher number wins on conflicts (per spec precedence)."
-                trafficFilter:
-                  type: object
-                  description: "STRUCT modeled after TrafficRuleDescriptor (ETSI GS MEC 010-2)."
-                  properties:
-                    srcAddress:
-                      type: array
-                      items:
-                        type: string
-                    dstAddress:
-                      type: array
-                      items:
-                        type: string
-                    srcPort:
-                      type: array
-                      items:
-                        type: string
-                        pattern: "^[0-9]+(-[0-9]+)?$"
-                    dstPort:
-                      type: array
-                      items:
-                        type: string
-                        pattern: "^[0-9]+(-[0-9]+)?$"
-                    protocol:
-                      type: array
-                      items:
-                        type: string
-                    dscp:
-                      type: array
-                      items:
-                        type: integer
-                        minimum: 0
-                        maximum: 63
-                    direction:
-                      type: string
-                      enum: ["UPLINK", "DOWNLINK", "BIDIRECTIONAL"]
-                    tunnelInfo:
-                      type: object
-                      properties:
-                        tunnelType:
-                          type: string
-                        tunnelDstAddress:
-                          type: string
-                        tunnelSrcAddress:
-                          type: string
-                        gtpTEID:
-                          type: string
-                action:
-                  type: string
-                  enum:
-                    - "DROP"
-                    - "FORWARD"
-                    - "DECAPSULATED"
-                    - "FORWARD_AS_IS"
-                    - "PASSTHROUGH"
-                    - "DUPLICATED_DECAPSULATED"
-                    - "DUPLICATE_AS_IS"
-                  description: "Action applied when the filter matches."
-                dstInterface:
-                  type: object
-                  description: "Destination interface (modeled after DstInterface in 010-2)."
-                  required: [interfaceType]
-                  properties:
-                    interfaceType:
-                      type: string
-                      description: "e.g., 'TUNNEL', 'N6_LAN', 'TRUSTED'."
-                    tunnelInfo:
-                      type: object
-                      properties:
-                        tunnelType:
-                          type: string
-                        localAddress:
-                          type: string
-                        remoteAddress:
-                          type: string
-                        gtpTEID:
-                          type: string
-                applicationRef:
-                  type: object
-                  description: "The EdgeApplication this TrafficRule is associated with."
-                  required: [name]
-                  properties:
-                    name:
-                      type: string
-                    namespace:
-                      type: string
-            status:
-              type: object
-              properties:
-                active:
-                  type: boolean
-                  description: "Controller/Operator may set true when applied."
----
-# ---------------------------------------------
-# DNSRule (ETSI: DNSRule IOC)
-# ---------------------------------------------
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: dnsrules.mec.atnog.org
-spec:
-  group: mec.atnog.org
-  scope: Namespaced
-  names:
-    plural: dnsrules
-    singular: dnsrule
-    kind: DNSRule
-    shortNames: [drule, dnsr]
-    categories: [mec]
-  versions:
-    - name: v1alpha1
-      served: true
-      storage: true
-      additionalPrinterColumns:
-        - name: App
-          type: string
-          jsonPath: .spec.applicationRef.name
-        - name: Domain
-          type: string
-          jsonPath: .spec.domainName
-        - name: IP
-          type: string
-          jsonPath: .spec.ipAddress
-        - name: IPType
-          type: string
-          jsonPath: .spec.ipAddressType
-      subresources:
-        status: {}
-      schema:
-        openAPIV3Schema:
-          type: object
-          required: [spec]
-          properties:
-            spec:
-              type: object
-              description: "DNS rule specifying domain resolution toward a EdgeApplication."
-              required: [dnsRuleId, domainName, ipAddressType, ipAddress, applicationRef]
-              properties:
-                dnsRuleId:
-                  type: string
-                  description: "Identifier of the DNS rule."
-                domainName:
-                  type: string
-                  description: "FQDN of the DNS rule."
-                ipAddressType:
-                  type: string
-                  enum: ["IPv4", "IPv6"]
-                  description: "Type of the IP address."
-                ipAddress:
-                  type: string
-                  description: "Address to which the domain resolves."
-                timeToLive:
-                  type: integer
-                  minimum: 0
-                  description: "TTL (optional in the spec)."
-                applicationRef:
-                  type: object
-                  description: "The EdgeApplication this DNSRule is associated with."
-                  required: [name]
-                  properties:
-                    name:
-                      type: string
-                    namespace:
-                      type: string
-            status:
-              type: object
-              properties:
-                active:
-                  type: boolean
-                  description: "Controller/Operator may set true when applied."
+  # --- ETSI-style descriptor fields ---
+  dId: "cam-logger-appd-v1"
+  name: "cam-logger"
+  provider: "mec.example"
+  softVersion: "1.0.0"
+  dVersion: "1.0.0"
+  infoName: "CAM Event Logger"
+  description: "Receives CAM CloudEvents from the MEC platform and logs them."
+  instanceId: "cam-logger-instance-001"
+
+  # References to other MEC rules (optional)
+  usedTrafficRules:
+    - name: cam-logger-n6-ingress
+      namespace: default
+  usedDNSRules:
+    - name: cam-logger-domain
+      namespace: default
+
+  relatedMepServices:
+    - knative-kafka-broker.default
+  relatedMeaServices:
+    - mqtt-forwarder
+
+  # --- Vendor-specific Knative block (your extension) ---
+  service:
+    container:
+      image: ghcr.io/pmacoutinho/cam-logger:1.0.0
+      env:
+        - name: LOG_LEVEL
+          value: "info"
+        - name: APP_MODE
+          value: "production"
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "500m"
+          memory: "256Mi"
+
+    # Simple hard scheduling: only on edge nodes with this label
+    nodeSelector:
+      mec.atnog.org/node-role: edge
+      kubernetes.io/arch: amd64
+
+    # More expressive node affinity
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: mec.atnog.org/zone
+                operator: In
+                values: ["edge-zone-1"]
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 80
+          preference:
+            matchExpressions:
+              - key: mec.atnog.org/gpu
+                operator: In
+                values: ["false"]
+        - weight: 20
+          preference:
+            matchExpressions:
+              - key: mec.atnog.org/high-mem
+                operator: In
+                values: ["true"]
+
+    # CloudEvent filter for the Knative Trigger
+    triggerFilters:
+      type: "its.cam"
+      source: "urn:dev:mqtt:cam"
+      "mec.app": "cam-logger"

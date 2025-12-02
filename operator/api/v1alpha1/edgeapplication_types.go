@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -48,6 +49,10 @@ type KnativeContainerSpec struct {
 	// env is an optional list of environment variables for the container.
 	// +optional
 	Env []NameValuePair `json:"env,omitempty"`
+
+	// resources are the resource requests and limits for this container.
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // KnativeServiceSpec represents the vendor-specific "service" block in the CRD,
@@ -60,6 +65,19 @@ type KnativeServiceSpec struct {
 	// (maps to spec.filter.attributes).
 	// +optional
 	TriggerFilters map[string]string `json:"triggerFilters,omitempty"`
+
+	// nodeSelector selects the nodes on which the Knative Service's pods may run.
+	// This is a direct pass-through to pod.spec.nodeSelector.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// affinity configures pod/node affinity (typically NodeAffinity).
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// tolerations applied to the pods created for this Knative Service.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 }
 
 // EdgeApplicationSpec defines the desired state of EdgeApplication
@@ -149,6 +167,7 @@ type EdgeApplicationStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:path=edgeapplications,scope=Namespaced,shortName=mea;meapp,categories=mec
 
 // EdgeApplication is the Schema for the edgeapplications API
 type EdgeApplication struct {
@@ -173,6 +192,10 @@ type EdgeApplicationList struct {
 	Items           []EdgeApplication `json:"items"`
 }
 
+// -----------------------------------------------------------------------------
+// Manual deep-copy methods to satisfy generated code expectations
+// -----------------------------------------------------------------------------
+
 // DeepCopyInto performs a deep copy of EdgeApplicationSpec into out.
 func (in *EdgeApplicationSpec) DeepCopyInto(out *EdgeApplicationSpec) {
 	*out = *in
@@ -196,26 +219,52 @@ func (in *EdgeApplicationSpec) DeepCopyInto(out *EdgeApplicationSpec) {
 		out.RelatedMeaServices = append([]string(nil), in.RelatedMeaServices...)
 	}
 
-	// Deep copy Service (container + env + triggerFilters)
+	// Deep copy Service (container + env + triggerFilters + scheduling)
 	if in.Service != nil {
 		out.Service = &KnativeServiceSpec{
 			Container: KnativeContainerSpec{
 				Image: in.Service.Container.Image,
 				Env:   nil,
+				// copy resources deeply
+				Resources: *in.Service.Container.Resources.DeepCopy(),
 			},
 			TriggerFilters: nil,
+			NodeSelector:   nil,
+			Affinity:       nil,
+			Tolerations:    nil,
 		}
 
+		// env
 		if in.Service.Container.Env != nil {
 			out.Service.Container.Env = make([]NameValuePair, len(in.Service.Container.Env))
 			copy(out.Service.Container.Env, in.Service.Container.Env)
 		}
 
+		// triggerFilters
 		if in.Service.TriggerFilters != nil {
 			out.Service.TriggerFilters = make(map[string]string, len(in.Service.TriggerFilters))
 			for k, v := range in.Service.TriggerFilters {
 				out.Service.TriggerFilters[k] = v
 			}
+		}
+
+		// nodeSelector
+		if in.Service.NodeSelector != nil {
+			out.Service.NodeSelector = make(map[string]string, len(in.Service.NodeSelector))
+			for k, v := range in.Service.NodeSelector {
+				out.Service.NodeSelector[k] = v
+			}
+		}
+
+		// affinity
+		if in.Service.Affinity != nil {
+			out.Service.Affinity = in.Service.Affinity.DeepCopy()
+		}
+
+		// tolerations
+		if in.Service.Tolerations != nil {
+			out.Service.Tolerations = make([]corev1.Toleration, len(in.Service.Tolerations))
+			copy(out.Service.Tolerations, in.Service.Tolerations)
 		}
 	}
 }
