@@ -6,19 +6,19 @@ CONFIGMAP="config-features"
 
 echo "🔍 Checking that kubectl is available..."
 if ! command -v kubectl >/dev/null 2>&1; then
-  echo "❌ kubectl not found in PATH. Please install kubectl and try again."
+  echo "kubectl not found in PATH. Please install kubectl and try again."
   exit 1
 fi
 
 echo "🔍 Checking that namespace '${NAMESPACE}' exists..."
 if ! kubectl get ns "${NAMESPACE}" >/dev/null 2>&1; then
-  echo "❌ Namespace '${NAMESPACE}' not found. Is Knative Serving installed?"
+  echo "Namespace '${NAMESPACE}' not found. Is Knative Serving installed?"
   exit 1
 fi
 
 echo "🔍 Checking that ConfigMap '${CONFIGMAP}' exists in namespace '${NAMESPACE}'..."
 if ! kubectl -n "${NAMESPACE}" get configmap "${CONFIGMAP}" >/dev/null 2>&1; then
-  echo "❌ ConfigMap '${CONFIGMAP}' not found in namespace '${NAMESPACE}'."
+  echo "ConfigMap '${CONFIGMAP}' not found in namespace '${NAMESPACE}'."
   echo "   This is usually created by Knative Serving as 'config-features'."
   exit 1
 fi
