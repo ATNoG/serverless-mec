@@ -1,19 +1,3 @@
-/*
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
@@ -43,10 +27,6 @@ type EdgeApplicationReconciler struct {
 	ConfigNamespace string
 }
 
-// -----------------------------------------------------------------------------
-// RBAC
-// -----------------------------------------------------------------------------
-
 // +kubebuilder:rbac:groups=mec.atnog.org,resources=edgeapplications,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=mec.atnog.org,resources=edgeapplications/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=mec.atnog.org,resources=edgeapplications/finalizers,verbs=update
@@ -54,11 +34,6 @@ type EdgeApplicationReconciler struct {
 // +kubebuilder:rbac:groups=serving.knative.dev,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=eventing.knative.dev,resources=triggers,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile is part of the main Kubernetes reconciliation loop. For each
-// EdgeApplication, if spec.service is present, it creates/updates:
-//
-//   - a Knative Service (same name/namespace as the EdgeApplication)
-//   - a Knative Trigger (name "<app>-trigger", broker from mec-operator-config)
 func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
 
@@ -71,7 +46,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	// If no "service" spec, do nothing (pure ETSI description)
+	// If no "service" spec, do nothing
 	if app.Spec.Service == nil {
 		logger.V(1).Info("EdgeApplication has no service spec; skipping Knative reconciliation",
 			"edgeApplication", app.Name)
@@ -97,7 +72,6 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	brokerNamespace := cfg.Data["default-broker-namespace"]
 	if brokerName == "" || brokerNamespace == "" {
 		logger.Error(nil, "mec-operator-config is missing default-broker-name or default-broker-namespace")
-		// configuration error; nothing we can do until admin fixes the ConfigMap
 		return ctrl.Result{}, nil
 	}
 
@@ -114,6 +88,18 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		})
 	}
 
+	// Build PodSpec from spec.service.*
+	podSpec := corev1.PodSpec{
+		Containers: []corev1.Container{{
+			Image:     app.Spec.Service.Container.Image,
+			Env:       env,
+			Resources: app.Spec.Service.Container.Resources,
+		}},
+		NodeSelector: app.Spec.Service.NodeSelector,
+		Tolerations:  app.Spec.Service.Tolerations,
+		Affinity:     app.Spec.Service.Affinity,
+	}
+
 	desiredSvc := &servingv1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      svcName,
@@ -126,26 +112,19 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			ConfigurationSpec: servingv1.ConfigurationSpec{
 				Template: servingv1.RevisionTemplateSpec{
 					Spec: servingv1.RevisionSpec{
-						PodSpec: corev1.PodSpec{
-							Containers: []corev1.Container{{
-								Image: app.Spec.Service.Container.Image,
-								Env:   env,
-							}},
-						},
+						PodSpec: podSpec,
 					},
 				},
 			},
 		},
 	}
 
-	// 3a. Create / update Knative Service, but PRESERVE existing spec fields
-	//     (annotations, autoscaling settings, etc) that we don't control.
+	// 3a. Create / update Knative Service, but PRESERVE existing template metadata
 	var existingSvc servingv1.Service
 	if err := r.Get(ctx, types.NamespacedName{
 		Name: svcName, Namespace: svcNs,
 	}, &existingSvc); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Service doesn't exist: set owner and create it from desiredSvc
 			if err := ctrl.SetControllerReference(&app, desiredSvc, r.Scheme); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -156,35 +135,27 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{}, err
 		}
 	} else {
-		// Service exists: copy it and only update the bits we own
 		updatedSvc := existingSvc.DeepCopy()
-		podSpec := &updatedSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec
+		ps := &updatedSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec
 
-		// Ensure there is at least one container
-		if len(podSpec.Containers) == 0 {
-			podSpec.Containers = []corev1.Container{{}}
+		if len(ps.Containers) == 0 {
+			ps.Containers = []corev1.Container{{}}
 		}
 
-		// Overwrite only what the EdgeApplication actually controls
-		podSpec.Containers[0].Image = app.Spec.Service.Container.Image
-		podSpec.Containers[0].Env = env
+		ps.Containers[0].Image = app.Spec.Service.Container.Image
+		ps.Containers[0].Env = env
+		ps.Containers[0].Resources = app.Spec.Service.Container.Resources
 
-		// In the future, when you add more fields (nodeSelector, tolerations, resources, affinity)
-		// to app.Spec.Service, you would set them here, e.g.:
-		//
-		// podSpec.NodeSelector = app.Spec.Service.NodeSelector
-		// podSpec.Tolerations = app.Spec.Service.Tolerations
-		// podSpec.Affinity = app.Spec.Service.Affinity
-		// podSpec.Containers[0].Resources = app.Spec.Service.Container.Resources
-		//
-		// This still preserves any extra fields Knative / users add that you don't control.
+		ps.NodeSelector = app.Spec.Service.NodeSelector
+		ps.Tolerations = app.Spec.Service.Tolerations
+		ps.Affinity = app.Spec.Service.Affinity
 
 		if err := r.Update(ctx, updatedSvc); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
-	// 4. Desired Trigger (name derived, broker ns/name from ConfigMap)
+	// 4. Trigger
 	trigName := svcName + "-trigger"
 	trigNs := brokerNamespace
 
@@ -237,7 +208,6 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
 func (r *EdgeApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.ConfigNamespace == "" {
 		r.ConfigNamespace = "mec-system"
