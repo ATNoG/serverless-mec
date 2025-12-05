@@ -6,6 +6,7 @@ import uuid
 import shutil
 import logging
 import subprocess
+import time  # <-- added
 from datetime import datetime, timezone
 
 import requests
@@ -50,6 +51,7 @@ log = logging.getLogger("live-capture")
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+
 def _val_to_str(x):
     try:
         if hasattr(x, "show"):
@@ -61,6 +63,7 @@ def _val_to_str(x):
     except Exception:
         pass
     return str(x)
+
 
 def extract_layer_fields(layer) -> dict:
     out = {}
@@ -74,6 +77,7 @@ def extract_layer_fields(layer) -> dict:
         else:
             out[name] = _val_to_str(v)
     return out
+
 
 def packet_to_record(pkt) -> dict | None:
     try:
@@ -98,14 +102,23 @@ def packet_to_record(pkt) -> dict | None:
 
     return rec
 
+
 # -------------------------
 # CloudEvents (official SDK)
 # -------------------------
 SESSION = requests.Session()
 
-def post_cloudevent_structured(sink_url: str, event_type: str, source: str, data: dict,
-                               subject: str | None = None, event_id: str | None = None,
-                               event_time: str | None = None, timeout: float = 5.0):
+
+def post_cloudevent_structured(
+    sink_url: str,
+    event_type: str,
+    source: str,
+    data: dict,
+    subject: str | None = None,
+    event_id: str | None = None,
+    event_time: str | None = None,
+    timeout: float = 5.0,
+):
     st = None
     try:
         st = data.get("cam_fields", {}).get("stationtype")
@@ -122,15 +135,26 @@ def post_cloudevent_structured(sink_url: str, event_type: str, source: str, data
     }
     if subject:
         attrs["subject"] = subject
-        
+
     # Add as CloudEvent extension (must be lowercase key)
     if st is not None:
         attrs["stationtype"] = str(st)
 
     event = CloudEvent(attrs, data)
     headers, body = to_structured(event)
+
+    # --- Measure sniffer → broker ingress HTTP latency ---
+    start_ns = time.perf_counter_ns()
     resp = SESSION.post(sink_url, headers=headers, data=body, timeout=timeout)
+    elapsed_ns = time.perf_counter_ns() - start_ns
+
+    # Log POST latency and status
+    # (convert to ms in your head: elapsed_ns / 1_000_000)
+    log.info("sniffer POST elapsed_ns=%d status=%d", elapsed_ns, resp.status_code)
+    # -----------------------------------------------------
+
     resp.raise_for_status()
+
 
 # -------------------------
 # Live capture loop
@@ -190,12 +214,15 @@ def run_live():
 
             processed += 1
             if LOG_EVERY > 0 and processed % LOG_EVERY == 0:
-                log.info(f"[{now_iso()}] processed {processed} CAM packets (file=on, sink={'on' if sink_on else 'off'})")
+                log.info(
+                    f"[{now_iso()}] processed {processed} CAM packets (file=on, sink={'on' if sink_on else 'off'})"
+                )
     finally:
         try:
             cap.close()
         except Exception:
             pass
+
 
 # -------------------------
 # Main

@@ -1,0 +1,26 @@
+# File: benchmark-app.yaml
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
+metadata:
+  name: benchmark-app
+  namespace: default
+spec:
+  # --- ETSI bits ---
+  dId: "benchmark-app-appd-v1"
+  name: "benchmark-app"
+  provider: "example.mec"
+  softVersion: "1.0.0"
+  dVersion: "1.0.0"
+  infoName: "App to bechmark logging and emitting times"
+  description: "App to bechmark logging and emitting times"
+  # --- Vendor-specific block ---
+  service:
+    container:
+      image: ghcr.io/pmacoutinho/benchmark-hop:latest
+      env:
+        - name: FORWARD_URL
+          value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/kafka-broker"
+        - name: HOP_NAME
+          value: "edge-bench-1"
+        - name: OUT_TYPE
+          value: "its.cam.benchmarked"
