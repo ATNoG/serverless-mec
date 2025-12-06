@@ -1,0 +1,26 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: direct-bench
+  namespace: default
+  labels:
+    mec.atnog.org/app: direct-bench
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"   # keep it warm
+    spec:
+      containers:
+        - name: user-container
+          image: ghcr.io/pmacoutinho/direct-bench:latest
+          env:
+            - name: HOP_NAME
+              value: direct-bench-1
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
