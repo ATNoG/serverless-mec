@@ -6,8 +6,10 @@ import uuid
 import shutil
 import logging
 import subprocess
-import time  # <-- added
+import time
 from datetime import datetime, timezone
+import queue
+import threading
 
 import requests
 import pyshark
@@ -30,6 +32,8 @@ INCLUDE_RAW_HEX = os.getenv("INCLUDE_RAW_HEX", "").lower() in ("1", "true", "yes
 SINK_URL = os.getenv("K_SINK", "").strip()
 STDOUT_NDJSON = os.getenv("STDOUT_NDJSON", "1") in ("1", "true", "yes")
 PROMISCUOUS = os.getenv("PROMISCUOUS", "0") in ("1", "true", "yes")
+
+SEND_QUEUE_MAX = int(os.getenv("SEND_QUEUE_MAX", "1000"))
 
 # Generate a reasonable CloudEvent source string
 HOST_ID = os.getenv("K8S_NODE_NAME") or os.getenv("NODE_NAME") or os.getenv("HOSTNAME") or "host"
@@ -108,6 +112,12 @@ def packet_to_record(pkt) -> dict | None:
 # -------------------------
 SESSION = requests.Session()
 
+# Async sending machinery
+SEND_QUEUE: "queue.Queue[tuple[str, str, str, dict, str | None]]" = queue.Queue(
+    maxsize=SEND_QUEUE_MAX
+)
+STOP_SENDER = False
+
 
 def post_cloudevent_structured(
     sink_url: str,
@@ -143,23 +153,47 @@ def post_cloudevent_structured(
     event = CloudEvent(attrs, data)
     headers, body = to_structured(event)
 
-    # --- Measure sniffer → broker ingress HTTP latency ---
+    # Measure sniffer to sink HTTP latency (runs in sender thread)
     start_ns = time.perf_counter_ns()
     resp = SESSION.post(sink_url, headers=headers, data=body, timeout=timeout)
     elapsed_ns = time.perf_counter_ns() - start_ns
 
-    # Log POST latency and status
-    # (convert to ms in your head: elapsed_ns / 1_000_000)
     log.info("sniffer POST elapsed_ns=%d status=%d", elapsed_ns, resp.status_code)
-    # -----------------------------------------------------
 
     resp.raise_for_status()
+
+
+def sender_worker():
+    global STOP_SENDER
+    while True:
+        try:
+            job = SEND_QUEUE.get(timeout=0.5)
+        except queue.Empty:
+            if STOP_SENDER:
+                break
+            continue
+
+        sink_url, event_type, source, data, subject = job
+        try:
+            post_cloudevent_structured(
+                sink_url=sink_url,
+                event_type=event_type,
+                source=source,
+                data=data,
+                subject=subject,
+            )
+        except Exception as e:
+            log.warning(f"[WARN] sender failed: {e}")
+        finally:
+            SEND_QUEUE.task_done()
 
 
 # -------------------------
 # Live capture loop
 # -------------------------
 def run_live():
+    global STOP_SENDER
+
     # Diagnostics
     tshark_path = shutil.which("tshark")
     if not tshark_path:
@@ -170,6 +204,7 @@ def run_live():
         log.info(f">> DISPLAY_FILTER='{DISPLAY_FILTER}'")
     sink_on = bool(SINK_URL)
     log.info(f">> CloudEvents sink: {'on' if sink_on else 'off'} -> {SINK_URL or '-'}")
+    log.info(f">> SEND_QUEUE_MAX={SEND_QUEUE_MAX}")
 
     # Build custom parameters; toggle promiscuous with env
     # tshark params:
@@ -185,6 +220,10 @@ def run_live():
         custom_parameters=custom_params,
     )
 
+    # Start sender thread
+    sender_thread = threading.Thread(target=sender_worker, daemon=True)
+    sender_thread.start()
+
     processed = 0
 
     try:
@@ -198,19 +237,20 @@ def run_live():
             if STDOUT_NDJSON:
                 print(line, flush=True)
 
-            # Post CloudEvent if configured
+            # Enqueue CloudEvent if configured
             if sink_on:
                 try:
-                    subject = str(rec.get("frame_number")) if rec.get("frame_number") is not None else None
-                    post_cloudevent_structured(
-                        sink_url=SINK_URL,
-                        event_type=CE_TYPE,
-                        source=CE_SOURCE,
-                        data=rec,
-                        subject=subject,
+                    subject = (
+                        str(rec.get("frame_number"))
+                        if rec.get("frame_number") is not None
+                        else None
                     )
-                except Exception as e:
-                    log.warning(f"[WARN] CloudEvent POST failed: {e}")
+                    SEND_QUEUE.put(
+                        (SINK_URL, CE_TYPE, CE_SOURCE, rec, subject),
+                        timeout=0.1,
+                    )
+                except queue.Full:
+                    log.warning("[WARN] SEND_QUEUE full, dropping event")
 
             processed += 1
             if LOG_EVERY > 0 and processed % LOG_EVERY == 0:
@@ -220,6 +260,13 @@ def run_live():
     finally:
         try:
             cap.close()
+        except Exception:
+            pass
+
+        # Stop sender thread
+        STOP_SENDER = True
+        try:
+            sender_thread.join(timeout=2.0)
         except Exception:
             pass
 
