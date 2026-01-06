@@ -36,8 +36,9 @@ static const char *ENV_BPF;            /* parsed loosely, logged always */
 static const char *ENV_DISPLAY_FILTER; /* logged only */
 static int   ENV_LOG_EVERY = 10;
 static const char *ENV_CE_TYPE;
-static bool  ENV_INCLUDE_RAW_HEX = false;
-static const char *ENV_SINK_URL;       /* K_SINK */
+static bool  ENV_INCLUDE_RAW_HEX = false;     /* stdout NDJSON raw hex */
+static bool  ENV_CE_INCLUDE_RAW_HEX = true;  /* CloudEvents data raw hex (default ON) */
+static const char *ENV_SINK_URL;       /* K_SINK injected by SinkBinding */
 static bool  ENV_STDOUT_NDJSON = true;
 static bool  ENV_PROMISCUOUS = false;
 static int   ENV_SEND_QUEUE_MAX = 1000;
@@ -327,6 +328,7 @@ static void *sender_thread_fn(void *arg) {
   curl_easy_setopt(curl, CURLOPT_URL, ENV_SINK_URL);
   curl_easy_setopt(curl, CURLOPT_POST, 1L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); /* important in multi-threaded apps */
 
   /* disable proxy env usage */
   curl_easy_setopt(curl, CURLOPT_PROXY, "");
@@ -370,6 +372,9 @@ static void *sender_thread_fn(void *arg) {
 
 /* -------------------------
  * Packet parsing / filtering
+ * Supports:
+ *   - Ethernet frames (with up to 2 VLAN tags)
+ *   - Radiotap + 802.11 data + LLC/SNAP ethertype + optional IPv4/UDP
  * ------------------------- */
 #pragma pack(push, 1)
 typedef struct {
@@ -411,16 +416,24 @@ typedef struct {
   uint8_t  saddr[16];
   uint8_t  daddr[16];
 } ipv6_hdr_t;
+
+/* Radiotap (minimal header) */
+typedef struct {
+  uint8_t  it_version;
+  uint8_t  it_pad;
+  uint16_t it_len;      /* little-endian on the wire */
+  uint32_t it_present;  /* little-endian; may extend, but we only use as heuristic */
+} radiotap_hdr_t;
 #pragma pack(pop)
 
 typedef struct {
   uint8_t src_mac[6];
   uint8_t dst_mac[6];
 
-  uint16_t ethertype;        /* after vlan unwrapping (if any) */
+  uint16_t ethertype;        /* after vlan unwrapping or after LLC/SNAP */
   bool has_vlan;
   int vlan_id;
-  uint16_t outer_ethertype;  /* original ethertype */
+  uint16_t outer_ethertype;  /* original ethertype (Ethernet) or SNAP ethertype */
 
   bool is_etsi_its;
   bool is_ipv4;
@@ -433,12 +446,163 @@ typedef struct {
   int dst_port;
 } pkt_meta_t;
 
+/* radiotap length (LE) */
+static bool parse_radiotap_offset(const uint8_t *pkt, size_t pkt_len, size_t *out_off) {
+  if (pkt_len < sizeof(radiotap_hdr_t)) return false;
+
+  const radiotap_hdr_t *rt = (const radiotap_hdr_t *)pkt;
+
+  /* Strong-ish heuristics to avoid false positives on Ethernet:
+     - version must be 0
+     - pad usually 0
+     - present bitmap non-zero
+     - len reasonable
+     - and next bytes look like 802.11 FC version=0 after rt_len */
+  if (rt->it_version != 0) return false;
+  if (rt->it_pad != 0) return false;
+
+  uint16_t rt_len = (uint16_t)pkt[2] | ((uint16_t)pkt[3] << 8);
+  if (rt_len < sizeof(radiotap_hdr_t)) return false;
+  if (rt_len > pkt_len) return false;
+  if (rt_len > 4096) return false;
+
+  uint32_t present = (uint32_t)pkt[4] |
+                     ((uint32_t)pkt[5] << 8) |
+                     ((uint32_t)pkt[6] << 16) |
+                     ((uint32_t)pkt[7] << 24);
+  if (present == 0) return false;
+
+  if (pkt_len < rt_len + 2) return false;
+  uint16_t fc = (uint16_t)pkt[rt_len] | ((uint16_t)pkt[rt_len + 1] << 8);
+  if ((fc & 0x3) != 0) return false; /* 802.11 version bits must be 0 */
+
+  *out_off = rt_len;
+  return true;
+}
+
+static size_t wifi_hdr_len(const uint8_t *p, size_t n) {
+  if (n < 2) return 0;
+  uint16_t fc = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+  uint8_t type = (fc >> 2) & 0x3;
+  if (type != 2) return 0; /* data only */
+
+  bool toDS   = (fc & (1u<<8))  != 0;
+  bool fromDS = (fc & (1u<<9))  != 0;
+
+  size_t hdr = 24; /* base data header */
+  if (toDS && fromDS) hdr += 6; /* addr4 present */
+
+  uint8_t subtype = (fc >> 4) & 0xF;
+  bool qos = (subtype & 0x8) != 0;
+  if (qos) hdr += 2;
+
+  return (n >= hdr) ? hdr : 0;
+}
+
+/* Parse 802.11 data frames + LLC/SNAP to recover ethertype & optional IPv4/UDP */
+static void parse_wifi_meta(const uint8_t *p, size_t n, pkt_meta_t *m) {
+  if (n < 24) return;
+
+  uint16_t fc = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+  uint8_t type = (fc >> 2) & 0x3;
+  if (type != 2) return; /* only data */
+
+  bool toDS   = (fc & (1u<<8))  != 0;
+  bool fromDS = (fc & (1u<<9))  != 0;
+
+  const uint8_t *addr1 = p + 4;
+  const uint8_t *addr2 = p + 10;
+  const uint8_t *addr3 = p + 16;
+
+  const uint8_t *sa = NULL;
+  const uint8_t *da = NULL;
+
+  if (!toDS && !fromDS) { da = addr1; sa = addr2; }
+  else if (toDS && !fromDS) { sa = addr2; da = addr3; }
+  else if (!toDS && fromDS) { da = addr1; sa = addr3; }
+  else { /* WDS */
+    if (n < 30) return;
+    da = addr3;
+    sa = p + 24; /* addr4 */
+  }
+
+  memcpy(m->dst_mac, da, 6);
+  memcpy(m->src_mac, sa, 6);
+
+  size_t hlen = wifi_hdr_len(p, n);
+  if (!hlen) return;
+
+  /* LLC/SNAP: AA AA 03, then OUI(3), then ethertype(2) */
+  if (n < hlen + 8) return;
+  const uint8_t *llc = p + hlen;
+
+  if (llc[0] == 0xAA && llc[1] == 0xAA && llc[2] == 0x03) {
+    uint16_t et = ((uint16_t)llc[6] << 8) | (uint16_t)llc[7];
+    m->outer_ethertype = et;
+    m->ethertype = et;
+
+    if (et == 0x8947) m->is_etsi_its = true;
+
+    const uint8_t *l3 = llc + 8;
+    size_t l3n = n - (hlen + 8);
+
+    /* IPv4 UDP */
+    if (et == 0x0800 && l3n >= sizeof(ipv4_hdr_t)) {
+      const ipv4_hdr_t *ip = (const ipv4_hdr_t *)l3;
+      uint8_t ver = (ip->ver_ihl >> 4) & 0xF;
+      uint8_t ihl = (ip->ver_ihl & 0xF) * 4;
+      if (ver == 4 && l3n >= ihl) {
+        m->is_ipv4 = true;
+        struct in_addr a;
+        a.s_addr = ip->saddr; inet_ntop(AF_INET, &a, m->src_ip, sizeof(m->src_ip));
+        a.s_addr = ip->daddr; inet_ntop(AF_INET, &a, m->dst_ip, sizeof(m->dst_ip));
+
+        if (ip->proto == 17 && l3n >= ihl + sizeof(udp_hdr_t)) {
+          const udp_hdr_t *udp = (const udp_hdr_t *)(l3 + ihl);
+          m->src_port = (int)ntohs(udp->sport);
+          m->dst_port = (int)ntohs(udp->dport);
+          m->is_udp = true;
+        }
+      }
+    }
+
+    /* IPv6 UDP (simple: next header UDP directly) */
+    if (et == 0x86dd && l3n >= sizeof(ipv6_hdr_t)) {
+      const ipv6_hdr_t *ip6 = (const ipv6_hdr_t *)l3;
+      uint32_t v = ntohl(ip6->v_tc_fl);
+      uint8_t ver = (uint8_t)((v >> 28) & 0xF);
+      if (ver == 6) {
+        m->is_ipv6 = true;
+        inet_ntop(AF_INET6, ip6->saddr, m->src_ip, sizeof(m->src_ip));
+        inet_ntop(AF_INET6, ip6->daddr, m->dst_ip, sizeof(m->dst_ip));
+
+        if (ip6->next_hdr == 17 && l3n >= sizeof(ipv6_hdr_t) + sizeof(udp_hdr_t)) {
+          const udp_hdr_t *udp = (const udp_hdr_t *)(l3 + sizeof(ipv6_hdr_t));
+          m->src_port = (int)ntohs(udp->sport);
+          m->dst_port = (int)ntohs(udp->dport);
+          m->is_udp = true;
+        }
+      }
+    }
+  }
+}
+
 static void parse_packet_meta(const uint8_t *pkt, size_t pkt_len, pkt_meta_t *m) {
   memset(m, 0, sizeof(*m));
   m->vlan_id = -1;
   m->src_port = -1;
   m->dst_port = -1;
 
+  /* Try radiotap first (monitor-mode interfaces) */
+  size_t rt_off = 0;
+  if (parse_radiotap_offset(pkt, pkt_len, &rt_off)) {
+    if (pkt_len > rt_off) {
+      parse_wifi_meta(pkt + rt_off, pkt_len - rt_off, m);
+    }
+    return;
+  }
+
+  /* Ethernet path */
   if (pkt_len < sizeof(eth_hdr_t)) return;
 
   const eth_hdr_t *eth = (const eth_hdr_t *)pkt;
@@ -449,13 +613,20 @@ static void parse_packet_meta(const uint8_t *pkt, size_t pkt_len, pkt_meta_t *m)
 
   size_t off = sizeof(eth_hdr_t);
 
-  if ((et == 0x8100 || et == 0x88a8) && pkt_len >= off + sizeof(vlan_hdr_t)) {
+  /* Unwrap up to 2 VLAN tags (QinQ) */
+  int vlan_depth = 0;
+  while ((et == 0x8100 || et == 0x88a8) &&
+         pkt_len >= off + sizeof(vlan_hdr_t) &&
+         vlan_depth < 2) {
     const vlan_hdr_t *v = (const vlan_hdr_t *)(pkt + off);
     uint16_t tci = ntohs(v->tci);
-    m->vlan_id = (int)(tci & 0x0FFF);
-    m->has_vlan = true;
+    if (vlan_depth == 0) {
+      m->vlan_id = (int)(tci & 0x0FFF);
+      m->has_vlan = true;
+    }
     et = ntohs(v->ethertype);
     off += sizeof(vlan_hdr_t);
+    vlan_depth++;
   }
 
   m->ethertype = et;
@@ -517,6 +688,9 @@ static bool bpf_requests_udp_port(const char *bpf, int *out_port) {
 }
 
 static bool should_accept_packet(const pkt_meta_t *m) {
+  /* If user explicitly set BPF="" => accept EVERYTHING (agnostic mode) */
+  if (ENV_BPF && ENV_BPF[0] == '\0') return true;
+
   bool match_its = m->is_etsi_its;
 
   int udp_port = 2001;
@@ -534,7 +708,8 @@ static char *build_record_json(
     const struct timeval *tv,
     const uint8_t *pkt,
     size_t pkt_len,
-    const pkt_meta_t *m
+    const pkt_meta_t *m,
+    bool include_raw_hex
 ) {
   char ts[64];
   iso8601_from_timeval(tv, ts, sizeof(ts));
@@ -551,7 +726,7 @@ static char *build_record_json(
   char *dstip_esc = json_escape(m->dst_ip[0] ? m->dst_ip : "");
 
   char *raw_hex = NULL;
-  if (ENV_INCLUDE_RAW_HEX) raw_hex = hex_encode(pkt, pkt_len);
+  if (include_raw_hex) raw_hex = hex_encode(pkt, pkt_len);
 
   if (!ts_esc || !srcmac_esc || !dstmac_esc || !srcip_esc || !dstip_esc) {
     free(ts_esc); free(srcmac_esc); free(dstmac_esc); free(srcip_esc); free(dstip_esc);
@@ -652,8 +827,10 @@ static void set_defaults_from_env(void) {
   ENV_IFACE = getenv("IFACE");
   if (!ENV_IFACE || !ENV_IFACE[0]) ENV_IFACE = "eth0";
 
+  /* Important: only use default filter if BPF env var is UNSET.
+     If BPF is set to empty string, we keep it empty => accept all. */
   ENV_BPF = getenv("BPF");
-  if (!ENV_BPF || !ENV_BPF[0]) {
+  if (ENV_BPF == NULL) {
     ENV_BPF = "(ether proto 0x8947 or (vlan and ether[16:2]==0x8947)) or udp port 2001";
   }
 
@@ -666,6 +843,14 @@ static void set_defaults_from_env(void) {
   if (!ENV_CE_TYPE || !ENV_CE_TYPE[0]) ENV_CE_TYPE = "its.cam";
 
   ENV_INCLUDE_RAW_HEX = truthy(getenv("INCLUDE_RAW_HEX")) != NULL;
+
+  /* CloudEvents raw frame hex (default ON). If set (even to empty), it is honored. */
+  const char *cer = getenv("CE_INCLUDE_RAW_HEX");
+  if (cer == NULL) {
+    ENV_CE_INCLUDE_RAW_HEX = true;
+  } else {
+    ENV_CE_INCLUDE_RAW_HEX = truthy(cer) != NULL;
+  }
 
   ENV_SINK_URL = getenv("K_SINK");
   if (!ENV_SINK_URL) ENV_SINK_URL = "";
@@ -688,7 +873,7 @@ static void set_defaults_from_env(void) {
 }
 
 /* -------------------------
- * Raw-socket setup (FIXED)
+ * Raw-socket setup
  * ------------------------- */
 static int open_bound_packet_socket(const char *iface, bool promisc, uint8_t out_mac[6]) {
   int fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
@@ -697,7 +882,6 @@ static int open_bound_packet_socket(const char *iface, bool promisc, uint8_t out
     return -1;
   }
 
-  // Get ifindex (use dedicated ifreq and SAVE it)
   struct ifreq ifr_idx;
   memset(&ifr_idx, 0, sizeof(ifr_idx));
   strncpy(ifr_idx.ifr_name, iface, IFNAMSIZ - 1);
@@ -710,7 +894,6 @@ static int open_bound_packet_socket(const char *iface, bool promisc, uint8_t out
 
   int ifindex = ifr_idx.ifr_ifindex;
 
-  // Bind socket to interface
   struct sockaddr_ll sll;
   memset(&sll, 0, sizeof(sll));
   sll.sll_family   = AF_PACKET;
@@ -723,7 +906,6 @@ static int open_bound_packet_socket(const char *iface, bool promisc, uint8_t out
     return -1;
   }
 
-  // Get interface MAC using a separate ifreq (do not clobber ifindex union)
   struct ifreq ifr_mac;
   memset(&ifr_mac, 0, sizeof(ifr_mac));
   strncpy(ifr_mac.ifr_name, iface, IFNAMSIZ - 1);
@@ -760,13 +942,14 @@ int main(void) {
   signal(SIGTERM, on_sig);
 
   logi(">> LIVE capture iface='%s' promisc=%s", ENV_IFACE, ENV_PROMISCUOUS ? "on" : "off");
-  logi(">> BPF='%s' (implemented as a fast built-in filter, not full BPF)", ENV_BPF);
+  logi(">> BPF='%s' (fast built-in filter; BPF='' means accept-all)", ENV_BPF ? ENV_BPF : "(null)");
   if (ENV_DISPLAY_FILTER && ENV_DISPLAY_FILTER[0]) {
     logi(">> DISPLAY_FILTER='%s' (ignored in raw-socket version)", ENV_DISPLAY_FILTER);
   }
   logi(">> CloudEvents sink: %s -> %s",
        (ENV_SINK_URL && ENV_SINK_URL[0]) ? "on" : "off",
        (ENV_SINK_URL && ENV_SINK_URL[0]) ? ENV_SINK_URL : "-");
+  logi(">> CE_INCLUDE_RAW_HEX=%s (CloudEvents include full frame hex)", ENV_CE_INCLUDE_RAW_HEX ? "true" : "false");
   logi(">> SEND_QUEUE_MAX=%d", ENV_SEND_QUEUE_MAX);
 
   bool sink_on = (ENV_SINK_URL && ENV_SINK_URL[0]);
@@ -799,7 +982,9 @@ int main(void) {
   }
 
   uint64_t frame_no = 0;
-  uint64_t processed = 0;
+  uint64_t accepted = 0;
+  uint64_t rx_total = 0;
+  uint64_t dropped  = 0;
 
   struct pollfd pfd;
   memset(&pfd, 0, sizeof(pfd));
@@ -823,23 +1008,46 @@ int main(void) {
         break;
       }
 
+      rx_total++;
       frame_no++;
       size_t pkt_len = (size_t)n;
 
       pkt_meta_t meta;
       parse_packet_meta(buf, pkt_len, &meta);
 
-      if (!should_accept_packet(&meta)) continue;
+      if (!should_accept_packet(&meta)) {
+        dropped++;
+        if (ENV_LOG_EVERY > 0 && (rx_total % (uint64_t)ENV_LOG_EVERY) == 0) {
+          logi("[rsock] rx=%" PRIu64 " accepted=%" PRIu64 " dropped=%" PRIu64 " (sink=%s)",
+               rx_total, accepted, dropped, sink_on ? "on" : "off");
+        }
+        continue;
+      }
 
       struct timeval tv;
       gettimeofday(&tv, NULL);
 
-      char *rec = build_record_json(frame_no, &tv, buf, pkt_len, &meta);
-      if (!rec) continue;
+      /* Build stdout record (may or may not include raw hex) */
+      char *rec_out = build_record_json(frame_no, &tv, buf, pkt_len, &meta, ENV_INCLUDE_RAW_HEX);
+      if (!rec_out) continue;
 
       if (ENV_STDOUT_NDJSON) {
-        fputs(rec, stdout);
+        fputs(rec_out, stdout);
         fputc('\n', stdout);
+      }
+
+      /* Build CloudEvents record (ensure raw hex included if requested) */
+      char *rec_ce = rec_out;
+      bool rec_ce_is_separate = false;
+
+      if (sink_on && ENV_CE_INCLUDE_RAW_HEX && !ENV_INCLUDE_RAW_HEX) {
+        rec_ce = build_record_json(frame_no, &tv, buf, pkt_len, &meta, true);
+        if (!rec_ce) {
+          /* fallback: still emit event without raw */
+          rec_ce = rec_out;
+        } else {
+          rec_ce_is_separate = true;
+        }
       }
 
       if (sink_on) {
@@ -847,7 +1055,7 @@ int main(void) {
         snprintf(subj, sizeof(subj), "%" PRIu64, frame_no);
 
         size_t body_len = 0;
-        char *ce = build_cloudevent_structured(ENV_CE_TYPE, CE_SOURCE, subj, rec, &body_len);
+        char *ce = build_cloudevent_structured(ENV_CE_TYPE, CE_SOURCE, subj, rec_ce, &body_len);
         if (ce) {
           job_t *job = (job_t *)calloc(1, sizeof(job_t));
           if (!job) {
@@ -864,12 +1072,13 @@ int main(void) {
         }
       }
 
-      free(rec);
+      if (rec_ce_is_separate) free(rec_ce);
+      free(rec_out);
 
-      processed++;
-      if (ENV_LOG_EVERY > 0 && (processed % (uint64_t)ENV_LOG_EVERY) == 0) {
-        logi("[rsock] processed %" PRIu64 " packets (sink=%s)", processed,
-             (ENV_SINK_URL && ENV_SINK_URL[0]) ? "on" : "off");
+      accepted++;
+      if (ENV_LOG_EVERY > 0 && (accepted % (uint64_t)ENV_LOG_EVERY) == 0) {
+        logi("[rsock] accepted=%" PRIu64 " rx=%" PRIu64 " dropped=%" PRIu64 " (sink=%s)",
+             accepted, rx_total, dropped, sink_on ? "on" : "off");
       }
     }
   }

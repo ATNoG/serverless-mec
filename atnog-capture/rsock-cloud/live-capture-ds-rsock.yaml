@@ -1,17 +1,17 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: live-capture-rsock
+  name: live-capture
   labels:
-    app: live-capture-rsock
+    app: live-capture
 spec:
   selector:
     matchLabels:
-      app: live-capture-rsock
+      app: live-capture
   template:
     metadata:
       labels:
-        app: live-capture-rsock
+        app: live-capture
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -19,7 +19,7 @@ spec:
         runAsUser: 0
       containers:
         - name: sniffer
-          image: ghcr.io/pmacoutinho/its-live-capture-rsock:latest
+          image: ghcr.io/pmacoutinho/live-capture-rsock:latest
           env:
             - name: K8S_NODE_NAME
               valueFrom:
@@ -28,14 +28,9 @@ spec:
 
             # capture interface
             - name: IFACE
-              value: "eth0"
-
-            # filter intent (we don’t execute full BPF; we implement the same *intent* fast)
-            # default in code if empty:
-            # (ether proto 0x8947 or (vlan and ether[16:2]==0x8947)) or udp port 2001
+              value: "cw-mon-rxa"
             - name: BPF
               value: ""
-
             - name: LOG_EVERY
               value: "10"
             - name: CE_TYPE
@@ -46,14 +41,9 @@ spec:
               value: "1"
             - name: SEND_QUEUE_MAX
               value: "1000"
-
             # Optional: include raw frame hex in output/event data (big!)
-            # - name: INCLUDE_RAW_HEX
-            #   value: "1"
-
-            # REQUIRED: where to POST CloudEvents (Knative Sink URL)
-            - name: K_SINK
-              value: "http://broker-ingress.knative-eventing.svc.cluster.local/YOUR_NAMESPACE/YOUR_BROKER"
+            - name: CE_INCLUDE_RAW_HEX
+              value: "1"
 
           securityContext:
             allowPrivilegeEscalation: false
