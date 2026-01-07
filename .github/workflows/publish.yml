@@ -27,8 +27,8 @@ jobs:
         include:
           - name: its-live-capture
             context: ./sniffer
-            file: ./sniffer/Dockerfile
-            image: ghcr.io/pmacoutinho/its-live-capture
+            file: ./sniffer/atnog-capture/Dockerfile
+            image: ghcr.io/pmacoutinho/live-capture-rsock
             platforms: linux/amd64,linux/arm64
 
           - name: mqtt-forwarder
