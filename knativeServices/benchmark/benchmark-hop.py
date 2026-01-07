@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 import os
 import time
-import uuid
 import logging
 from datetime import datetime, timezone
 
 import requests
 from flask import Flask, request, Response
-from cloudevents.http import from_http, CloudEvent
-from cloudevents.conversion import to_structured
+from cloudevents.http import from_http
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("benchmark-hop")
@@ -17,7 +15,9 @@ app = Flask(__name__)
 
 FORWARD_URL = os.getenv("FORWARD_URL", "").strip()
 HOP_NAME = os.getenv("HOP_NAME", "bench-hop")
-OUT_TYPE = os.getenv("OUT_TYPE", "its.cam.benchmarked")
+
+# Optional: override outgoing content-type (default is raw bytes)
+OUT_CONTENT_TYPE = os.getenv("OUT_CONTENT_TYPE", "application/octet-stream").strip()
 
 SESSION = requests.Session()
 
@@ -36,6 +36,14 @@ def parse_iso(ts: str) -> datetime | None:
         return None
 
 
+def hex_to_bytes(hex_str: str) -> bytes:
+    s = (hex_str or "").strip()
+    if s.startswith("0x") or s.startswith("0X"):
+        s = s[2:]
+    # bytes.fromhex tolerates whitespace between bytes; it will fail on non-hex chars.
+    return bytes.fromhex(s)
+
+
 @app.post("/")
 def handle():
     if not FORWARD_URL:
@@ -52,11 +60,16 @@ def handle():
 
     size_in = len(body_in)
 
-    # 2) Parse CloudEvent
-    event_in = from_http(headers_in, body_in)
+    # 2) Parse CloudEvent (incoming)
+    try:
+        event_in = from_http(headers_in, body_in)
+    except Exception as e:
+        log.exception("Failed to parse CloudEvent: %s", e)
+        return Response("Invalid CloudEvent", status=400)
     t2 = time.perf_counter_ns()
 
-    # Extract original attributes
+    # Extract original attributes (for logging/headers)
+    orig_id = event_in.get("id")
     orig_type = event_in.get("type")
     orig_source = event_in.get("source")
     orig_subject = event_in.get("subject")
@@ -69,84 +82,70 @@ def handle():
         if parsed is not None:
             e2e_ms = (datetime.now(timezone.utc) - parsed).total_seconds() * 1000.0
 
-    # 3) Build new benchmarked payload
+    # 3) Extract the raw frame hex from CE data and recreate the packet bytes
     data_in = event_in.data
-
-    # ensure dict
     if not isinstance(data_in, dict):
-        data_in = {"_raw": str(data_in)}
+        return Response("CloudEvent data is not a JSON object", status=422)
 
-    # timings so far
-    t_recv_to_body = t1 - t0
-    t_body_to_parsed = t2 - t1
+    frame_hex = data_in.get("frame_raw_hex")
+    if not isinstance(frame_hex, str) or not frame_hex.strip():
+        return Response("Missing data.frame_raw_hex", status=422)
 
-    bench_partial = {
-        "hop": HOP_NAME,
-        "recv_iso": recv_iso,
-        "original_time": orig_time,
-        "timings_ns": {
-            "recv_to_body": t_recv_to_body,
-            "body_to_parsed": t_body_to_parsed,
-        },
-        "sizes_bytes": {
-            "in": size_in,
-        },
-        "e2e_ms_from_ce_time": e2e_ms,
-        "orig_type": orig_type,
-        "orig_source": orig_source,
-        "orig_subject": orig_subject,
-    }
+    try:
+        packet_bytes = hex_to_bytes(frame_hex)
+    except Exception as e:
+        log.exception("Failed to decode frame_raw_hex: %s", e)
+        return Response("Invalid frame_raw_hex", status=422)
 
-    # wrap original data inside "original"
-    data_out = {
-        "original": data_in,
-        "bench": bench_partial,
-    }
-
+    size_out = len(packet_bytes)
     t3 = time.perf_counter_ns()
 
-    # 4) Create new CloudEvent with extensions
-    attrs_out = {
-        "specversion": "1.0",
-        "type": OUT_TYPE,
-        "source": orig_source or f"benchmark://{HOP_NAME}",
-        "id": str(uuid.uuid4()),
-        "time": now_iso(),
+    # Optional sanity check if frame_len exists
+    frame_len = data_in.get("frame_len")
+    if isinstance(frame_len, int) and frame_len != size_out:
+        log.warning(
+            "frame_len mismatch: frame_len=%d decoded_len=%d (still forwarding decoded bytes)",
+            frame_len,
+            size_out,
+        )
+
+    # 4) Forward the recreated packet as raw bytes (NOT a CloudEvent)
+    headers_out = {
+        "Content-Type": OUT_CONTENT_TYPE or "application/octet-stream",
+        # Helpful metadata for downstream (safe to remove if you want a “pure” payload)
+        "X-Hop-Name": HOP_NAME,
     }
+    if orig_id:
+        headers_out["X-Orig-CE-Id"] = str(orig_id)
+    if orig_time:
+        headers_out["X-Orig-CE-Time"] = str(orig_time)
+    if orig_source:
+        headers_out["X-Orig-CE-Source"] = str(orig_source)
+    if orig_type:
+        headers_out["X-Orig-CE-Type"] = str(orig_type)
     if orig_subject:
-        attrs_out["subject"] = orig_subject
-
-    # extensions for quick inspection
+        headers_out["X-Orig-CE-Subject"] = str(orig_subject)
     if e2e_ms is not None:
-        attrs_out["e2e_ms"] = f"{e2e_ms:.3f}"
-    attrs_out["hop"] = HOP_NAME
-
-    event_out = CloudEvent(attrs_out, data_out)
-
-    # 5) Serialize to structured mode & POST to next sink
-    headers_out, body_out = to_structured(event_out)
-    size_out = len(body_out)
-
-    # update sizes in bench
-    data_out["bench"]["sizes_bytes"]["out"] = size_out
-
-    # re-serialize with updated data
-    event_out = CloudEvent(attrs_out, data_out)
-    headers_out, body_out = to_structured(event_out)
+        headers_out["X-E2E-Ms-From-CE-Time"] = f"{e2e_ms:.3f}"
+    if isinstance(data_in.get("frame_number"), int):
+        headers_out["X-Frame-Number"] = str(data_in["frame_number"])
+    if isinstance(data_in.get("timestamp"), str):
+        headers_out["X-Frame-Timestamp"] = data_in["timestamp"]
 
     t_emit_start = time.perf_counter_ns()
-    resp = SESSION.post(FORWARD_URL, headers=headers_out, data=body_out, timeout=5.0)
+    resp = SESSION.post(FORWARD_URL, headers=headers_out, data=packet_bytes, timeout=5.0)
     t4 = time.perf_counter_ns()
 
     # timing details
+    t_recv_to_body = t1 - t0
+    t_body_to_parsed = t2 - t1
     t_parsed_to_built = t3 - t2
     t_built_to_emitted = t4 - t_emit_start
     total_ns = t4 - t0
 
-    # log everything
     log.info(
         "hop=%s orig_time=%s recv_iso=%s total_ns=%d recv->body_ns=%d body->parsed_ns=%d "
-        "parsed->built_ns=%d built->emit_ns=%d e2e_ms=%s status=%d",
+        "parsed->built_ns=%d built->emit_ns=%d e2e_ms=%s status=%d size_in=%d size_out=%d",
         HOP_NAME,
         orig_time,
         recv_iso,
@@ -157,6 +156,12 @@ def handle():
         t_built_to_emitted,
         f"{e2e_ms:.3f}" if e2e_ms is not None else "None",
         resp.status_code,
-    )   
+        size_in,
+        size_out,
+    )
+
+    # Consider surfacing downstream errors
+    if resp.status_code >= 400:
+        log.error("Downstream returned status=%d body=%r", resp.status_code, resp.text[:500])
 
     return Response(status=204)

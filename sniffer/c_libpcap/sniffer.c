@@ -1,0 +1,732 @@
+// sniffer.c — libpcap + libcurl CloudEvents structured sender
+// Build (Alpine): gcc -O2 -Wall -Wextra -pthread sniffer.c -lpcap -lcurl -o sniffer
+
+#define _GNU_SOURCE
+#include <pcap/pcap.h>
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <curl/curl.h>
+
+/* -------------------------
+ * Config via environment
+ * ------------------------- */
+static const char *ENV_IFACE;
+static const char *ENV_BPF;
+static const char *ENV_DISPLAY_FILTER; /* logged only */
+static int   ENV_LOG_EVERY = 10;
+static const char *ENV_CE_TYPE;
+static bool  ENV_INCLUDE_RAW_HEX = false;
+static const char *ENV_SINK_URL;       /* K_SINK */
+static bool  ENV_STDOUT_NDJSON = true;
+static bool  ENV_PROMISCUOUS = false;
+static int   ENV_SEND_QUEUE_MAX = 1000;
+
+static char CE_SOURCE[256] = {0};
+
+/* -------------------------
+ * Logging
+ * ------------------------- */
+static void logi(const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+}
+static void logw(const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  fprintf(stderr, "[WARN] ");
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+}
+static void loge(const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  fprintf(stderr, "[ERROR] ");
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+}
+
+/* -------------------------
+ * Helpers
+ * ------------------------- */
+static volatile sig_atomic_t g_stop = 0;
+static void on_sig(int sig) { (void)sig; g_stop = 1; }
+
+static void iso8601_from_timeval(const struct timeval *tv, char *out, size_t out_sz) {
+  /* UTC ISO8601 with microseconds: YYYY-MM-DDTHH:MM:SS.uuuuuuZ */
+  struct tm tm;
+  time_t sec = tv->tv_sec;
+  gmtime_r(&sec, &tm);
+  int n = snprintf(out, out_sz,
+                   "%04d-%02d-%02dT%02d:%02d:%02d.%06ldZ",
+                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                   tm.tm_hour, tm.tm_min, tm.tm_sec, (long)tv->tv_usec);
+  if (n < 0 || (size_t)n >= out_sz) {
+    snprintf(out, out_sz, "1970-01-01T00:00:00.000000Z");
+  }
+}
+
+static void mac_to_str(const uint8_t mac[6], char *out, size_t out_sz) {
+  snprintf(out, out_sz, "%02x:%02x:%02x:%02x:%02x:%02x",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static char *hex_encode(const uint8_t *buf, size_t len) {
+  static const char *hex = "0123456789abcdef";
+  size_t out_len = len * 2;
+  char *out = (char *)malloc(out_len + 1);
+  if (!out) return NULL;
+  for (size_t i = 0; i < len; i++) {
+    out[i*2]     = hex[(buf[i] >> 4) & 0xF];
+    out[i*2 + 1] = hex[buf[i] & 0xF];
+  }
+  out[out_len] = '\0';
+  return out;
+}
+
+static char *json_escape(const char *s) {
+  /* Minimal JSON escaping for strings */
+  size_t n = 0;
+  for (const char *p = s; *p; p++) {
+    switch (*p) {
+      case '\"': case '\\': case '\b': case '\f': case '\n': case '\r': case '\t':
+        n += 2; break;
+      default:
+        if ((unsigned char)*p < 0x20) n += 6; else n += 1;
+    }
+  }
+  char *out = (char *)malloc(n + 1);
+  if (!out) return NULL;
+  char *o = out;
+  for (const char *p = s; *p; p++) {
+    switch (*p) {
+      case '\"': *o++='\\'; *o++='\"'; break;
+      case '\\': *o++='\\'; *o++='\\'; break;
+      case '\b': *o++='\\'; *o++='b'; break;
+      case '\f': *o++='\\'; *o++='f'; break;
+      case '\n': *o++='\\'; *o++='n'; break;
+      case '\r': *o++='\\'; *o++='r'; break;
+      case '\t': *o++='\\'; *o++='t'; break;
+      default:
+        if ((unsigned char)*p < 0x20) {
+          sprintf(o, "\\u%04x", (unsigned char)*p);
+          o += 6;
+        } else {
+          *o++ = *p;
+        }
+    }
+  }
+  *o = '\0';
+  return out;
+}
+
+static bool uuid4(char out[37]) {
+  uint8_t b[16];
+  int fd = open("/dev/urandom", O_RDONLY);
+  if (fd < 0) return false;
+  ssize_t r = read(fd, b, sizeof(b));
+  close(fd);
+  if (r != (ssize_t)sizeof(b)) return false;
+
+  /* RFC 4122 v4 */
+  b[6] = (b[6] & 0x0F) | 0x40;
+  b[8] = (b[8] & 0x3F) | 0x80;
+
+  snprintf(out, 37,
+           "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+           b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+           b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+  return true;
+}
+
+/* -------------------------
+ * Bounded send queue
+ * ------------------------- */
+typedef struct {
+  char *body;
+  size_t body_len;
+} job_t;
+
+typedef struct {
+  job_t **items;
+  int cap, head, tail, count;
+  pthread_mutex_t mu;
+  pthread_cond_t cv_not_empty;
+} jobq_t;
+
+static jobq_t g_q;
+
+static void jobq_init(jobq_t *q, int cap) {
+  q->items = (job_t **)calloc((size_t)cap, sizeof(job_t *));
+  q->cap = cap; q->head = 0; q->tail = 0; q->count = 0;
+  pthread_mutex_init(&q->mu, NULL);
+  pthread_cond_init(&q->cv_not_empty, NULL);
+}
+
+static void jobq_destroy(jobq_t *q) {
+  pthread_mutex_lock(&q->mu);
+  for (int i = 0; i < q->cap; i++) {
+    if (q->items[i]) {
+      free(q->items[i]->body);
+      free(q->items[i]);
+    }
+  }
+  free(q->items);
+  pthread_mutex_unlock(&q->mu);
+  pthread_mutex_destroy(&q->mu);
+  pthread_cond_destroy(&q->cv_not_empty);
+}
+
+static bool jobq_try_push(jobq_t *q, job_t *job) {
+  bool ok = false;
+  pthread_mutex_lock(&q->mu);
+  if (q->count < q->cap) {
+    q->items[q->tail] = job;
+    q->tail = (q->tail + 1) % q->cap;
+    q->count++;
+    ok = true;
+    pthread_cond_signal(&q->cv_not_empty);
+  }
+  pthread_mutex_unlock(&q->mu);
+  return ok;
+}
+
+static job_t *jobq_pop_block(jobq_t *q) {
+  pthread_mutex_lock(&q->mu);
+  while (q->count == 0 && !g_stop) {
+    pthread_cond_wait(&q->cv_not_empty, &q->mu);
+  }
+  job_t *job = NULL;
+  if (q->count > 0) {
+    job = q->items[q->head];
+    q->items[q->head] = NULL;
+    q->head = (q->head + 1) % q->cap;
+    q->count--;
+  }
+  pthread_mutex_unlock(&q->mu);
+  return job;
+}
+
+/* -------------------------
+ * HTTP sender (CloudEvents structured)
+ * ------------------------- */
+static const char *truthy(const char *s) {
+  if (!s) return NULL;
+  if (strcmp(s,"1")==0) return s;
+  if (strcasecmp(s,"true")==0) return s;
+  if (strcasecmp(s,"yes")==0) return s;
+  return NULL;
+}
+
+static void *sender_thread_fn(void *arg) {
+  (void)arg;
+
+  CURL *curl = curl_easy_init();
+  if (!curl) {
+    loge("curl_easy_init failed");
+    return NULL;
+  }
+
+  struct curl_slist *headers = NULL;
+  headers = curl_slist_append(headers, "Content-Type: application/cloudevents+json");
+
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_URL, ENV_SINK_URL);
+  curl_easy_setopt(curl, CURLOPT_POST, 1L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+
+  /* Like requests.Session(trust_env=False): disable proxy env usage */
+  curl_easy_setopt(curl, CURLOPT_PROXY, "");
+  curl_easy_setopt(curl, CURLOPT_NOPROXY, "*");
+
+  curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+
+  while (!g_stop) {
+    job_t *job = jobq_pop_block(&g_q);
+    if (!job) continue;
+
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, job->body);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)job->body_len);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    CURLcode rc = curl_easy_perform(curl);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+
+    long long elapsed_ns =
+      (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL +
+      (long long)(t1.tv_nsec - t0.tv_nsec);
+
+    if (rc != CURLE_OK) {
+      logw("sniffer POST elapsed_ns=%lld status=%ld curl_err=%s",
+           elapsed_ns, status, curl_easy_strerror(rc));
+    } else {
+      logi("sniffer POST elapsed_ns=%lld status=%ld", elapsed_ns, status);
+    }
+
+    free(job->body);
+    free(job);
+  }
+
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  return NULL;
+}
+
+/* -------------------------
+ * Packet parsing (fast metadata)
+ * ------------------------- */
+#pragma pack(push, 1)
+typedef struct {
+  uint8_t  dst[6];
+  uint8_t  src[6];
+  uint16_t ethertype;
+} eth_hdr_t;
+
+typedef struct {
+  uint16_t tci;
+  uint16_t ethertype;
+} vlan_hdr_t;
+
+typedef struct {
+  uint8_t  ver_ihl;
+  uint8_t  tos;
+  uint16_t tot_len;
+  uint16_t id;
+  uint16_t frag_off;
+  uint8_t  ttl;
+  uint8_t  proto;
+  uint16_t csum;
+  uint32_t saddr;
+  uint32_t daddr;
+} ipv4_hdr_t;
+
+typedef struct {
+  uint16_t sport;
+  uint16_t dport;
+  uint16_t len;
+  uint16_t csum;
+} udp_hdr_t;
+#pragma pack(pop)
+
+static char *build_record_json(
+    uint64_t frame_no,
+    const struct pcap_pkthdr *h,
+    const uint8_t *pkt,
+    size_t pkt_len
+) {
+  char ts[64];
+  iso8601_from_timeval(&h->ts, ts, sizeof(ts));
+
+  char srcmac[32] = {0}, dstmac[32] = {0};
+  uint16_t ethertype = 0;
+  int vlan_id = -1;
+
+  char srcip[64] = {0}, dstip[64] = {0};
+  int srcport = -1, dstport = -1;
+  bool is_udp = false;
+  bool is_ipv4 = false;
+  bool is_etsi_its = false;
+
+  size_t off = 0;
+  if (pkt_len >= sizeof(eth_hdr_t)) {
+    const eth_hdr_t *eth = (const eth_hdr_t *)(pkt);
+    mac_to_str(eth->src, srcmac, sizeof(srcmac));
+    mac_to_str(eth->dst, dstmac, sizeof(dstmac));
+    ethertype = ntohs(eth->ethertype);
+    off = sizeof(eth_hdr_t);
+
+    if ((ethertype == 0x8100 || ethertype == 0x88a8) && pkt_len >= off + sizeof(vlan_hdr_t)) {
+      const vlan_hdr_t *v = (const vlan_hdr_t *)(pkt + off);
+      uint16_t tci = ntohs(v->tci);
+      vlan_id = (int)(tci & 0x0FFF);
+      ethertype = ntohs(v->ethertype);
+      off += sizeof(vlan_hdr_t);
+    }
+
+    if (ethertype == 0x8947) {
+      is_etsi_its = true; /* ETSI ITS (GeoNetworking) ethertype */
+    }
+
+    if (ethertype == 0x0800 && pkt_len >= off + sizeof(ipv4_hdr_t)) {
+      const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(pkt + off);
+      uint8_t ver = (ip->ver_ihl >> 4) & 0xF;
+      uint8_t ihl = (ip->ver_ihl & 0xF) * 4;
+      if (ver == 4 && pkt_len >= off + ihl) {
+        is_ipv4 = true;
+        struct in_addr a;
+        a.s_addr = ip->saddr; inet_ntop(AF_INET, &a, srcip, sizeof(srcip));
+        a.s_addr = ip->daddr; inet_ntop(AF_INET, &a, dstip, sizeof(dstip));
+
+        if (ip->proto == 17 && pkt_len >= off + ihl + sizeof(udp_hdr_t)) {
+          const udp_hdr_t *udp = (const udp_hdr_t *)(pkt + off + ihl);
+          srcport = (int)ntohs(udp->sport);
+          dstport = (int)ntohs(udp->dport);
+          is_udp = true;
+        }
+      }
+    }
+  }
+
+  char *ts_esc = json_escape(ts);
+  char *srcmac_esc = json_escape(srcmac[0] ? srcmac : "");
+  char *dstmac_esc = json_escape(dstmac[0] ? dstmac : "");
+  char *srcip_esc  = json_escape(srcip[0] ? srcip : "");
+  char *dstip_esc  = json_escape(dstip[0] ? dstip : "");
+
+  char *raw_hex = NULL;
+  if (ENV_INCLUDE_RAW_HEX) raw_hex = hex_encode(pkt, pkt_len);
+
+  char vlan_part[64];
+  if (vlan_id >= 0) snprintf(vlan_part, sizeof(vlan_part), "%d", vlan_id);
+  else snprintf(vlan_part, sizeof(vlan_part), "null");
+
+  char srcip_part[128];
+  if (srcip[0]) snprintf(srcip_part, sizeof(srcip_part), "\"%s\"", srcip_esc);
+  else snprintf(srcip_part, sizeof(srcip_part), "null");
+
+  char dstip_part[128];
+  if (dstip[0]) snprintf(dstip_part, sizeof(dstip_part), "\"%s\"", dstip_esc);
+  else snprintf(dstip_part, sizeof(dstip_part), "null");
+
+  char srcport_part[64];
+  if (srcport >= 0) snprintf(srcport_part, sizeof(srcport_part), "%d", srcport);
+  else snprintf(srcport_part, sizeof(srcport_part), "null");
+
+  char dstport_part[64];
+  if (dstport >= 0) snprintf(dstport_part, sizeof(dstport_part), "%d", dstport);
+  else snprintf(dstport_part, sizeof(dstport_part), "null");
+
+  size_t buf_sz = 2048
+    + strlen(ts_esc) + strlen(srcmac_esc) + strlen(dstmac_esc)
+    + strlen(srcip_esc) + strlen(dstip_esc)
+    + (raw_hex ? (strlen(raw_hex) + 64) : 0);
+
+  char *buf = (char *)malloc(buf_sz);
+  if (!buf) {
+    free(ts_esc); free(srcmac_esc); free(dstmac_esc); free(srcip_esc); free(dstip_esc);
+    free(raw_hex);
+    return NULL;
+  }
+
+  int n = snprintf(
+    buf, buf_sz,
+    "{"
+      "\"timestamp\":\"%s\","
+      "\"frame_number\":%" PRIu64 ","
+      "\"cam_layer\":\"its\","
+      "\"pcap_len\":%u,"
+      "\"pcap_caplen\":%u,"
+      "\"cam_fields\":{"
+        "\"src_mac\":\"%s\","
+        "\"dst_mac\":\"%s\","
+        "\"ethertype\":\"0x%04x\","
+        "\"vlan_id\":%s,"
+        "\"is_etsi_its_ethertype\":%s,"
+        "\"is_ipv4\":%s,"
+        "\"is_udp\":%s,"
+        "\"src_ip\":%s,"
+        "\"dst_ip\":%s,"
+        "\"src_port\":%s,"
+        "\"dst_port\":%s"
+      "}%s%s%s"
+    "}",
+    ts_esc,
+    frame_no,
+    h->len,
+    h->caplen,
+    srcmac_esc,
+    dstmac_esc,
+    ethertype,
+    vlan_part,
+    is_etsi_its ? "true" : "false",
+    is_ipv4 ? "true" : "false",
+    is_udp ? "true" : "false",
+    srcip_part,
+    dstip_part,
+    srcport_part,
+    dstport_part,
+    raw_hex ? ",\"frame_raw_hex\":\"" : "",
+    raw_hex ? raw_hex : "",
+    raw_hex ? "\"" : ""
+  );
+
+  if (n < 0 || (size_t)n >= buf_sz) {
+    free(buf);
+    buf = NULL;
+  }
+
+  free(ts_esc); free(srcmac_esc); free(dstmac_esc); free(srcip_esc); free(dstip_esc);
+  free(raw_hex);
+  return buf;
+}
+
+static char *build_cloudevent_structured(
+    const char *event_type,
+    const char *source,
+    const char *subject_or_null, /* frame_number as string or NULL */
+    const char *data_json_obj,   /* must be JSON object string */
+    size_t *out_len
+) {
+  char id[37];
+  if (!uuid4(id)) snprintf(id, sizeof(id), "00000000-0000-4000-8000-000000000000");
+
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  char tbuf[64];
+  iso8601_from_timeval(&tv, tbuf, sizeof(tbuf));
+
+  char *type_esc = json_escape(event_type);
+  char *src_esc  = json_escape(source);
+  char *id_esc   = json_escape(id);
+  char *time_esc = json_escape(tbuf);
+
+  char *subj_part = NULL;
+  if (subject_or_null) {
+    char *subj_esc = json_escape(subject_or_null);
+    size_t sp_sz = strlen(subj_esc) + 32;
+    subj_part = (char *)malloc(sp_sz);
+    snprintf(subj_part, sp_sz, ",\"subject\":\"%s\"", subj_esc);
+    free(subj_esc);
+  } else {
+    subj_part = strdup("");
+  }
+
+  size_t body_sz =
+    strlen(type_esc) + strlen(src_esc) + strlen(id_esc) + strlen(time_esc) +
+    strlen(subj_part) + strlen(data_json_obj) + 256;
+
+  char *body = (char *)malloc(body_sz);
+  if (!body) {
+    free(type_esc); free(src_esc); free(id_esc); free(time_esc); free(subj_part);
+    return NULL;
+  }
+
+  snprintf(
+    body, body_sz,
+    "{"
+      "\"specversion\":\"1.0\","
+      "\"type\":\"%s\","
+      "\"source\":\"%s\","
+      "\"id\":\"%s\","
+      "\"time\":\"%s\","
+      "\"datacontenttype\":\"application/json\""
+      "%s,"
+      "\"data\":%s"
+    "}",
+    type_esc, src_esc, id_esc, time_esc, subj_part, data_json_obj
+  );
+
+  *out_len = strlen(body);
+
+  free(type_esc); free(src_esc); free(id_esc); free(time_esc); free(subj_part);
+  return body;
+}
+
+/* -------------------------
+ * libpcap capture
+ * ------------------------- */
+static uint64_t g_frame_no = 0;
+static uint64_t g_processed = 0;
+
+static void on_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes) {
+  (void)user;
+  if (g_stop) return;
+
+  g_frame_no++;
+
+  char *rec = build_record_json(g_frame_no, h, bytes, h->caplen);
+  if (!rec) return;
+
+  if (ENV_STDOUT_NDJSON) {
+    fputs(rec, stdout);
+    fputc('\n', stdout);
+  }
+
+  if (ENV_SINK_URL && ENV_SINK_URL[0]) {
+    char subj[32];
+    snprintf(subj, sizeof(subj), "%" PRIu64, g_frame_no);
+
+    size_t body_len = 0;
+    char *ce = build_cloudevent_structured(ENV_CE_TYPE, CE_SOURCE, subj, rec, &body_len);
+    if (ce) {
+      job_t *job = (job_t *)calloc(1, sizeof(job_t));
+      if (!job) {
+        free(ce);
+      } else {
+        job->body = ce;
+        job->body_len = body_len;
+        if (!jobq_try_push(&g_q, job)) {
+          logw("SEND_QUEUE full, dropping event");
+          free(job->body);
+          free(job);
+        }
+      }
+    }
+  }
+
+  free(rec);
+
+  g_processed++;
+  if (ENV_LOG_EVERY > 0 && (g_processed % (uint64_t)ENV_LOG_EVERY) == 0) {
+    logi("[pcap] processed %" PRIu64 " packets (sink=%s)", g_processed,
+         (ENV_SINK_URL && ENV_SINK_URL[0]) ? "on" : "off");
+  }
+}
+
+static void set_defaults_from_env(void) {
+  ENV_IFACE = getenv("IFACE");
+  if (!ENV_IFACE || !ENV_IFACE[0]) ENV_IFACE = "eth0";
+
+  ENV_BPF = getenv("BPF");
+  if (!ENV_BPF || !ENV_BPF[0]) {
+    ENV_BPF = "(ether proto 0x8947 or (vlan and ether[16:2]==0x8947)) or udp port 2001";
+  }
+
+  ENV_DISPLAY_FILTER = getenv("DISPLAY_FILTER");
+
+  const char *le = getenv("LOG_EVERY");
+  if (le && le[0]) ENV_LOG_EVERY = atoi(le);
+
+  ENV_CE_TYPE = getenv("CE_TYPE");
+  if (!ENV_CE_TYPE || !ENV_CE_TYPE[0]) ENV_CE_TYPE = "its.cam";
+
+  ENV_INCLUDE_RAW_HEX = truthy(getenv("INCLUDE_RAW_HEX")) != NULL;
+
+  ENV_SINK_URL = getenv("K_SINK");
+  if (!ENV_SINK_URL) ENV_SINK_URL = "";
+
+  const char *nd = getenv("STDOUT_NDJSON");
+  if (nd && nd[0]) {
+    ENV_STDOUT_NDJSON = truthy(nd) != NULL;
+  }
+
+  ENV_PROMISCUOUS = truthy(getenv("PROMISCUOUS")) != NULL;
+
+  const char *sqm = getenv("SEND_QUEUE_MAX");
+  if (sqm && sqm[0]) ENV_SEND_QUEUE_MAX = atoi(sqm);
+  if (ENV_SEND_QUEUE_MAX <= 0) ENV_SEND_QUEUE_MAX = 1000;
+
+  const char *host =
+    getenv("K8S_NODE_NAME") ? getenv("K8S_NODE_NAME") :
+    getenv("NODE_NAME")     ? getenv("NODE_NAME")     :
+    getenv("HOSTNAME")      ? getenv("HOSTNAME")      : "host";
+
+  snprintf(CE_SOURCE, sizeof(CE_SOURCE), "sniffer://%s/%s", host, ENV_IFACE);
+}
+
+int main(void) {
+  setvbuf(stdout, NULL, _IOLBF, 0);
+
+  set_defaults_from_env();
+
+  signal(SIGINT, on_sig);
+  signal(SIGTERM, on_sig);
+
+  logi(">> LIVE capture iface='%s' promisc=%s", ENV_IFACE, ENV_PROMISCUOUS ? "on" : "off");
+  logi(">> BPF='%s'", ENV_BPF);
+  if (ENV_DISPLAY_FILTER && ENV_DISPLAY_FILTER[0]) {
+    logi(">> DISPLAY_FILTER='%s' (ignored in libpcap version)", ENV_DISPLAY_FILTER);
+  }
+  logi(">> CloudEvents sink: %s -> %s",
+       (ENV_SINK_URL && ENV_SINK_URL[0]) ? "on" : "off",
+       (ENV_SINK_URL && ENV_SINK_URL[0]) ? ENV_SINK_URL : "-");
+  logi(">> SEND_QUEUE_MAX=%d", ENV_SEND_QUEUE_MAX);
+
+  bool sink_on = (ENV_SINK_URL && ENV_SINK_URL[0]);
+  pthread_t sender_th;
+
+  jobq_init(&g_q, ENV_SEND_QUEUE_MAX);
+
+  if (sink_on) {
+    curl_global_init(CURL_GLOBAL_ALL);
+    if (pthread_create(&sender_th, NULL, sender_thread_fn, NULL) != 0) {
+      loge("failed to start sender thread (disabling sink)");
+      sink_on = false;
+    }
+  }
+
+  char errbuf[PCAP_ERRBUF_SIZE] = {0};
+  pcap_t *pc = pcap_create(ENV_IFACE, errbuf);
+  if (!pc) {
+    loge("pcap_create failed: %s", errbuf);
+    g_stop = 1;
+    goto shutdown;
+  }
+
+  pcap_set_snaplen(pc, 262144);
+  pcap_set_promisc(pc, ENV_PROMISCUOUS ? 1 : 0);
+  pcap_set_timeout(pc, 1000);
+
+  int rc = pcap_activate(pc);
+  if (rc < 0) {
+    loge("pcap_activate failed: %s", pcap_geterr(pc));
+    pcap_close(pc);
+    g_stop = 1;
+    goto shutdown;
+  }
+
+  struct bpf_program fp;
+  if (pcap_compile(pc, &fp, ENV_BPF, 1, PCAP_NETMASK_UNKNOWN) < 0) {
+    loge("pcap_compile failed: %s", pcap_geterr(pc));
+    pcap_close(pc);
+    g_stop = 1;
+    goto shutdown;
+  }
+  if (pcap_setfilter(pc, &fp) < 0) {
+    loge("pcap_setfilter failed: %s", pcap_geterr(pc));
+    pcap_freecode(&fp);
+    pcap_close(pc);
+    g_stop = 1;
+    goto shutdown;
+  }
+  pcap_freecode(&fp);
+
+  while (!g_stop) {
+    int r = pcap_dispatch(pc, 64, on_packet, NULL);
+    if (r < 0) {
+      loge("pcap_dispatch error: %s", pcap_geterr(pc));
+      break;
+    }
+    /* r==0 is timeout */
+  }
+
+  pcap_breakloop(pc);
+  pcap_close(pc);
+
+shutdown:
+  g_stop = 1;
+
+  /* wake sender thread */
+  pthread_mutex_lock(&g_q.mu);
+  pthread_cond_broadcast(&g_q.cv_not_empty);
+  pthread_mutex_unlock(&g_q.mu);
+
+  if (sink_on) {
+    pthread_join(sender_th, NULL);
+    curl_global_cleanup();
+  }
+
+  jobq_destroy(&g_q);
+  return g_stop ? 1 : 0;
+}

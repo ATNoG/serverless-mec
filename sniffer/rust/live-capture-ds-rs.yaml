@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: live-capture
+  labels:
+    app: live-capture
+spec:
+  selector:
+    matchLabels:
+      app: live-capture
+  template:
+    metadata:
+      labels:
+        app: live-capture
+    spec:
+      # See all node interfaces and get node network namespace
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: user-container
+          # TODO: change to your actual pushed image name
+          image: ghcr.io/pmacoutinho/its-live-capture-rs:latest
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: IFACE
+              value: "cw-mon-rxa"
+            - name: BPF
+              value: ""              # empty => no BPF filter (overrides default)
+            - name: LOG_EVERY
+              value: "10"
+            - name: CE_TYPE
+              value: "its.cam"
+            - name: STDOUT_NDJSON
+              value: "1"
+            - name: PROMISCUOUS
+              value: "1"
+            - name: RUST_LOG
+              value: "info"
+            - name: INCLUDE_RAW_HEX
+              value: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_RAW", "NET_ADMIN"]  # needed for AF_PACKET capture
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+      volumes:
+        - name: varlog
+          emptyDir: {}

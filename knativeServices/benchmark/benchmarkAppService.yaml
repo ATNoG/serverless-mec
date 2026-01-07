@@ -1,0 +1,13 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: benchmark-app
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+      - image: ghcr.io/pmacoutinho/benchmark-hop:latest
+        # containerPort is optional; Knative sets $PORT for the image.
+        ports:
+        - containerPort: 8080
