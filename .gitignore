@@ -1,2 +1,2 @@
-rust/Cargo.lock
-rust/target/
+sniffer/rust/Cargo.lock
+sniffer/rust/target/
