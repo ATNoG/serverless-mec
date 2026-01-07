@@ -25,8 +25,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: its-live-capture
-            context: ./sniffer
+          - name: live-capture-rsock
+            context: ./sniffer/atnog-capture
             file: ./sniffer/atnog-capture/Dockerfile
             image: ghcr.io/pmacoutinho/live-capture-rsock
             platforms: linux/amd64,linux/arm64
