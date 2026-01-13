@@ -56,9 +56,8 @@ spec:
             - name: SEND_QUEUE_MAX
               value: "1000"
 
-            # Optional: include full frame hex in output (can be huge)
-            # - name: INCLUDE_RAW_HEX
-            #   value: "1"
+            - name: CE_INCLUDE_RAW_HEX
+              value: "1"
 
           securityContext:
             allowPrivilegeEscalation: false

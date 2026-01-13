@@ -31,7 +31,8 @@ static const char *ENV_BPF;
 static const char *ENV_DISPLAY_FILTER; /* logged only */
 static int   ENV_LOG_EVERY = 10;
 static const char *ENV_CE_TYPE;
-static bool  ENV_INCLUDE_RAW_HEX = false;
+static bool  ENV_INCLUDE_RAW_HEX = false;     /* stdout NDJSON raw hex */
+static bool  ENV_CE_INCLUDE_RAW_HEX = true;  /* CloudEvents data raw hex (default ON) */
 static const char *ENV_SINK_URL;       /* K_SINK */
 static bool  ENV_STDOUT_NDJSON = true;
 static bool  ENV_PROMISCUOUS = false;
@@ -103,6 +104,7 @@ static char *hex_encode(const uint8_t *buf, size_t len) {
 
 static char *json_escape(const char *s) {
   /* Minimal JSON escaping for strings */
+  if (!s) s = "";
   size_t n = 0;
   for (const char *p = s; *p; p++) {
     switch (*p) {
@@ -251,6 +253,7 @@ static void *sender_thread_fn(void *arg) {
   curl_easy_setopt(curl, CURLOPT_URL, ENV_SINK_URL);
   curl_easy_setopt(curl, CURLOPT_POST, 1L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); /* important in multi-threaded apps */
 
   /* Like requests.Session(trust_env=False): disable proxy env usage */
   curl_easy_setopt(curl, CURLOPT_PROXY, "");
@@ -333,7 +336,8 @@ static char *build_record_json(
     uint64_t frame_no,
     const struct pcap_pkthdr *h,
     const uint8_t *pkt,
-    size_t pkt_len
+    size_t pkt_len,
+    bool include_raw_hex
 ) {
   char ts[64];
   iso8601_from_timeval(&h->ts, ts, sizeof(ts));
@@ -395,7 +399,13 @@ static char *build_record_json(
   char *dstip_esc  = json_escape(dstip[0] ? dstip : "");
 
   char *raw_hex = NULL;
-  if (ENV_INCLUDE_RAW_HEX) raw_hex = hex_encode(pkt, pkt_len);
+  if (include_raw_hex) raw_hex = hex_encode(pkt, pkt_len);
+
+  if (!ts_esc || !srcmac_esc || !dstmac_esc || !srcip_esc || !dstip_esc) {
+    free(ts_esc); free(srcmac_esc); free(dstmac_esc); free(srcip_esc); free(dstip_esc);
+    free(raw_hex);
+    return NULL;
+  }
 
   char vlan_part[64];
   if (vlan_id >= 0) snprintf(vlan_part, sizeof(vlan_part), "%d", vlan_id);
@@ -506,10 +516,15 @@ static char *build_cloudevent_structured(
     char *subj_esc = json_escape(subject_or_null);
     size_t sp_sz = strlen(subj_esc) + 32;
     subj_part = (char *)malloc(sp_sz);
-    snprintf(subj_part, sp_sz, ",\"subject\":\"%s\"", subj_esc);
+    if (subj_part) snprintf(subj_part, sp_sz, ",\"subject\":\"%s\"", subj_esc);
     free(subj_esc);
   } else {
     subj_part = strdup("");
+  }
+
+  if (!type_esc || !src_esc || !id_esc || !time_esc || !subj_part) {
+    free(type_esc); free(src_esc); free(id_esc); free(time_esc); free(subj_part);
+    return NULL;
   }
 
   size_t body_sz =
@@ -555,20 +570,37 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *b
 
   g_frame_no++;
 
-  char *rec = build_record_json(g_frame_no, h, bytes, h->caplen);
-  if (!rec) return;
+  /* Build stdout record (may or may not include raw hex) */
+  char *rec_out = build_record_json(g_frame_no, h, bytes, h->caplen, ENV_INCLUDE_RAW_HEX);
+  if (!rec_out) return;
 
   if (ENV_STDOUT_NDJSON) {
-    fputs(rec, stdout);
+    fputs(rec_out, stdout);
     fputc('\n', stdout);
   }
 
-  if (ENV_SINK_URL && ENV_SINK_URL[0]) {
+  bool sink_on = (ENV_SINK_URL && ENV_SINK_URL[0]);
+
+  /* Build CloudEvents record (ensure raw hex included if requested) */
+  char *rec_ce = rec_out;
+  bool rec_ce_is_separate = false;
+
+  if (sink_on && ENV_CE_INCLUDE_RAW_HEX && !ENV_INCLUDE_RAW_HEX) {
+    rec_ce = build_record_json(g_frame_no, h, bytes, h->caplen, true);
+    if (!rec_ce) {
+      /* fallback: still emit event without raw */
+      rec_ce = rec_out;
+    } else {
+      rec_ce_is_separate = true;
+    }
+  }
+
+  if (sink_on) {
     char subj[32];
     snprintf(subj, sizeof(subj), "%" PRIu64, g_frame_no);
 
     size_t body_len = 0;
-    char *ce = build_cloudevent_structured(ENV_CE_TYPE, CE_SOURCE, subj, rec, &body_len);
+    char *ce = build_cloudevent_structured(ENV_CE_TYPE, CE_SOURCE, subj, rec_ce, &body_len);
     if (ce) {
       job_t *job = (job_t *)calloc(1, sizeof(job_t));
       if (!job) {
@@ -585,7 +617,8 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *b
     }
   }
 
-  free(rec);
+  if (rec_ce_is_separate) free(rec_ce);
+  free(rec_out);
 
   g_processed++;
   if (ENV_LOG_EVERY > 0 && (g_processed % (uint64_t)ENV_LOG_EVERY) == 0) {
@@ -612,6 +645,14 @@ static void set_defaults_from_env(void) {
   if (!ENV_CE_TYPE || !ENV_CE_TYPE[0]) ENV_CE_TYPE = "its.cam";
 
   ENV_INCLUDE_RAW_HEX = truthy(getenv("INCLUDE_RAW_HEX")) != NULL;
+
+  /* CloudEvents raw frame hex (default ON). If set (even to empty), it is honored. */
+  const char *cer = getenv("CE_INCLUDE_RAW_HEX");
+  if (cer == NULL) {
+    ENV_CE_INCLUDE_RAW_HEX = true;
+  } else {
+    ENV_CE_INCLUDE_RAW_HEX = truthy(cer) != NULL;
+  }
 
   ENV_SINK_URL = getenv("K_SINK");
   if (!ENV_SINK_URL) ENV_SINK_URL = "";
@@ -651,6 +692,7 @@ int main(void) {
   logi(">> CloudEvents sink: %s -> %s",
        (ENV_SINK_URL && ENV_SINK_URL[0]) ? "on" : "off",
        (ENV_SINK_URL && ENV_SINK_URL[0]) ? ENV_SINK_URL : "-");
+  logi(">> CE_INCLUDE_RAW_HEX=%s (CloudEvents include full frame hex)", ENV_CE_INCLUDE_RAW_HEX ? "true" : "false");
   logi(">> SEND_QUEUE_MAX=%d", ENV_SEND_QUEUE_MAX);
 
   bool sink_on = (ENV_SINK_URL && ENV_SINK_URL[0]);
