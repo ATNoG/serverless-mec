@@ -1,3 +1,3 @@
-requests
-pcapy-ng
 cloudevents
+pyshark
+requests

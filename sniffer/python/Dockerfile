@@ -1,27 +1,19 @@
 # syntax=docker/dockerfile:1
 FROM python:3.11-alpine
 
-RUN apk add --no-cache \
-      libpcap \
-      libstdc++ \
-      ca-certificates \
-      build-base linux-headers libpcap-dev
+# Install tshark (CLI version of Wireshark) + tcpdump + libcap
+RUN apk add --no-cache tshark tcpdump libcap \
+ && setcap 'CAP_NET_RAW+eip CAP_NET_ADMIN+eip' /usr/bin/dumpcap
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-  && apk del build-base linux-headers libpcap-dev
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY sniffer.py .
 
 ENV IFACE=eth0 \
-    BPF="" \
-    PROMISCUOUS=0 \
-    SEND_QUEUE_MAX=20000 \
-    SENDER_WORKERS=4 \
-    MEASURE_POST=1 \
-    INCLUDE_TIME=0 \
-    PCAP_TIMEOUT_MS=1
+    BPF="ether proto 0x8947" \
+    LOG_EVERY=50
 
 ENTRYPOINT ["python", "sniffer.py"]

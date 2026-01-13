@@ -1,230 +1,282 @@
 #!/usr/bin/env python3
 import os
 import sys
-import time
-import queue
-import signal
+import json
+import uuid
+import shutil
 import logging
-import threading
+import time
 from datetime import datetime, timezone
+import queue
+import threading
 
-import pcapy  # pcapy-ng
 import requests
-from requests.adapters import HTTPAdapter
+import pyshark
 
+from cloudevents.http import CloudEvent
+from cloudevents.conversion import to_structured
 
 # -------------------------
-# Config
+# Config via environment
 # -------------------------
 IFACE = os.getenv("IFACE", "eth0").strip()
-BPF = os.getenv("BPF", "").strip()  # optional; if empty we won't setfilter()
+BPF = os.getenv(
+    "BPF",
+    "(ether proto 0x8947 or (vlan and ether[16:2]==0x8947)) or udp port 2001",
+).strip()
+DISPLAY_FILTER = os.getenv("DISPLAY_FILTER", "").strip() or None
+LOG_EVERY = int(os.getenv("LOG_EVERY", "10"))
+CE_TYPE = os.getenv("CE_TYPE", "its.cam")
+INCLUDE_RAW_HEX = os.getenv("INCLUDE_RAW_HEX", "").lower() in ("1", "true", "yes")
 SINK_URL = os.getenv("K_SINK", "").strip()
+STDOUT_NDJSON = os.getenv("STDOUT_NDJSON", "1") in ("1", "true", "yes")
+PROMISCUOUS = os.getenv("PROMISCUOUS", "0") in ("1", "true", "yes")
 
-CE_TYPE = os.getenv("CE_TYPE", "its.packet").strip()
+SEND_QUEUE_MAX = int(os.getenv("SEND_QUEUE_MAX", "1000"))
 
+# Generate a reasonable CloudEvent source string
 HOST_ID = os.getenv("K8S_NODE_NAME") or os.getenv("NODE_NAME") or os.getenv("HOSTNAME") or "host"
-CE_SOURCE = os.getenv("CE_SOURCE", f"sniffer://{HOST_ID}/{IFACE}").strip()
-
-PROMISCUOUS = os.getenv("PROMISCUOUS", "0").lower() in ("1", "true", "yes")
-
-SNAPLEN = int(os.getenv("SNAPLEN", "65535"))
-PCAP_TIMEOUT_MS = int(os.getenv("PCAP_TIMEOUT_MS", "1"))  # small for low latency
-
-# Pipeline
-SEND_QUEUE_MAX = int(os.getenv("SEND_QUEUE_MAX", "20000"))
-SENDER_WORKERS = int(os.getenv("SENDER_WORKERS", "4"))
-
-# Sending behavior
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "5"))
-MEASURE_POST = os.getenv("MEASURE_POST", "1").lower() in ("1", "true", "yes")
-LOG_EVERY = int(os.getenv("LOG_EVERY", "0"))  # 0 disables periodic logs
-INCLUDE_TIME = os.getenv("INCLUDE_TIME", "0").lower() in ("1", "true", "yes")
-
-# ID generation (faster than uuid): host + run_id + counter
-RUN_ID = int(time.time() * 1_000_000)
+CE_SOURCE = f"sniffer://{HOST_ID}/{IFACE}"
 
 # -------------------------
 # Logging
 # -------------------------
-logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
-log = logging.getLogger("fast-sniffer")
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.INFO,
+    format="%(message)s",
+)
+log = logging.getLogger("live-capture")
 
 # -------------------------
-# State
+# Helpers
 # -------------------------
-SEND_QUEUE: "queue.Queue[tuple[int, int, int, bytes]]" = queue.Queue(maxsize=SEND_QUEUE_MAX)
-STOP = False
-
-
-def now_rfc3339() -> str:
-    # only used if INCLUDE_TIME=1
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def ts_to_rfc3339(sec: int, usec: int) -> str:
-    # only used if INCLUDE_TIME=1
-    dt = datetime.fromtimestamp(sec + usec / 1_000_000.0, tz=timezone.utc)
-    return dt.isoformat().replace("+00:00", "Z")
+def _val_to_str(x):
+    try:
+        if hasattr(x, "show"):
+            return x.show
+        if hasattr(x, "showname_value"):
+            return x.showname_value
+        if hasattr(x, "value"):
+            return x.value
+    except Exception:
+        pass
+    return str(x)
 
 
-def make_ce_headers(frame_no: int, dlt: int, sec: int, usec: int) -> dict:
-    # CloudEvents binary mode: attributes in headers, raw bytes in body
-    # https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/bindings/http-protocol-binding.md
-    ce_id = f"{HOST_ID}-{RUN_ID}-{frame_no}"
+def extract_layer_fields(layer) -> dict:
+    out = {}
+    names = getattr(layer, "field_names", []) or []
+    for name in names:
+        v = getattr(layer, name, None)
+        if v is None:
+            continue
+        if isinstance(v, list):
+            out[name] = _val_to_str(v[0]) if len(v) == 1 else [_val_to_str(e) for e in v]
+        else:
+            out[name] = _val_to_str(v)
+    return out
 
-    h = {
-        "Content-Type": "application/octet-stream",
-        "ce-specversion": "1.0",
-        "ce-type": CE_TYPE,
-        "ce-source": CE_SOURCE,
-        "ce-id": ce_id,
-        "ce-subject": str(frame_no),
-        # extensions:
-        "ce-dlt": str(dlt),
-        "ce-iface": IFACE,
+
+def packet_to_record(pkt) -> dict | None:
+    try:
+        its_layer = pkt["its"]
+    except KeyError:
+        return None
+
+    rec = {
+        "timestamp": now_iso(),
+        "frame_number": getattr(pkt, "number", None),
+        "cam_layer": "its",
+        "cam_fields": extract_layer_fields(its_layer),
     }
 
-    if INCLUDE_TIME:
-        if sec and usec:
-            h["ce-time"] = ts_to_rfc3339(sec, usec)
-        else:
-            h["ce-time"] = now_rfc3339()
+    if INCLUDE_RAW_HEX:
+        try:
+            raw = getattr(pkt.frame_raw, "value", None)
+            if raw:
+                rec["frame_raw_hex"] = raw
+        except Exception:
+            pass
 
-    return h
+    return rec
 
 
-def sender_worker(worker_id: int):
-    # One Session per worker (better than sharing a Session across threads)
-    sess = requests.Session()
-    sess.trust_env = False
+# -------------------------
+# CloudEvents (official SDK)
+# -------------------------
+SESSION = requests.Session()
+SESSION.trust_env = False
 
-    # Increase pool size for concurrency
-    adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=0)
-    sess.mount("http://", adapter)
-    sess.mount("https://", adapter)
+# Async sending machinery
+SEND_QUEUE: "queue.Queue[tuple[str, str, str, dict, str | None]]" = queue.Queue(
+    maxsize=SEND_QUEUE_MAX
+)
+STOP_SENDER = False
 
+
+def post_cloudevent_structured(
+    sink_url: str,
+    event_type: str,
+    source: str,
+    data: dict,
+    subject: str | None = None,
+    event_id: str | None = None,
+    event_time: str | None = None,
+    timeout: float = 5.0,
+):
+    st = None
+    try:
+        st = data.get("cam_fields", {}).get("stationtype")
+    except Exception:
+        pass
+
+    attrs = {
+        "specversion": "1.0",
+        "type": event_type,
+        "source": source,
+        "id": event_id or str(uuid.uuid4()),
+        "time": event_time or now_iso(),
+        "datacontenttype": "application/json",
+    }
+    if subject:
+        attrs["subject"] = subject
+
+    # Add as CloudEvent extension (must be lowercase key)
+    if st is not None:
+        attrs["stationtype"] = str(st)
+
+    event = CloudEvent(attrs, data)
+    headers, body = to_structured(event)
+
+    # Measure sniffer to sink HTTP latency (runs in sender thread)
+    start_ns = time.perf_counter_ns()
+    resp = SESSION.post(sink_url, headers=headers, data=body, timeout=timeout)
+    elapsed_ns = time.perf_counter_ns() - start_ns
+
+    log.info("sniffer POST elapsed_ns=%d status=%d", elapsed_ns, resp.status_code)
+
+    resp.raise_for_status()
+
+
+def sender_worker():
+    global STOP_SENDER
     while True:
         try:
-            frame_no, sec, usec, pkt = SEND_QUEUE.get(timeout=0.5)
+            job = SEND_QUEUE.get(timeout=0.5)
         except queue.Empty:
-            if STOP:
+            if STOP_SENDER:
                 break
             continue
 
+        sink_url, event_type, source, data, subject = job
         try:
-            # dlt is stable per capture; we stash it in thread-local global later
-            dlt = GLOBAL_DLT
-            headers = make_ce_headers(frame_no, dlt, sec, usec)
-
-            if MEASURE_POST:
-                t0 = time.perf_counter_ns()
-                r = sess.post(SINK_URL, headers=headers, data=pkt, timeout=HTTP_TIMEOUT)
-                dt = time.perf_counter_ns() - t0
-                log.info("sniffer POST elapsed_ns=%d status=%d", dt, r.status_code)
-            else:
-                r = sess.post(SINK_URL, headers=headers, data=pkt, timeout=HTTP_TIMEOUT)
-
-            r.raise_for_status()
+            post_cloudevent_structured(
+                sink_url=sink_url,
+                event_type=event_type,
+                source=source,
+                data=data,
+                subject=subject,
+            )
         except Exception as e:
-            # keep going; this is a throughput test
-            log.warning(f"[WARN] sender[{worker_id}] failed: {e}")
+            log.warning(f"[WARN] sender failed: {e}")
         finally:
             SEND_QUEUE.task_done()
 
 
-def handle_signal(signum, frame):
-    global STOP
-    STOP = True
+# -------------------------
+# Live capture loop
+# -------------------------
+def run_live():
+    global STOP_SENDER
 
-
-signal.signal(signal.SIGINT, handle_signal)
-signal.signal(signal.SIGTERM, handle_signal)
-
-# Global set once after opening pcap
-GLOBAL_DLT = 0
-
-
-def run():
-    global STOP, GLOBAL_DLT
-
-    if not SINK_URL:
-        log.error("K_SINK is empty. Set K_SINK to your Knative broker ingress URL.")
-        sys.exit(2)
-
-    log.info(f">> FAST capture iface='{IFACE}' promisc={'on' if PROMISCUOUS else 'off'} snaplen={SNAPLEN} timeout_ms={PCAP_TIMEOUT_MS}")
+    # Diagnostics
+    tshark_path = shutil.which("tshark")
+    if not tshark_path:
+        log.error("tshark is not installed in the image. Please ensure 'tshark' is present.")
+    log.info(f">> LIVE capture iface='{IFACE}' promisc={'on' if PROMISCUOUS else 'off'}")
     log.info(f">> BPF='{BPF}'")
-    log.info(f">> CloudEvents sink: on -> {SINK_URL}")
-    log.info(f">> SEND_QUEUE_MAX={SEND_QUEUE_MAX} SENDER_WORKERS={SENDER_WORKERS} INCLUDE_TIME={int(INCLUDE_TIME)}")
+    if DISPLAY_FILTER:
+        log.info(f">> DISPLAY_FILTER='{DISPLAY_FILTER}'")
+    sink_on = bool(SINK_URL)
+    log.info(f">> CloudEvents sink: {'on' if sink_on else 'off'} -> {SINK_URL or '-'}")
+    log.info(f">> SEND_QUEUE_MAX={SEND_QUEUE_MAX}")
 
-    cap = pcapy.open_live(IFACE, SNAPLEN, 1 if PROMISCUOUS else 0, PCAP_TIMEOUT_MS)
-    GLOBAL_DLT = cap.datalink()
-    log.info(f">> DLT={GLOBAL_DLT}")
+    # Build custom parameters; toggle promiscuous with env
+    # tshark params:
+    # -p : disable promiscuous mode (avoid needing NET_ADMIN)
+    custom_params = []
+    if not PROMISCUOUS:
+        custom_params.append("-p")
 
-    if BPF:
-        cap.setfilter(BPF)
+    cap = pyshark.LiveCapture(
+        interface=IFACE,
+        bpf_filter=BPF,
+        display_filter=DISPLAY_FILTER,
+        custom_parameters=custom_params,
+    )
 
-    # Start sender workers
-    threads = []
-    for i in range(max(1, SENDER_WORKERS)):
-        t = threading.Thread(target=sender_worker, args=(i,), daemon=True)
-        t.start()
-        threads.append(t)
+    # Start sender thread
+    sender_thread = threading.Thread(target=sender_worker, daemon=True)
+    sender_thread.start()
 
-    captured = 0
-    enqueued = 0
-    dropped = 0
-    frame_no = 0
+    processed = 0
 
     try:
-        while not STOP:
-            hdr, data = cap.next()
-            if not hdr or not data:
+        for pkt in cap.sniff_continuously():
+            rec = packet_to_record(pkt)
+            if rec is None:
                 continue
 
-            captured += 1
-            frame_no += 1
+            # Write NDJSON
+            line = json.dumps(rec, ensure_ascii=False)
+            if STDOUT_NDJSON:
+                print(line, flush=True)
 
-            # pcapy sometimes gives str; normalize to bytes
-            if isinstance(data, str):
-                pkt = data.encode("latin1", errors="ignore")
-            else:
-                pkt = data
+            # Enqueue CloudEvent if configured
+            if sink_on:
+                try:
+                    subject = (
+                        str(rec.get("frame_number"))
+                        if rec.get("frame_number") is not None
+                        else None
+                    )
+                    SEND_QUEUE.put(
+                        (SINK_URL, CE_TYPE, CE_SOURCE, rec, subject),
+                        timeout=0.1,
+                    )
+                except queue.Full:
+                    log.warning("[WARN] SEND_QUEUE full, dropping event")
 
-            # timestamp
-            try:
-                sec, usec = hdr.getts()
-            except Exception:
-                sec, usec = 0, 0
-
-            # enqueue (drop if full)
-            try:
-                SEND_QUEUE.put((frame_no, sec, usec, pkt), timeout=0.0)
-                enqueued += 1
-            except queue.Full:
-                dropped += 1
-
-            if LOG_EVERY > 0 and (captured % LOG_EVERY == 0):
+            processed += 1
+            if LOG_EVERY > 0 and processed % LOG_EVERY == 0:
                 log.info(
-                    f"[{datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}] "
-                    f"captured={captured} enqueued={enqueued} dropped={dropped} qsize={SEND_QUEUE.qsize()}"
+                    f"[{now_iso()}] processed {processed} CAM packets (file=on, sink={'on' if sink_on else 'off'})"
                 )
     finally:
-        STOP = True
         try:
             cap.close()
         except Exception:
             pass
 
-        # Let workers exit after queue drains a bit (don’t block forever)
-        # For pure throughput tests you usually don’t care about draining fully.
-        time.sleep(0.5)
-
-        for t in threads:
-            try:
-                t.join(timeout=1.0)
-            except Exception:
-                pass
+        # Stop sender thread
+        STOP_SENDER = True
+        try:
+            sender_thread.join(timeout=2.0)
+        except Exception:
+            pass
 
 
+# -------------------------
+# Main
+# -------------------------
 if __name__ == "__main__":
-    run()
+    try:
+        run_live()
+    except Exception as e:
+        logging.exception(e)
+        sys.exit(1)
