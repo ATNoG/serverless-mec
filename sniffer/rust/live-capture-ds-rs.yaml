@@ -13,14 +13,12 @@ spec:
       labels:
         app: live-capture
     spec:
-      # See all node interfaces and get node network namespace
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       securityContext:
         runAsUser: 0
       containers:
         - name: user-container
-          # TODO: change to your actual pushed image name
           image: ghcr.io/pmacoutinho/its-live-capture-rs:latest
           env:
             - name: K8S_NODE_NAME
@@ -28,9 +26,11 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: IFACE
-              value: "cw-mon-rxa"
+              value: "eth0"
             - name: BPF
-              value: ""              # empty => no BPF filter (overrides default)
+              value: ""
+            - name: DISPLAY_FILTER
+              value: ""
             - name: LOG_EVERY
               value: "10"
             - name: CE_TYPE
@@ -39,15 +39,18 @@ spec:
               value: "1"
             - name: PROMISCUOUS
               value: "1"
-            - name: RUST_LOG
+            - name: RUST_LOG 
               value: "info"
-            - name: INCLUDE_RAW_HEX
-              value: "1"
+            # Optional:
+            # - name: INCLUDE_RAW_HEX
+            #   value: "1"
+            # - name: SEND_QUEUE_MAX
+            #   value: "1000"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-              add: ["NET_RAW", "NET_ADMIN"]  # needed for AF_PACKET capture
+              add: ["NET_RAW", "NET_ADMIN"]
           volumeMounts:
             - name: varlog
               mountPath: /var/log
