@@ -1,6 +1,6 @@
 import json
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import requests
 from flask import Flask, jsonify, request
@@ -22,14 +22,10 @@ EDGEAPP_NAMESPACE = os.getenv("EDGEAPP_NAMESPACE", os.getenv("POD_NAMESPACE", "d
 TARGET_NODE_LABEL_KEY = os.getenv("TARGET_NODE_LABEL_KEY", "mec.atnog.org/rsu")
 TARGET_NODE_LABEL_VALUES = os.getenv("TARGET_NODE_LABEL_VALUES", "rsu-a,rsu-b")
 
-# These indices must match CR structure
-NODESELECTORTERM_INDEX = int(os.getenv("NODESELECTORTERM_INDEX", "0"))
-MATCHEXPR_INDEX = int(os.getenv("MATCHEXPR_INDEX", "0"))
-
-# Optional extra JSONPatch operations, as a JSON array string
+# Optional extra MERGE patch (dict) as JSON string.
 # Example:
-#   EXTRA_JSONPATCH='[{"op":"add","path":"/spec/service/foo","value":"bar"}]'
-EXTRA_JSONPATCH = os.getenv("EXTRA_JSONPATCH", "").strip()
+#   EXTRA_MERGEPATCH='{"spec":{"service":{"nodeSelector":null}}}'
+EXTRA_MERGEPATCH = os.getenv("EXTRA_MERGEPATCH", "").strip()
 
 # Set to "false" only if debugging TLS issues
 VERIFY_TLS = os.getenv("VERIFY_TLS", "true").lower() in ("1", "true", "yes")
@@ -48,37 +44,67 @@ def edgeapp_url(namespace: str, name: str) -> str:
     return f"{K8S_HOST}/apis/{EDGEAPP_GROUP}/{EDGEAPP_VERSION}/namespaces/{namespace}/{EDGEAPP_PLURAL}/{name}"
 
 
-def build_affinity_patch(label_key: str, rsu_values: List[str]) -> List[Dict[str, Any]]:
-    base = (
-        f"/spec/service/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution"
-        f"/nodeSelectorTerms/{NODESELECTORTERM_INDEX}/matchExpressions/{MATCHEXPR_INDEX}"
-    )
+def build_affinity_mergepatch(label_key: str, rsu_values: List[str]) -> Dict[str, Any]:
+    """
+    Build a JSON MERGE patch that creates missing parent fields automatically.
+    Equivalent to:
+      kubectl patch edgeapplication ... --type merge -p '{...}'
+    """
+    return {
+        "spec": {
+            "service": {
+                "affinity": {
+                    "nodeAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": {
+                            "nodeSelectorTerms": [
+                                {
+                                    "matchExpressions": [
+                                        {
+                                            "key": label_key,
+                                            "operator": "In",
+                                            "values": rsu_values,
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-    # Use "add" for object fields; it will replace if the key already exists
-    return [
-        {"op": "add", "path": f"{base}/key", "value": label_key},
-        {"op": "add", "path": f"{base}/operator", "value": "In"},
-        {"op": "add", "path": f"{base}/values", "value": rsu_values},
-    ]
+
+def deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge dict b into a recursively (mutates and returns a).
+    Lists are replaced (not merged) to keep behavior predictable.
+    """
+    for k, v in b.items():
+        if isinstance(v, dict) and isinstance(a.get(k), dict):
+            deep_merge(a[k], v)
+        else:
+            a[k] = v
+    return a
 
 
-def parse_extra_patch(extra: str) -> List[Dict[str, Any]]:
+def parse_extra_mergepatch(extra: str) -> Dict[str, Any]:
     if not extra:
-        return []
+        return {}
     try:
         data = json.loads(extra)
-        if not isinstance(data, list):
-            raise ValueError("EXTRA_JSONPATCH must be a JSON array")
+        if not isinstance(data, dict):
+            raise ValueError("EXTRA_MERGEPATCH must be a JSON object (dict)")
         return data
     except Exception as e:
-        raise ValueError(f"Invalid EXTRA_JSONPATCH: {e}") from e
+        raise ValueError(f"Invalid EXTRA_MERGEPATCH: {e}") from e
 
 
-def do_jsonpatch(url: str, patch_ops: List[Dict[str, Any]]) -> requests.Response:
+def do_mergepatch(url: str, patch_body: Dict[str, Any]) -> requests.Response:
     token = read_token()
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json-patch+json",
+        "Content-Type": "application/merge-patch+json",
         "Accept": "application/json",
     }
 
@@ -87,7 +113,7 @@ def do_jsonpatch(url: str, patch_ops: List[Dict[str, Any]]) -> requests.Response
     return requests.patch(
         url,
         headers=headers,
-        data=json.dumps(patch_ops),
+        data=json.dumps(patch_body),
         timeout=10,
         verify=verify,
     )
@@ -101,8 +127,11 @@ def healthz():
 @app.post("/replicate")
 def replicate():
     """
-    PATCH EdgeApplication to set required nodeAffinity to:
+    PATCH EdgeApplication (MERGE PATCH) to set required nodeAffinity to:
       TARGET_NODE_LABEL_KEY in TARGET_NODE_LABEL_VALUES
+
+    This uses MERGE PATCH so it works even if:
+      spec.service.affinity / nodeAffinity / nodeSelectorTerms don't exist yet.
 
     Optional JSON body:
     {
@@ -110,7 +139,10 @@ def replicate():
       "namespace": "default",
       "labelKey": "mec.atnog.org/rsu",
       "values": ["rsu-a", "rsu-b"],
-      "extraPatch": [ ... JSONPatch ops ... ]
+
+      // Optional: extra merge-patch object to merge into the patch
+      // (ex: {"spec":{"service":{"nodeSelector":null}}})
+      "extraMergePatch": { ... }
     }
     """
     body = request.get_json(silent=True) or {}
@@ -126,32 +158,29 @@ def replicate():
     if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
         return jsonify({"error": "`values` must be a list of strings"}), 400
 
-    patch_ops = build_affinity_patch(label_key, values)
+    patch_body: Dict[str, Any] = build_affinity_mergepatch(label_key, values)
 
-    # Allow extra patch ops via env or request body
-    extra_ops: List[Dict[str, Any]] = []
-    if EXTRA_JSONPATCH:
+    # Allow extra merge patch via env var
+    if EXTRA_MERGEPATCH:
         try:
-            extra_ops.extend(parse_extra_patch(EXTRA_JSONPATCH))
+            deep_merge(patch_body, parse_extra_mergepatch(EXTRA_MERGEPATCH))
         except ValueError as e:
             return jsonify({"error": str(e)}), 500
 
-    if "extraPatch" in body:
-        if not isinstance(body["extraPatch"], list):
-            return jsonify({"error": "`extraPatch` must be a JSONPatch array"}), 400
-        extra_ops.extend(body["extraPatch"])
-
-    patch_ops.extend(extra_ops)
+    # Allow extra merge patch via request body
+    if "extraMergePatch" in body:
+        if not isinstance(body["extraMergePatch"], dict):
+            return jsonify({"error": "`extraMergePatch` must be a JSON object (merge-patch)"}), 400
+        deep_merge(patch_body, body["extraMergePatch"])
 
     url = edgeapp_url(namespace, name)
-    resp = do_jsonpatch(url, patch_ops)
+    resp = do_mergepatch(url, patch_body)
 
-    # Surface useful debugging info
     out = {
         "edgeapp": f"{namespace}/{name}",
         "url": url,
         "status_code": resp.status_code,
-        "patch_sent": patch_ops,
+        "patch_sent": patch_body,
     }
 
     try:
