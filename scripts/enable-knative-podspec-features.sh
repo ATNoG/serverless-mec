@@ -30,7 +30,8 @@ kubectl -n "${NAMESPACE}" patch configmap "${CONFIGMAP}" \
     "data": {
       "kubernetes.podspec-affinity": "enabled",
       "kubernetes.podspec-tolerations": "enabled",
-      "kubernetes.podspec-nodeselector": "enabled"
+      "kubernetes.podspec-nodeselector": "enabled",
+      "kubernetes.podspec-topologyspreadconstraints": "enabled"
     }
   }'
 
