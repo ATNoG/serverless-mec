@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -18,6 +19,13 @@ import (
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 
 	mecv1alpha1 "github.com/ATNoG/serverless-mec/operator/api/v1alpha1"
+)
+
+const (
+	appLabelKey        = "mec.atnog.org/app"
+	rsuLabelKeyDefault = "mec.atnog.org/rsu"
+
+	knativeMinScaleAnnotation = "autoscaling.knative.dev/minScale"
 )
 
 // EdgeApplicationReconciler reconciles an EdgeApplication object
@@ -52,6 +60,10 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			"edgeApplication", app.Name)
 		return ctrl.Result{}, nil
 	}
+
+	// Compute desired minScale based on number of RSUs in affinity (A+B -> 2)
+	desiredMinScale := computeDesiredMinScale(&app, rsuLabelKeyDefault)
+	minScaleStr := strconv.Itoa(desiredMinScale)
 
 	// 2. Read operator config (broker info) from mec-operator-config
 	cfgNs := r.ConfigNamespace
@@ -100,17 +112,43 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		Affinity:     app.Spec.Service.Affinity,
 	}
 
+	// Add topology spread to force replicas to split across nodes (A and B)
+	// This only works if your Knative install allows topologySpreadConstraints.
+	// If not allowed, the revision may be rejected until you enable the feature gate.
+	podSpec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{
+		{
+			MaxSkew:           1,
+			TopologyKey:       "kubernetes.io/hostname",
+			WhenUnsatisfiable: corev1.DoNotSchedule,
+			LabelSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					appLabelKey: app.Name,
+				},
+			},
+		},
+	}
+
 	desiredSvc := &servingv1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      svcName,
 			Namespace: svcNs,
 			Labels: map[string]string{
-				"mec.atnog.org/app": app.Name,
+				appLabelKey: app.Name,
 			},
 		},
 		Spec: servingv1.ServiceSpec{
 			ConfigurationSpec: servingv1.ConfigurationSpec{
 				Template: servingv1.RevisionTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							// This label must exist on the pod template for topologySpreadConstraints selector
+							appLabelKey: app.Name,
+						},
+						Annotations: map[string]string{
+							// Force at least N replicas, where N = number of RSU values in affinity.
+							knativeMinScaleAnnotation: minScaleStr,
+						},
+					},
 					Spec: servingv1.RevisionSpec{
 						PodSpec: podSpec,
 					},
@@ -121,9 +159,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// 3a. Create / update Knative Service, but PRESERVE existing template metadata
 	var existingSvc servingv1.Service
-	if err := r.Get(ctx, types.NamespacedName{
-		Name: svcName, Namespace: svcNs,
-	}, &existingSvc); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: svcName, Namespace: svcNs}, &existingSvc); err != nil {
 		if apierrors.IsNotFound(err) {
 			if err := ctrl.SetControllerReference(&app, desiredSvc, r.Scheme); err != nil {
 				return ctrl.Result{}, err
@@ -136,8 +172,9 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	} else {
 		updatedSvc := existingSvc.DeepCopy()
-		ps := &updatedSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec
 
+		// Update PodSpec fields
+		ps := &updatedSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec
 		if len(ps.Containers) == 0 {
 			ps.Containers = []corev1.Container{{}}
 		}
@@ -149,6 +186,20 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		ps.NodeSelector = app.Spec.Service.NodeSelector
 		ps.Tolerations = app.Spec.Service.Tolerations
 		ps.Affinity = app.Spec.Service.Affinity
+
+		// Always enforce spread constraints (so if minScale becomes 2, pods split across nodes)
+		ps.TopologySpreadConstraints = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.TopologySpreadConstraints
+
+		// Preserve existing template metadata BUT ensure required keys exist
+		if updatedSvc.Spec.ConfigurationSpec.Template.Labels == nil {
+			updatedSvc.Spec.ConfigurationSpec.Template.Labels = map[string]string{}
+		}
+		updatedSvc.Spec.ConfigurationSpec.Template.Labels[appLabelKey] = app.Name
+
+		if updatedSvc.Spec.ConfigurationSpec.Template.Annotations == nil {
+			updatedSvc.Spec.ConfigurationSpec.Template.Annotations = map[string]string{}
+		}
+		updatedSvc.Spec.ConfigurationSpec.Template.Annotations[knativeMinScaleAnnotation] = minScaleStr
 
 		if err := r.Update(ctx, updatedSvc); err != nil {
 			return ctrl.Result{}, err
@@ -164,7 +215,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			Name:      trigName,
 			Namespace: trigNs,
 			Labels: map[string]string{
-				"mec.atnog.org/app": app.Name,
+				appLabelKey: app.Name,
 			},
 		},
 		Spec: eventingv1.TriggerSpec{
@@ -188,9 +239,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	var existingTrig eventingv1.Trigger
-	if err := r.Get(ctx, types.NamespacedName{
-		Name: trigName, Namespace: trigNs,
-	}, &existingTrig); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: trigName, Namespace: trigNs}, &existingTrig); err != nil {
 		if apierrors.IsNotFound(err) {
 			if err := r.Create(ctx, desiredTrig); err != nil {
 				return ctrl.Result{}, err
@@ -219,4 +268,36 @@ func (r *EdgeApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&eventingv1.Trigger{}).
 		Named("edgeapplication").
 		Complete(r)
+}
+
+// computeDesiredMinScale returns how many replicas we should keep based on the
+// number of RSU targets in NodeAffinity matchExpressions values.
+// If it cannot find the RSU expression, it returns 1.
+func computeDesiredMinScale(app *mecv1alpha1.EdgeApplication, rsuKey string) int {
+	if app == nil || app.Spec.Service == nil || app.Spec.Service.Affinity == nil {
+		return 1
+	}
+
+	aff := app.Spec.Service.Affinity
+	if aff.NodeAffinity == nil || aff.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return 1
+	}
+
+	terms := aff.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	maxVals := 0
+
+	for _, term := range terms {
+		for _, expr := range term.MatchExpressions {
+			if expr.Key == rsuKey && len(expr.Values) > 0 {
+				if len(expr.Values) > maxVals {
+					maxVals = len(expr.Values)
+				}
+			}
+		}
+	}
+
+	if maxVals < 1 {
+		return 1
+	}
+	return maxVals
 }
