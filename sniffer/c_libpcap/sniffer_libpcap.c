@@ -1,21 +1,5 @@
 // sniffer_libpcap.c — libpcap + libcurl CloudEvents structured sender
 // Build (Alpine): gcc -O2 -Wall -Wextra -pthread sniffer_libpcap.c -lpcap -lcurl -o sniffer_libpcap
-//
-// What changed vs your current version:
-// - Adds per-event benchmark timings from packet receive -> decode -> record build -> CE build -> queue wait -> POST -> total.
-// - Logs those benchmarks on every POST line (and on drop when SEND_QUEUE is full).
-// - Benchmarks are monotonic-clock ns.
-//
-// Benchmarks you’ll see per POST:
-//   recv_to_decode_ns            : on_packet entry -> decode_cam_uper_min() start (includes extraction/scanning + raw hex encode if enabled)
-//   decode_ns                    : time inside decode_cam_uper_min()
-//   decode_to_record_ns          : decode end -> record JSON ready
-//   record_to_ce_ns              : record JSON ready -> CloudEvent JSON ready
-//   after_decode_to_sendstart_ns : decode end -> curl_easy_perform start (includes record/CE build + queue wait)
-//   qwait_ns                     : enqueue time -> curl_easy_perform start
-//   elapsed_ns                   : curl_easy_perform duration
-//   total_ns                     : on_packet entry -> curl_easy_perform end
-
 #define _GNU_SOURCE
 #include <pcap/pcap.h>
 
@@ -85,17 +69,6 @@ static void loge(const char *fmt, ...) {
  * ------------------------- */
 static volatile sig_atomic_t g_stop = 0;
 static void on_sig(int sig) { (void)sig; g_stop = 1; }
-
-static inline int64_t now_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
-}
-
-static inline long long ns_diff(int64_t end_ns, int64_t start_ns) {
-  if (end_ns < 0 || start_ns < 0) return -1;
-  return (long long)(end_ns - start_ns);
-}
 
 static void iso8601_from_timeval(const struct timeval *tv, char *out, size_t out_sz) {
   /* UTC ISO8601 with microseconds: YYYY-MM-DDTHH:MM:SS.uuuuuuZ */
@@ -186,37 +159,11 @@ static bool uuid4(char out[37]) {
 }
 
 /* -------------------------
- * Per-event perf capture
- * ------------------------- */
-typedef struct {
-  int64_t t_recv_ns;         /* on_packet() entry */
-  int64_t t_decode_start_ns; /* right before decode_cam_uper_min() */
-  int64_t t_decode_end_ns;   /* right after decode_cam_uper_min() */
-  int64_t t_record_done_ns;  /* record JSON ready */
-  int64_t t_ce_done_ns;      /* CloudEvent JSON ready */
-  int64_t t_enqueue_ns;      /* job enqueue time (capture thread) */
-} perf_t;
-
-static inline void perf_init(perf_t *p, int64_t t_recv_ns) {
-  if (!p) return;
-  p->t_recv_ns = t_recv_ns;
-  p->t_decode_start_ns = -1;
-  p->t_decode_end_ns   = -1;
-  p->t_record_done_ns  = -1;
-  p->t_ce_done_ns      = -1;
-  p->t_enqueue_ns      = -1;
-}
-
-/* -------------------------
  * Bounded send queue
  * ------------------------- */
 typedef struct {
   char *body;
   size_t body_len;
-
-  /* for logging / correlation */
-  uint64_t frame_no;
-  perf_t perf;
 } job_t;
 
 typedef struct {
@@ -329,39 +276,15 @@ static void *sender_thread_fn(void *arg) {
     long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 
-    int64_t send_start_ns = (int64_t)t0.tv_sec * 1000000000LL + (int64_t)t0.tv_nsec;
-    int64_t send_end_ns   = (int64_t)t1.tv_sec * 1000000000LL + (int64_t)t1.tv_nsec;
-
     long long elapsed_ns =
       (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL +
       (long long)(t1.tv_nsec - t0.tv_nsec);
 
-    long long recv_to_decode_ns   = ns_diff(job->perf.t_decode_start_ns, job->perf.t_recv_ns);
-    long long decode_ns           = ns_diff(job->perf.t_decode_end_ns,   job->perf.t_decode_start_ns);
-    long long decode_to_record_ns = ns_diff(job->perf.t_record_done_ns,  job->perf.t_decode_end_ns);
-    long long record_to_ce_ns     = ns_diff(job->perf.t_ce_done_ns,      job->perf.t_record_done_ns);
-    long long qwait_ns            = ns_diff(send_start_ns,               job->perf.t_enqueue_ns);
-    long long after_decode_to_sendstart_ns = ns_diff(send_start_ns,       job->perf.t_decode_end_ns);
-    long long total_ns            = ns_diff(send_end_ns,                 job->perf.t_recv_ns);
-
     if (rc != CURLE_OK) {
-      logw("sniffer POST frame=%" PRIu64
-           " recv_to_decode_ns=%lld decode_ns=%lld decode_to_record_ns=%lld record_to_ce_ns=%lld"
-           " after_decode_to_sendstart_ns=%lld qwait_ns=%lld elapsed_ns=%lld total_ns=%lld"
-           " status=%ld curl_err=%s",
-           job->frame_no,
-           recv_to_decode_ns, decode_ns, decode_to_record_ns, record_to_ce_ns,
-           after_decode_to_sendstart_ns, qwait_ns, elapsed_ns, total_ns,
-           status, curl_easy_strerror(rc));
+      logw("sniffer POST elapsed_ns=%lld status=%ld curl_err=%s",
+           elapsed_ns, status, curl_easy_strerror(rc));
     } else {
-      logi("sniffer POST frame=%" PRIu64
-           " recv_to_decode_ns=%lld decode_ns=%lld decode_to_record_ns=%lld record_to_ce_ns=%lld"
-           " after_decode_to_sendstart_ns=%lld qwait_ns=%lld elapsed_ns=%lld total_ns=%lld"
-           " status=%ld",
-           job->frame_no,
-           recv_to_decode_ns, decode_ns, decode_to_record_ns, record_to_ce_ns,
-           after_decode_to_sendstart_ns, qwait_ns, elapsed_ns, total_ns,
-           status);
+      logi("sniffer POST elapsed_ns=%lld status=%ld", elapsed_ns, status);
     }
 
     free(job->body);
@@ -755,7 +678,7 @@ static bool decode_cam_uper_min(const uint8_t *cam_bytes, size_t cam_len, cam_de
 
   if (!br_read_constrained_i32(&br, -1000, 8001, &si)) return false; d.altitude_value = si;
   if (!br_read_constrained_u32(&br, 0, 15, &ui)) return false; d.altitude_confidence = ui;
-
+  /* per_enum_index in your sample matches altitudeconfidence */
   /* HighFrequencyContainer (CHOICE with extension marker): ext bit + 1-bit index for root alternatives */
   if (!br_read_bool(&br, &d.hf_ext_bit)) return false;
   if (!br_read_bits_u64(&br, 1, &u)) return false; d.hf_choice = (uint8_t)u;
@@ -842,7 +765,7 @@ static char *build_cam_fields_json_from_decoded(const cam_decoded_t *d) {
   char exterior_hex[3];
   snprintf(exterior_hex, sizeof(exterior_hex), "%02x", (unsigned)d->exterior_lights);
 
-  /* individual exterior light bits */
+  /* individual exterior light bits (spec mapping is tool-dependent; this matches your sample naming) */
   bool lowbeam  = (d->exterior_lights & (1u<<0)) != 0;
   bool highbeam = (d->exterior_lights & (1u<<1)) != 0;
   bool left     = (d->exterior_lights & (1u<<2)) != 0;
@@ -852,18 +775,22 @@ static char *build_cam_fields_json_from_decoded(const cam_decoded_t *d) {
   bool fog      = (d->exterior_lights & (1u<<6)) != 0;
   bool parking  = (d->exterior_lights & (1u<<7)) != 0;
 
+  /* cam_highfrequencycontainer and cam_lowfrequencycontainer are CHOICE indexes in your sample */
   char hf_choice_s[8]; snprintf(hf_choice_s, sizeof(hf_choice_s), "%u", (unsigned)d->hf_choice);
   char lf_choice_s[8]; snprintf(lf_choice_s, sizeof(lf_choice_s), "%u", (unsigned)d->lf_choice);
 
+  /* per_enum_index / per_choice_index etc are debug-ish in your sample */
   char per_enum_index[16]; snprintf(per_enum_index, sizeof(per_enum_index), "%u", (unsigned)d->altitude_confidence);
   char per_choice_index[16]; snprintf(per_choice_index, sizeof(per_choice_index), "%u", (unsigned)d->hf_choice);
 
+  /* per_sequence_of_length + cam_pathhistory in your sample */
   char ph_len_s[16]; snprintf(ph_len_s, sizeof(ph_len_s), "%u", (unsigned)d->path_history_len);
 
   size_t buf_sz = 4096;
   char *buf = (char *)malloc(buf_sz);
   if (!buf) return NULL;
 
+  /* Keep keys aligned with your example as much as possible. */
   int n = snprintf(
     buf, buf_sz,
     "{"
@@ -993,7 +920,6 @@ static char *build_record_json(
     const uint8_t *pkt,
     size_t pkt_len,
     bool include_raw_hex,
-    perf_t *perf,
     cam_decoded_t *decoded_out /* optional, filled if decoded */
 ) {
   char ts[64];
@@ -1016,10 +942,7 @@ static char *build_record_json(
       find_cam_start(its, its_len, &cam_off)) {
     const uint8_t *cam = its + cam_off;
     size_t cam_len = its_len - cam_off;
-
-    if (perf) perf->t_decode_start_ns = now_ns();
     decoded_ok = decode_cam_uper_min(cam, cam_len, &d);
-    if (perf) perf->t_decode_end_ns = now_ns();
   }
 
   if (decoded_ok) {
@@ -1068,12 +991,10 @@ static char *build_record_json(
     }
 
     if (decoded_out) *decoded_out = d;
-    if (perf) perf->t_record_done_ns = now_ns();
     return buf;
   }
 
   /* Fallback: old metadata record */
-  (void)frame_no;
   char srcmac[32] = {0}, dstmac[32] = {0};
   uint16_t ethertype = 0;
   int vlan_id = -1;
@@ -1215,7 +1136,6 @@ static char *build_record_json(
 
   free(ts_esc); free(srcmac_esc); free(dstmac_esc); free(srcip_esc); free(dstip_esc);
   free(raw_hex);
-  if (perf) perf->t_record_done_ns = now_ns();
   return buf;
 }
 
@@ -1304,18 +1224,13 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *b
   (void)user;
   if (g_stop) return;
 
-  int64_t t_recv_ns = now_ns();
-
   g_frame_no++;
 
   cam_decoded_t decoded;
   cam_decoded_init(&decoded);
 
-  perf_t perf_out;
-  perf_init(&perf_out, t_recv_ns);
-
   /* Build stdout record (may or may not include raw hex) */
-  char *rec_out = build_record_json(g_frame_no, h, bytes, h->caplen, ENV_INCLUDE_RAW_HEX, &perf_out, &decoded);
+  char *rec_out = build_record_json(g_frame_no, h, bytes, h->caplen, ENV_INCLUDE_RAW_HEX, &decoded);
   if (!rec_out) return;
 
   if (ENV_STDOUT_NDJSON) {
@@ -1329,26 +1244,16 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *b
   char *rec_ce = rec_out;
   bool rec_ce_is_separate = false;
 
-  perf_t perf_ce;
-  perf_init(&perf_ce, t_recv_ns);
-
-  perf_t *pperf = &perf_out;
-
   if (sink_on && ENV_CE_INCLUDE_RAW_HEX && !ENV_INCLUDE_RAW_HEX) {
     cam_decoded_t decoded2;
     cam_decoded_init(&decoded2);
-
-    rec_ce = build_record_json(g_frame_no, h, bytes, h->caplen, true, &perf_ce, &decoded2);
+    rec_ce = build_record_json(g_frame_no, h, bytes, h->caplen, true, &decoded2);
     if (!rec_ce) {
       rec_ce = rec_out;
-      pperf = &perf_out;
     } else {
       rec_ce_is_separate = true;
-      decoded = decoded2;
-      pperf = &perf_ce;
+      decoded = decoded2; /* prefer decoded from CE build (it had raw hex anyway) */
     }
-  } else {
-    pperf = &perf_out;
   }
 
   if (sink_on) {
@@ -1360,8 +1265,6 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *b
 
     size_t body_len = 0;
     char *ce = build_cloudevent_structured(ENV_CE_TYPE, CE_SOURCE, subj, rec_ce, &body_len, stationtype_ext);
-    if (pperf) pperf->t_ce_done_ns = now_ns();
-
     if (ce) {
       job_t *job = (job_t *)calloc(1, sizeof(job_t));
       if (!job) {
@@ -1369,23 +1272,8 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *b
       } else {
         job->body = ce;
         job->body_len = body_len;
-        job->frame_no = g_frame_no;
-
-        if (pperf) {
-          job->perf = *pperf;
-        } else {
-          perf_init(&job->perf, t_recv_ns);
-        }
-        job->perf.t_enqueue_ns = now_ns();
-
         if (!jobq_try_push(&g_q, job)) {
-          logw("SEND_QUEUE full, dropping event frame=%" PRIu64
-               " recv_to_decode_ns=%lld decode_ns=%lld decode_to_record_ns=%lld record_to_ce_ns=%lld",
-               job->frame_no,
-               ns_diff(job->perf.t_decode_start_ns, job->perf.t_recv_ns),
-               ns_diff(job->perf.t_decode_end_ns,   job->perf.t_decode_start_ns),
-               ns_diff(job->perf.t_record_done_ns,  job->perf.t_decode_end_ns),
-               ns_diff(job->perf.t_ce_done_ns,      job->perf.t_record_done_ns));
+          logw("SEND_QUEUE full, dropping event");
           free(job->body);
           free(job);
         }
