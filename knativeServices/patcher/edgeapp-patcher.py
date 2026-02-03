@@ -1,33 +1,28 @@
 import json
 import os
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Tuple
 
 import requests
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# --- Defaults / config ---
+# --- Cluster access (in-cluster defaults) ---
 K8S_HOST = os.getenv("K8S_HOST", "https://kubernetes.default.svc")
 TOKEN_PATH = os.getenv("TOKEN_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/token")
 CA_PATH = os.getenv("CA_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 
+# --- API group/version for EdgeApplication (CRD) ---
 EDGEAPP_GROUP = os.getenv("EDGEAPP_GROUP", "mec.atnog.org")
 EDGEAPP_VERSION = os.getenv("EDGEAPP_VERSION", "v1alpha1")
 EDGEAPP_PLURAL = os.getenv("EDGEAPP_PLURAL", "edgeapplications")
 
-EDGEAPP_NAME = os.getenv("EDGEAPP_NAME", "cam-logger-operator")
-EDGEAPP_NAMESPACE = os.getenv("EDGEAPP_NAMESPACE", os.getenv("POD_NAMESPACE", "default"))
+# --- Knative Serving API ---
+KSVC_GROUP = "serving.knative.dev"
+KSVC_VERSION = "v1"
+KSVC_PLURAL = "services"  # ksvc is "Service" under serving.knative.dev
 
-TARGET_NODE_LABEL_KEY = os.getenv("TARGET_NODE_LABEL_KEY", "mec.atnog.org/rsu")
-TARGET_NODE_LABEL_VALUES = os.getenv("TARGET_NODE_LABEL_VALUES", "rsu-a,rsu-b")
-
-# Optional extra MERGE patch (dict) as JSON string.
-# Example:
-#   EXTRA_MERGEPATCH='{"spec":{"service":{"nodeSelector":null}}}'
-EXTRA_MERGEPATCH = os.getenv("EXTRA_MERGEPATCH", "").strip()
-
-# Set to "false" only if debugging TLS issues
+# --- TLS verify ---
 VERIFY_TLS = os.getenv("VERIFY_TLS", "true").lower() in ("1", "true", "yes")
 
 
@@ -36,87 +31,85 @@ def read_token() -> str:
         return f.read().strip()
 
 
-def parse_values(values_csv: str) -> List[str]:
-    return [v.strip() for v in values_csv.split(",") if v.strip()]
+def k8s_verify() -> Any:
+    # requests.verify can be: True/False/CA-bundle path
+    return CA_PATH if VERIFY_TLS else False
 
 
 def edgeapp_url(namespace: str, name: str) -> str:
-    return f"{K8S_HOST}/apis/{EDGEAPP_GROUP}/{EDGEAPP_VERSION}/namespaces/{namespace}/{EDGEAPP_PLURAL}/{name}"
+    return (
+        f"{K8S_HOST}/apis/{EDGEAPP_GROUP}/{EDGEAPP_VERSION}"
+        f"/namespaces/{namespace}/{EDGEAPP_PLURAL}/{name}"
+    )
 
 
-def build_affinity_mergepatch(label_key: str, rsu_values: List[str]) -> Dict[str, Any]:
+def ksvc_url(namespace: str, name: str) -> str:
+    return (
+        f"{K8S_HOST}/apis/{KSVC_GROUP}/{KSVC_VERSION}"
+        f"/namespaces/{namespace}/{KSVC_PLURAL}/{name}"
+    )
+
+
+def http_get(url: str) -> requests.Response:
+    token = read_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    return requests.get(url, headers=headers, timeout=10, verify=k8s_verify())
+
+
+def http_merge_patch(url: str, patch_obj: Dict[str, Any]) -> requests.Response:
+    token = read_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/merge-patch+json",
+    }
+    return requests.patch(url, headers=headers, data=json.dumps(patch_obj), timeout=10, verify=k8s_verify())
+
+
+def build_required_node_affinity(label_key: str, values: List[str]) -> Dict[str, Any]:
     """
-    Build a JSON MERGE patch that creates missing parent fields automatically.
-    Equivalent to:
-      kubectl patch edgeapplication ... --type merge -p '{...}'
+    Builds:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: <label_key>
+                operator: In
+                values: [...]
     """
     return {
-        "spec": {
-            "service": {
-                "affinity": {
-                    "nodeAffinity": {
-                        "requiredDuringSchedulingIgnoredDuringExecution": {
-                            "nodeSelectorTerms": [
-                                {
-                                    "matchExpressions": [
-                                        {
-                                            "key": label_key,
-                                            "operator": "In",
-                                            "values": rsu_values,
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
+        "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
+                    {
+                        "matchExpressions": [
+                            {
+                                "key": label_key,
+                                "operator": "In",
+                                "values": values,
+                            }
+                        ]
                     }
-                }
+                ]
             }
         }
     }
 
 
-def deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+def safe_int(s: Any, default: int = 0) -> Tuple[int, bool]:
     """
-    Merge dict b into a recursively (mutates and returns a).
-    Lists are replaced (not merged) to keep behavior predictable.
+    Returns (value, ok). ok=False if parsing failed and default used.
     """
-    for k, v in b.items():
-        if isinstance(v, dict) and isinstance(a.get(k), dict):
-            deep_merge(a[k], v)
-        else:
-            a[k] = v
-    return a
-
-
-def parse_extra_mergepatch(extra: str) -> Dict[str, Any]:
-    if not extra:
-        return {}
+    if s is None:
+        return default, True
     try:
-        data = json.loads(extra)
-        if not isinstance(data, dict):
-            raise ValueError("EXTRA_MERGEPATCH must be a JSON object (dict)")
-        return data
-    except Exception as e:
-        raise ValueError(f"Invalid EXTRA_MERGEPATCH: {e}") from e
-
-
-def do_mergepatch(url: str, patch_body: Dict[str, Any]) -> requests.Response:
-    token = read_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/merge-patch+json",
-        "Accept": "application/json",
-    }
-
-    verify = CA_PATH if VERIFY_TLS else False
-
-    return requests.patch(
-        url,
-        headers=headers,
-        data=json.dumps(patch_body),
-        timeout=10,
-        verify=verify,
-    )
+        return int(str(s).strip()), True
+    except Exception:
+        return default, False
 
 
 @app.get("/healthz")
@@ -127,71 +120,197 @@ def healthz():
 @app.post("/replicate")
 def replicate():
     """
-    PATCH EdgeApplication (MERGE PATCH) to set required nodeAffinity to:
-      TARGET_NODE_LABEL_KEY in TARGET_NODE_LABEL_VALUES
-
-    This uses MERGE PATCH so it works even if:
-      spec.service.affinity / nodeAffinity / nodeSelectorTerms don't exist yet.
-
-    Optional JSON body:
+    Body example:
     {
-      "edgeappName": "cam-logger-operator",
       "namespace": "default",
-      "labelKey": "mec.atnog.org/rsu",
-      "values": ["rsu-a", "rsu-b"],
 
-      // Optional: extra merge-patch object to merge into the patch
-      // (ex: {"spec":{"service":{"nodeSelector":null}}})
-      "extraMergePatch": { ... }
+      "edgeappName": "cam-logger-operator",
+
+      "ksvcName": "cam-logger-operator",
+      "ksvcNamespace": "default",   // optional; defaults to namespace
+
+      "affinity": {
+        "key": "mec.atnog.org/rsu",
+        "values": ["rsu-a", "rsu-b"]
+      },
+
+      "nodeSelector": {
+        "repeater": "true"
+      },
+
+      "minScaleIncrement": 1
     }
     """
     body = request.get_json(silent=True) or {}
 
-    name = body.get("edgeappName", EDGEAPP_NAME)
-    namespace = body.get("namespace", EDGEAPP_NAMESPACE)
+    namespace = body.get("namespace")
+    edgeapp_name = body.get("edgeappName")
+    ksvc_name = body.get("ksvcName")
 
-    label_key = body.get("labelKey", TARGET_NODE_LABEL_KEY)
+    if not namespace or not isinstance(namespace, str):
+        return jsonify({"error": "`namespace` (string) is required"}), 400
+    if not edgeapp_name or not isinstance(edgeapp_name, str):
+        return jsonify({"error": "`edgeappName` (string) is required"}), 400
+    if not ksvc_name or not isinstance(ksvc_name, str):
+        return jsonify({"error": "`ksvcName` (string) is required"}), 400
 
-    values = body.get("values")
-    if values is None:
-        values = parse_values(TARGET_NODE_LABEL_VALUES)
-    if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
-        return jsonify({"error": "`values` must be a list of strings"}), 400
+    ksvc_namespace = body.get("ksvcNamespace", namespace)
+    if not isinstance(ksvc_namespace, str) or not ksvc_namespace:
+        return jsonify({"error": "`ksvcNamespace` must be a non-empty string if provided"}), 400
 
-    patch_body: Dict[str, Any] = build_affinity_mergepatch(label_key, values)
+    # ---- Parse affinity input (optional) ----
+    affinity_patch: Dict[str, Any] = {}
+    if "affinity" in body and body["affinity"] is not None:
+        affinity = body["affinity"]
+        if not isinstance(affinity, dict):
+            return jsonify({"error": "`affinity` must be an object"}), 400
 
-    # Allow extra merge patch via env var
-    if EXTRA_MERGEPATCH:
-        try:
-            deep_merge(patch_body, parse_extra_mergepatch(EXTRA_MERGEPATCH))
-        except ValueError as e:
-            return jsonify({"error": str(e)}), 500
+        key = affinity.get("key")
+        values = affinity.get("values")
 
-    # Allow extra merge patch via request body
-    if "extraMergePatch" in body:
-        if not isinstance(body["extraMergePatch"], dict):
-            return jsonify({"error": "`extraMergePatch` must be a JSON object (merge-patch)"}), 400
-        deep_merge(patch_body, body["extraMergePatch"])
+        if not isinstance(key, str) or not key:
+            return jsonify({"error": "`affinity.key` must be a non-empty string"}), 400
+        if not isinstance(values, list) or not all(isinstance(v, str) and v for v in values):
+            return jsonify({"error": "`affinity.values` must be a list of non-empty strings"}), 400
 
-    url = edgeapp_url(namespace, name)
-    resp = do_mergepatch(url, patch_body)
+        affinity_patch = build_required_node_affinity(key, values)
 
-    out = {
-        "edgeapp": f"{namespace}/{name}",
-        "url": url,
-        "status_code": resp.status_code,
-        "patch_sent": patch_body,
+    # ---- Parse nodeSelector input (optional) ----
+    node_selector_patch: Dict[str, str] = {}
+    if "nodeSelector" in body and body["nodeSelector"] is not None:
+        node_selector = body["nodeSelector"]
+        if not isinstance(node_selector, dict):
+            return jsonify({"error": "`nodeSelector` must be an object (map of string:string)"}), 400
+
+        # Ensure all keys/values are strings (K8s nodeSelector requires string values)
+        for k, v in node_selector.items():
+            if not isinstance(k, str) or not k:
+                return jsonify({"error": "`nodeSelector` keys must be non-empty strings"}), 400
+            if not isinstance(v, str):
+                return jsonify({"error": "`nodeSelector` values must be strings"}), 400
+        node_selector_patch = node_selector
+
+    # ---- Parse minScaleIncrement (optional) ----
+    inc_raw = body.get("minScaleIncrement", 0)
+    inc, inc_ok = safe_int(inc_raw, default=0)
+    if not inc_ok:
+        return jsonify({"error": "`minScaleIncrement` must be an integer"}), 400
+    if inc < 0:
+        return jsonify({"error": "`minScaleIncrement` must be >= 0"}), 400
+
+    # =========================
+    # 1) Patch EdgeApplication
+    # =========================
+    edgeapp_patch_obj: Dict[str, Any] = {"spec": {"service": {}}}
+    if affinity_patch:
+        edgeapp_patch_obj["spec"]["service"]["affinity"] = affinity_patch
+    if node_selector_patch:
+        edgeapp_patch_obj["spec"]["service"]["nodeSelector"] = node_selector_patch
+
+    edgeapp_resp = None
+    edgeapp_url_str = edgeapp_url(namespace, edgeapp_name)
+
+    if edgeapp_patch_obj["spec"]["service"]:
+        edgeapp_resp = http_merge_patch(edgeapp_url_str, edgeapp_patch_obj)
+
+    # =========================
+    # 2) Read + bump KService minScale
+    # =========================
+    ksvc_url_str = ksvc_url(ksvc_namespace, ksvc_name)
+
+    # GET current ksvc
+    ksvc_get_resp = http_get(ksvc_url_str)
+    ksvc_obj: Dict[str, Any] = {}
+    ksvc_get_json_ok = True
+    try:
+        ksvc_obj = ksvc_get_resp.json()
+    except Exception:
+        ksvc_get_json_ok = False
+
+    if not (200 <= ksvc_get_resp.status_code < 300):
+        return jsonify(
+            {
+                "error": "Failed to GET KService",
+                "ksvc": f"{ksvc_namespace}/{ksvc_name}",
+                "url": ksvc_url_str,
+                "status_code": ksvc_get_resp.status_code,
+                "response_json": ksvc_obj if ksvc_get_json_ok else None,
+                "response_text": None if ksvc_get_json_ok else (ksvc_get_resp.text[:2000] if ksvc_get_resp.text else ""),
+                "edgeapp_patch_attempted": edgeapp_resp is not None,
+                "edgeapp_patch_status": edgeapp_resp.status_code if edgeapp_resp is not None else None,
+            }
+        ), 500
+
+    # Extract current minScale annotation
+    annotations = (
+        ksvc_obj.get("spec", {})
+        .get("template", {})
+        .get("metadata", {})
+        .get("annotations", {})
+    )
+    current_min_raw = annotations.get("autoscaling.knative.dev/minScale")
+    current_min, current_ok = safe_int(current_min_raw, default=0)
+
+    new_min = current_min + inc if inc > 0 else current_min
+
+    ksvc_patch_resp = None
+    ksvc_patch_obj: Dict[str, Any] = {}
+
+    if inc > 0:
+        # Merge patch to set annotation
+        ksvc_patch_obj = {
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "autoscaling.knative.dev/minScale": str(new_min)
+                        }
+                    }
+                }
+            }
+        }
+        ksvc_patch_resp = http_merge_patch(ksvc_url_str, ksvc_patch_obj)
+
+    # Build output
+    out: Dict[str, Any] = {
+        "edgeapp": f"{namespace}/{edgeapp_name}",
+        "edgeapp_url": edgeapp_url_str,
+        "edgeapp_patch_sent": edgeapp_patch_obj if edgeapp_resp is not None else None,
+        "edgeapp_patch_status": edgeapp_resp.status_code if edgeapp_resp is not None else None,
+
+        "ksvc": f"{ksvc_namespace}/{ksvc_name}",
+        "ksvc_url": ksvc_url_str,
+        "minScale": {
+            "before": current_min,
+            "before_raw": current_min_raw,
+            "before_parse_ok": current_ok,
+            "increment": inc,
+            "after": new_min,
+        },
+        "ksvc_patch_sent": ksvc_patch_obj if ksvc_patch_resp is not None else None,
+        "ksvc_patch_status": ksvc_patch_resp.status_code if ksvc_patch_resp is not None else None,
     }
 
-    try:
-        out["response_json"] = resp.json()
-    except Exception:
-        out["response_text"] = resp.text[:2000]
+    # Attach responses (trimmed)
+    if edgeapp_resp is not None:
+        try:
+            out["edgeapp_response_json"] = edgeapp_resp.json()
+        except Exception:
+            out["edgeapp_response_text"] = (edgeapp_resp.text[:2000] if edgeapp_resp.text else "")
 
-    if 200 <= resp.status_code < 300:
-        return jsonify(out), 200
+    if ksvc_patch_resp is not None:
+        try:
+            out["ksvc_patch_response_json"] = ksvc_patch_resp.json()
+        except Exception:
+            out["ksvc_patch_response_text"] = (ksvc_patch_resp.text[:2000] if ksvc_patch_resp.text else "")
 
-    return jsonify(out), 500
+    # If any patch failed, return 500 to make it obvious
+    if edgeapp_resp is not None and not (200 <= edgeapp_resp.status_code < 300):
+        return jsonify(out), 500
+    if ksvc_patch_resp is not None and not (200 <= ksvc_patch_resp.status_code < 300):
+        return jsonify(out), 500
+
+    return jsonify(out), 200
 
 
 if __name__ == "__main__":

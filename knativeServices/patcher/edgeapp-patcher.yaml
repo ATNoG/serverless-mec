@@ -1,31 +1,37 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: cam-logger-sa
+  name: edgeapp-patcher-sa
   namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: edgeapp-self-patch
+  name: edgeapp-patcher
   namespace: default
 rules:
-- apiGroups: ["mec.atnog.org"]
-  resources: ["edgeapplications"]
-  resourceNames: ["cam-logger-operator"]   # lock it down to ONE CR
-  verbs: ["get", "patch"]
+  # EdgeApplication CRD (your operator CR)
+  - apiGroups: ["mec.atnog.org"]
+    resources: ["edgeapplications"]
+    verbs: ["get", "patch"]
+
+  # Knative Service (serving.knative.dev Service)
+  - apiGroups: ["serving.knative.dev"]
+    resources: ["services"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: edgeapp-self-patch
+  name: edgeapp-patcher
   namespace: default
 subjects:
-- kind: ServiceAccount
-  name: cam-logger-sa
+  - kind: ServiceAccount
+    name: edgeapp-patcher-sa
+    namespace: default
 roleRef:
   kind: Role
-  name: edgeapp-self-patch
+  name: edgeapp-patcher
   apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: serving.knative.dev/v1
@@ -39,44 +45,13 @@ spec:
       annotations:
         autoscaling.knative.dev/minScale: "1"
     spec:
-      serviceAccountName: cam-logger-sa
-
-      # Pick ONE of these approaches:
-
-      # (A) If you labeled RSU nodes like mec.atnog.org/rsu=rsu-a:
-      nodeSelector:
-        mec.atnog.org/rsu: rsu-a
-
-      # (B) Or, pin to a specific node hostname (like your benchmark example):
-      # nodeSelector:
-      #   kubernetes.io/hostname: rsu-mk6-a-db7f2d0f
+      serviceAccountName: edgeapp-patcher-sa
 
       containers:
         - image: ghcr.io/pmacoutinho/edgeapp-patcher:latest
           imagePullPolicy: Always
           env:
-            - name: EDGEAPP_NAME
-              value: "cam-logger-operator"
-            - name: EDGEAPP_NAMESPACE
-              value: "default"
-
-            # This matches your desired patch result:
-            - name: TARGET_NODE_LABEL_KEY
-              value: "mec.atnog.org/rsu"
-            - name: TARGET_NODE_LABEL_VALUES
-              value: "rsu-a,rsu-b"
-
-            # These indices must match your EdgeApplication CR structure
-            - name: NODESELECTORTERM_INDEX
-              value: "0"
-            - name: MATCHEXPR_INDEX
-              value: "0"
-
-            # Usually keep true; set false only for debugging TLS
             - name: VERIFY_TLS
               value: "true"
           ports:
             - containerPort: 8080
-  traffic:
-    - latestRevision: true
-      percent: 100
