@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: ghcr.io/pmacoutinho/serverless-mec-operator
-  newTag: latest
+  newTag: handoff-20260210-1800

@@ -27,6 +27,7 @@ rules:
 - apiGroups:
   - mec.atnog.org
   resources:
+  - edgeapplicationhandoffs
   - edgeapplications
   verbs:
   - create
@@ -39,12 +40,14 @@ rules:
 - apiGroups:
   - mec.atnog.org
   resources:
+  - edgeapplicationhandoffs/finalizers
   - edgeapplications/finalizers
   verbs:
   - update
 - apiGroups:
   - mec.atnog.org
   resources:
+  - edgeapplicationhandoffs/status
   - edgeapplications/status
   verbs:
   - get
