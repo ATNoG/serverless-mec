@@ -960,9 +960,8 @@ spec:
               createTrigger:
                 type: boolean
               disableBaseTrigger:
-                description: |-
-                  Optional: if true, we disable the BASE (legacy) trigger while keeping the base KService alive.
-                  This avoids duplicate event delivery when the new replica trigger is created.
+                description: 'Optional: if true, we disable the BASE (legacy) trigger
+                  while keeping the base KService alive.'
                 type: boolean
               edgeApplicationName:
                 minLength: 1

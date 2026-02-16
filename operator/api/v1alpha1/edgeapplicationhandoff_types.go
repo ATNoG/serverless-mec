@@ -38,7 +38,6 @@ type EdgeApplicationHandoffSpec struct {
 	CleanupOnDelete bool `json:"cleanupOnDelete,omitempty"`
 
 	// Optional: if true, we disable the BASE (legacy) trigger while keeping the base KService alive.
-	// This avoids duplicate event delivery when the new replica trigger is created.
 	// +optional
 	DisableBaseTrigger bool `json:"disableBaseTrigger,omitempty"`
 }

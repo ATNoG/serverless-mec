@@ -44,12 +44,6 @@ import (
 
 const (
 	handoffFinalizer = "mec.atnog.org/handoff-finalizer"
-
-	// RSU label key
-	rsuLabelKey = "mec.atnog.org/rsu"
-
-	// Same namespace your mec-operator-config ConfigMap lives in
-	defaultConfigNs = "mec-system"
 )
 
 // EdgeApplicationHandoffReconciler reconciles EdgeApplicationHandoff objects.
@@ -252,9 +246,9 @@ func (r *EdgeApplicationHandoffReconciler) buildTargetReplica(
 }
 
 func upsertReplica(list *[]mecv1alpha1.KnativeServiceReplicaSpec, desired mecv1alpha1.KnativeServiceReplicaSpec) bool {
-	if list == nil {
-		tmp := []mecv1alpha1.KnativeServiceReplicaSpec{desired}
-		*list = tmp
+	// list pointer is never nil when passed as &app.Spec.Replicas; handle nil slice instead
+	if *list == nil {
+		*list = []mecv1alpha1.KnativeServiceReplicaSpec{desired}
 		return true
 	}
 
@@ -308,7 +302,6 @@ func (r *EdgeApplicationHandoffReconciler) expectedTrigger(ctx context.Context, 
 	}
 
 	var cfg corev1.ConfigMap
-	// NOTE: defaultConfigMapName is defined in edgeapplication_controller.go (same package)
 	if err := r.Get(ctx, types.NamespacedName{Name: defaultConfigMapName, Namespace: cfgNs}, &cfg); err != nil {
 		return "", ""
 	}

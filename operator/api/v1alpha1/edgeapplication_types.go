@@ -21,10 +21,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// NOTE: json tags are required. Any new fields you add must have json tags
-// for the fields to be serialized, and you must run "make" to regenerate code
-// after modifying this file.
-
 // EdgeRuleRef represents a reference to another MEC resource (e.g. TrafficRule, DNSRule).
 type EdgeRuleRef struct {
 	// name of the referenced resource (required in CRD)
@@ -80,6 +76,41 @@ type KnativeServiceSpec struct {
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 }
 
+// KnativeServiceReplicaSpec describes an additional Knative Service instance derived
+// from the base EdgeApplication.spec.service (e.g., pinned to a specific RSU node).
+type KnativeServiceReplicaSpec struct {
+	// name is the replica identifier. The resulting Knative Service will be:
+	// <edgeapplication name>-<replica name>
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// nodeSelector selects the nodes on which this replica's pods may run.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// affinity configures pod/node affinity.
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// tolerations applied to the pods created for this replica.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+
+	// minScale sets autoscaling.knative.dev/minScale for this replica.
+	// +optional
+	MinScale *int32 `json:"minScale,omitempty"`
+
+	// createTrigger controls whether a trigger is created for this replica.
+	// If nil, defaults to true.
+	// +optional
+	CreateTrigger *bool `json:"createTrigger,omitempty"`
+
+	// triggerFilters overrides trigger filters for this replica.
+	// If nil, base EdgeApplication.spec.service.triggerFilters is used.
+	// +optional
+	TriggerFilters map[string]string `json:"triggerFilters,omitempty"`
+}
+
 // EdgeApplicationSpec defines the desired state of EdgeApplication
 // and corresponds to spec in the CRD.
 type EdgeApplicationSpec struct {
@@ -130,6 +161,11 @@ type EdgeApplicationSpec struct {
 	// MEC application as a Knative Service and Trigger (not defined in ETSI GS MEC 010-1).
 	// +optional
 	Service *KnativeServiceSpec `json:"service,omitempty"`
+
+	// replicas optionally defines extra Knative services derived from spec.service
+	// while keeping the base service running.
+	// +optional
+	Replicas []KnativeServiceReplicaSpec `json:"replicas,omitempty"`
 }
 
 // EdgeApplicationStatus defines the observed state of EdgeApplication.
@@ -150,15 +186,6 @@ type EdgeApplicationStatus struct {
 	OperationalState string `json:"operationalState,omitempty"`
 
 	// conditions represent the current state of the EdgeApplication resource.
-	// Each condition has a unique type and reflects the status of a specific aspect
-	// of the resource.
-	//
-	// Standard condition types may include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
