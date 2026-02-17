@@ -204,36 +204,41 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *mecv1alpha1.EdgeApplication, d desiredService) error {
 	logger := logf.FromContext(ctx)
 
-	labels := map[string]string{
+	// Label applied to:
+	// - KService (for listing / cleanup)
+	// - Revision template (so Pods can be selected by mec.atnog.org/app)
+	appLabel := map[string]string{
 		"mec.atnog.org/app": app.Name,
+	}
+
+	// Build template metadata in a way that does NOT introduce churn:
+	// - always set Labels
+	// - only set Annotations map if we actually set a key
+	templateMeta := metav1.ObjectMeta{
+		Labels: appLabel,
+	}
+	if d.MinScale != nil {
+		templateMeta.Annotations = map[string]string{
+			"autoscaling.knative.dev/minScale": strconv.FormatInt(int64(*d.MinScale), 10),
+		}
 	}
 
 	desiredSvc := &servingv1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      d.Name,
 			Namespace: d.Namespace,
-			Labels:    labels,
+			Labels:    appLabel,
 		},
 		Spec: servingv1.ServiceSpec{
 			ConfigurationSpec: servingv1.ConfigurationSpec{
 				Template: servingv1.RevisionTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						// Manage only minScale here; preserve other template metadata on update.
-						Annotations: map[string]string{},
-					},
+					ObjectMeta: templateMeta,
 					Spec: servingv1.RevisionSpec{
 						PodSpec: d.PodSpec,
 					},
 				},
 			},
 		},
-	}
-
-	// Set minScale annotation if requested
-	if d.MinScale != nil {
-		desiredSvc.Spec.ConfigurationSpec.Template.Annotations["autoscaling.knative.dev/minScale"] = strconv.FormatInt(int64(*d.MinScale), 10)
-	} else {
-		// leave empty map; update path will remove key if present
 	}
 
 	var existing servingv1.Service
@@ -252,7 +257,7 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	// Update only what we manage, and only if it actually changes.
 	updated := existing.DeepCopy()
 
-	// Preserve template metadata; only adjust podspec + minScale key
+	// --- PodSpec update (container + scheduling) ---
 	ps := &updated.Spec.ConfigurationSpec.Template.Spec.PodSpec
 	if len(ps.Containers) == 0 {
 		ps.Containers = []corev1.Container{{}}
@@ -268,20 +273,40 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	ps.Tolerations = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Tolerations
 	ps.Affinity = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Affinity
 
-	// minScale management (keep other annotations intact)
-	if updated.Spec.ConfigurationSpec.Template.Annotations == nil {
-		updated.Spec.ConfigurationSpec.Template.Annotations = map[string]string{}
+	// --- Ensure template labels exist and include the app label (pods selection) ---
+	if updated.Spec.ConfigurationSpec.Template.Labels == nil {
+		updated.Spec.ConfigurationSpec.Template.Labels = map[string]string{}
 	}
+	updated.Spec.ConfigurationSpec.Template.Labels["mec.atnog.org/app"] = app.Name
+
+	// --- MinScale management on template annotations (only the key we manage) ---
+	// Note: leaving annotations nil is fine.
 	if d.MinScale != nil {
+		if updated.Spec.ConfigurationSpec.Template.Annotations == nil {
+			updated.Spec.ConfigurationSpec.Template.Annotations = map[string]string{}
+		}
 		updated.Spec.ConfigurationSpec.Template.Annotations["autoscaling.knative.dev/minScale"] =
 			strconv.FormatInt(int64(*d.MinScale), 10)
 	} else {
-		delete(updated.Spec.ConfigurationSpec.Template.Annotations, "autoscaling.knative.dev/minScale")
-		// if map becomes empty, that's fine
+		// If replicas don't request minScale, remove it (keeps other annotations intact)
+		if updated.Spec.ConfigurationSpec.Template.Annotations != nil {
+			delete(updated.Spec.ConfigurationSpec.Template.Annotations, "autoscaling.knative.dev/minScale")
+			// Optional: you can set annotations to nil when empty to reduce churn
+			if len(updated.Spec.ConfigurationSpec.Template.Annotations) == 0 {
+				updated.Spec.ConfigurationSpec.Template.Annotations = nil
+			}
+		}
 	}
 
-	// prevent double revisions: only Update if spec changed
-	if equality.Semantic.DeepEqual(existing.Spec, updated.Spec) {
+	// Also keep KService labels for cleanup/listing
+	if updated.Labels == nil {
+		updated.Labels = map[string]string{}
+	}
+	updated.Labels["mec.atnog.org/app"] = app.Name
+
+	// prevent revisions: only Update if spec changed
+	if equality.Semantic.DeepEqual(existing.Spec, updated.Spec) &&
+		equality.Semantic.DeepEqual(existing.Labels, updated.Labels) {
 		return nil
 	}
 
@@ -361,7 +386,6 @@ func (r *EdgeApplicationReconciler) cleanupOrphanKServices(ctx context.Context, 
 			continue
 		}
 
-		// Don't delete unrelated services with same label? Here label is ours, so safe.
 		if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
