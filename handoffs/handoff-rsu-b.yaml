@@ -1,0 +1,8 @@
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplicationHandoff
+metadata:
+  name: cam-logger-operator-to-rsu-b
+  namespace: default
+spec:
+  edgeApplicationName: cam-logger-operator
+  targetReplicaName: rsu-b
