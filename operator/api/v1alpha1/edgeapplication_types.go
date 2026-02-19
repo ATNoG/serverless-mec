@@ -57,6 +57,11 @@ type KnativeServiceSpec struct {
 	// container describes the container configuration for the Knative Service.
 	Container KnativeContainerSpec `json:"container"`
 
+	// minScale sets autoscaling.knative.dev/minScale for the BASE service.
+	// Replica/autoReplica rules may override this.
+	// +optional
+	MinScale *int32 `json:"minScale,omitempty"`
+
 	// triggerFilters are the CloudEvent attribute filters for the Knative Trigger
 	// (maps to spec.filter.attributes).
 	// +optional
@@ -97,6 +102,7 @@ type KnativeServiceReplicaSpec struct {
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 
 	// minScale sets autoscaling.knative.dev/minScale for this replica.
+	// If nil, EdgeApplication.spec.service.minScale is used (if set).
 	// +optional
 	MinScale *int32 `json:"minScale,omitempty"`
 
@@ -106,6 +112,37 @@ type KnativeServiceReplicaSpec struct {
 	CreateTrigger *bool `json:"createTrigger,omitempty"`
 
 	// triggerFilters overrides trigger filters for this replica.
+	// If nil, base EdgeApplication.spec.service.triggerFilters is used.
+	// +optional
+	TriggerFilters map[string]string `json:"triggerFilters,omitempty"`
+}
+
+// AutoReplicaRule defines an auto-fanout rule: one KService per matching node.
+type AutoReplicaRule struct {
+	// matchNodes selects the nodes that should receive a replica service.
+	// Example:
+	//   matchNodes:
+	//     road-rsu: "true"
+	// +kubebuilder:validation:MinProperties=1
+	MatchNodes map[string]string `json:"matchNodes"`
+
+	// pinByLabelKey defines which node label is used to pin the service to ONE node.
+	// Defaults to "kubernetes.io/hostname".
+	// Typically you want to keep the default.
+	// +optional
+	PinByLabelKey string `json:"pinByLabelKey,omitempty"`
+
+	// minScale sets autoscaling.knative.dev/minScale for the auto-replica services.
+	// If nil, EdgeApplication.spec.service.minScale is used (if set).
+	// +optional
+	MinScale *int32 `json:"minScale,omitempty"`
+
+	// createTrigger controls whether a trigger is created for each auto-replica.
+	// If nil, defaults to true.
+	// +optional
+	CreateTrigger *bool `json:"createTrigger,omitempty"`
+
+	// triggerFilters overrides trigger filters for auto-replicas.
 	// If nil, base EdgeApplication.spec.service.triggerFilters is used.
 	// +optional
 	TriggerFilters map[string]string `json:"triggerFilters,omitempty"`
@@ -158,7 +195,7 @@ type EdgeApplicationSpec struct {
 	RelatedMeaServices []string `json:"relatedMeaServices,omitempty"`
 
 	// service contains vendor-specific Knative configuration used to realize this
-	// MEC application as a Knative Service and Trigger (not defined in ETSI GS MEC 010-1).
+	// MEC application as a Knative Service and Trigger.
 	// +optional
 	Service *KnativeServiceSpec `json:"service,omitempty"`
 
@@ -166,6 +203,13 @@ type EdgeApplicationSpec struct {
 	// while keeping the base service running.
 	// +optional
 	Replicas []KnativeServiceReplicaSpec `json:"replicas,omitempty"`
+
+	// autoReplicas creates one KService per node that matches each rule's matchNodes.
+	// If set and non-empty, the controller runs in "daemon mode" and does NOT create:
+	// - the base service (<edgeapplication name>)
+	// - spec.replicas services
+	// +optional
+	AutoReplicas []AutoReplicaRule `json:"autoReplicas,omitempty"`
 }
 
 // EdgeApplicationStatus defines the observed state of EdgeApplication.

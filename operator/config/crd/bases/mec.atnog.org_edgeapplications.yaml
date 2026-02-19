@@ -44,6 +44,54 @@ spec:
           spec:
             description: spec defines the desired state of EdgeApplication
             properties:
+              autoReplicas:
+                description: |-
+                  autoReplicas creates one KService per node that matches each rule's matchNodes.
+                  If set and non-empty, the controller runs in "daemon mode" and does NOT create:
+                  - the base service (<edgeapplication name>)
+                  - spec.replicas services
+                items:
+                  description: 'AutoReplicaRule defines an auto-fanout rule: one KService
+                    per matching node.'
+                  properties:
+                    createTrigger:
+                      description: |-
+                        createTrigger controls whether a trigger is created for each auto-replica.
+                        If nil, defaults to true.
+                      type: boolean
+                    matchNodes:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        matchNodes selects the nodes that should receive a replica service.
+                        Example:
+                          matchNodes:
+                            road-rsu: "true"
+                      minProperties: 1
+                      type: object
+                    minScale:
+                      description: |-
+                        minScale sets autoscaling.knative.dev/minScale for the auto-replica services.
+                        If nil, EdgeApplication.spec.service.minScale is used (if set).
+                      format: int32
+                      type: integer
+                    pinByLabelKey:
+                      description: |-
+                        pinByLabelKey defines which node label is used to pin the service to ONE node.
+                        Defaults to "kubernetes.io/hostname".
+                        Typically you want to keep the default.
+                      type: string
+                    triggerFilters:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        triggerFilters overrides trigger filters for auto-replicas.
+                        If nil, base EdgeApplication.spec.service.triggerFilters is used.
+                      type: object
+                  required:
+                  - matchNodes
+                  type: object
+                type: array
               dId:
                 description: dId is the identifier of the edge application descriptor
                   (dId).
@@ -1014,8 +1062,9 @@ spec:
                         If nil, defaults to true.
                       type: boolean
                     minScale:
-                      description: minScale sets autoscaling.knative.dev/minScale
-                        for this replica.
+                      description: |-
+                        minScale sets autoscaling.knative.dev/minScale for this replica.
+                        If nil, EdgeApplication.spec.service.minScale is used (if set).
                       format: int32
                       type: integer
                     name:
@@ -1084,7 +1133,7 @@ spec:
               service:
                 description: |-
                   service contains vendor-specific Knative configuration used to realize this
-                  MEC application as a Knative Service and Trigger (not defined in ETSI GS MEC 010-1).
+                  MEC application as a Knative Service and Trigger.
                 properties:
                   affinity:
                     description: affinity configures pod/node affinity (typically
@@ -2093,6 +2142,12 @@ spec:
                     required:
                     - image
                     type: object
+                  minScale:
+                    description: |-
+                      minScale sets autoscaling.knative.dev/minScale for the BASE service.
+                      Replica/autoReplica rules may override this.
+                    format: int32
+                    type: integer
                   nodeSelector:
                     additionalProperties:
                       type: string
