@@ -1,3 +1,4 @@
+
 /*
 Copyright 2025.
 
@@ -33,9 +34,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	servingv1 "knative.dev/serving/pkg/apis/serving/v1"
@@ -611,11 +616,55 @@ func (r *EdgeApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.ConfigNamespace = defaultConfigNs
 	}
 
+	// Reconcile on node create/delete and on label changes only (ignore noisy status updates)
+	nodePred := predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool { return true },
+		DeleteFunc: func(e event.DeleteEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldN, ok1 := e.ObjectOld.(*corev1.Node)
+			newN, ok2 := e.ObjectNew.(*corev1.Node)
+			if !ok1 || !ok2 {
+				return true
+			}
+			return !equality.Semantic.DeepEqual(oldN.Labels, newN.Labels)
+		},
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&mecv1alpha1.EdgeApplication{}).
-		WithEventFilter(predicate.GenerationChangedPredicate{}).
+		// Apply GenerationChanged only to the primary resource (EdgeApplication)
+		For(&mecv1alpha1.EdgeApplication{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&servingv1.Service{}).
 		Owns(&eventingv1.Trigger{}).
+
+		// Watch Nodes so that new labelled nodes trigger reconcile -> new per-node KService
+		// We enqueue ALL EdgeApplications that use autoReplicas (safe + ensures cleanup on delete/label removal).
+		Watches(
+			&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				_ = obj // we don't need the node contents; any label-change/new/delete may affect desired fanout
+				var apps mecv1alpha1.EdgeApplicationList
+				if err := r.List(ctx, &apps); err != nil {
+					return nil
+				}
+
+				reqs := make([]reconcile.Request, 0, len(apps.Items))
+				for i := range apps.Items {
+					app := &apps.Items[i]
+					if app.Spec.Service == nil || len(app.Spec.AutoReplicas) == 0 {
+						continue
+					}
+					reqs = append(reqs, reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Name:      app.Name,
+							Namespace: app.Namespace,
+						},
+					})
+				}
+				return reqs
+			}),
+			builder.WithPredicates(nodePred),
+		).
+
 		Named("edgeapplication").
 		Complete(r)
 }
