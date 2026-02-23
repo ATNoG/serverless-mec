@@ -23,140 +23,224 @@ import (
 
 // EdgeRuleRef represents a reference to another MEC resource (e.g. TrafficRule, DNSRule).
 type EdgeRuleRef struct {
+	// name of the referenced resource (required in CRD)
 	Name string `json:"name"`
+
+	// namespace of the referenced resource (optional in CRD)
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 }
 
-// EnvVarSpec supports either a literal value OR a valueFrom.
+// EnvVarSpec supports either a literal value OR a valueFrom (Downward API, ConfigMapKeyRef, SecretKeyRef).
 type EnvVarSpec struct {
 	Name string `json:"name"`
+
 	// +optional
 	Value string `json:"value,omitempty"`
+
 	// +optional
 	ValueFrom *corev1.EnvVarSource `json:"valueFrom,omitempty"`
 }
 
 // KnativeContainerSpec holds the container configuration for the Knative Service.
 type KnativeContainerSpec struct {
+	// name is the container name (optional). If omitted, Knative will assign one.
 	// +optional
 	Name string `json:"name,omitempty"`
+
+	// image is the container image for the Knative Service implementing this EdgeApplication.
 	Image string `json:"image"`
+
+	// env is an optional list of environment variables for the container.
 	// +optional
 	Env []EnvVarSpec `json:"env,omitempty"`
+
+	// resources are the resource requests and limits for this container.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// securityContext is the container security context (capabilities, runAsUser, etc).
 	// +optional
 	SecurityContext *corev1.SecurityContext `json:"securityContext,omitempty"`
+
+	// volumeMounts are mounts for volumes defined at the pod level.
 	// +optional
 	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
 }
 
-// KnativeServiceSpec is the vendor-specific "service" block in the CRD,
-// used to realize the EdgeApplication as Knative Services (and optionally Triggers).
+// KnativeServiceSpec represents the vendor-specific "service" block in the CRD,
+// used to realize the EdgeApplication as a Knative Service and (optionally) Trigger(s).
 type KnativeServiceSpec struct {
+	// container describes the container configuration for the Knative Service.
 	Container KnativeContainerSpec `json:"container"`
 
-	// minScale sets autoscaling.knative.dev/minScale and applies to ALL derived services
-	// (base, replicas, autoReplicas).
+	// minScale sets autoscaling.knative.dev/minScale.
+	// Applies to base service, replicas, and autoReplicas services.
 	// +optional
 	MinScale *int32 `json:"minScale,omitempty"`
 
-	// triggerFilters are CloudEvent attribute filters for the Trigger.
-	// If omitted or empty, NO triggers are created.
+	// triggerFilters are the CloudEvent attribute filters for the Knative Trigger
+	// (maps to spec.filter.attributes).
+	//
+	// NEW semantics:
+	// - This exists ONLY here (service-level).
+	// - If triggerFilters is empty/nil, the operator will NOT create any Trigger resources.
 	// +optional
 	TriggerFilters map[string]string `json:"triggerFilters,omitempty"`
 
+	// nodeSelector selects the nodes on which the Knative Service's pods may run.
+	// This is a direct pass-through to pod.spec.nodeSelector.
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// affinity configures pod/node affinity (typically NodeAffinity).
 	// +optional
 	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// tolerations applied to the pods created for this Knative Service.
 	// +optional
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 
+	// hostNetwork puts the pod into the host's network namespace (needed for sniffing host interfaces).
 	// +optional
 	HostNetwork bool `json:"hostNetwork,omitempty"`
+
+	// dnsPolicy allows setting ClusterFirstWithHostNet when hostNetwork=true.
 	// +optional
 	DNSPolicy corev1.DNSPolicy `json:"dnsPolicy,omitempty"`
 
-	// podSecurityContext applies to ALL containers (including queue-proxy). Use with care.
+	// podSecurityContext is the pod-level security context (runAsUser, fsGroup, etc).
+	// NOTE: This applies to queue-proxy too. Prefer container.securityContext.runAsUser for root sniffers.
 	// +optional
 	PodSecurityContext *corev1.PodSecurityContext `json:"podSecurityContext,omitempty"`
 
+	// volumes are pod volumes (e.g., emptyDir) that can be mounted by the container.
 	// +optional
 	Volumes []corev1.Volume `json:"volumes,omitempty"`
 
+	// serviceAccountName sets the pod's serviceAccountName (optional).
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
+	// automountServiceAccountToken controls automounting SA token.
 	// +optional
 	AutomountServiceAccountToken *bool `json:"automountServiceAccountToken,omitempty"`
 }
 
 // KnativeServiceReplicaSpec describes an additional Knative Service instance derived
-// from the base EdgeApplication.spec.service. Placement-only overrides.
+// from the base EdgeApplication.spec.service.
 type KnativeServiceReplicaSpec struct {
+	// name is the replica identifier. The resulting Knative Service will be:
+	// <edgeapplication name>-<replica name>
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
+	// nodeSelector selects the nodes on which this replica's pods may run.
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// affinity configures pod/node affinity.
 	// +optional
 	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// tolerations applied to the pods created for this replica.
 	// +optional
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 }
 
 // AutoReplicaRule defines an auto-fanout rule: one KService per matching node.
-// New semantics: ONLY matchNodes is allowed.
+//
+// NEW semantics:
+// - autoReplicas entries ONLY contain matchNodes.
 type AutoReplicaRule struct {
+	// matchNodes selects the nodes that should receive a replica service.
+	// Example:
+	//   matchNodes:
+	//     road-rsu: "true"
 	// +kubebuilder:validation:MinProperties=1
 	MatchNodes map[string]string `json:"matchNodes"`
 }
 
 // EdgeApplicationSpec defines the desired state of EdgeApplication
+// and corresponds to spec in the CRD.
 type EdgeApplicationSpec struct {
-	DID         string `json:"dId"`
-	Name        string `json:"name"`
-	Provider    string `json:"provider"`
-	SoftVersion string `json:"softVersion"`
-	DVersion    string `json:"dVersion"`
+	// dId is the identifier of the edge application descriptor (dId).
+	DID string `json:"dId"`
 
+	// name is the human readable name of the MEC application.
+	Name string `json:"name"`
+
+	// provider is the provider of the MEC application.
+	Provider string `json:"provider"`
+
+	// softVersion is the version of the MEC application software.
+	SoftVersion string `json:"softVersion"`
+
+	// dVersion is the version of the application descriptor.
+	DVersion string `json:"dVersion"`
+
+	// infoName is a human readable product name.
 	// +optional
 	InfoName string `json:"infoName,omitempty"`
+
+	// description is a human readable description of the MEC application.
 	// +optional
 	Description string `json:"description,omitempty"`
+
+	// instanceId is the application instance identifier.
 	// +optional
 	InstanceID string `json:"instanceId,omitempty"`
 
+	// usedTrafficRules references TrafficRule resources used by this app (active rules only).
 	// +optional
 	UsedTrafficRules []EdgeRuleRef `json:"usedTrafficRules,omitempty"`
+
+	// usedDNSRules references DNSRule resources used by this app (active rules only).
 	// +optional
 	UsedDNSRules []EdgeRuleRef `json:"usedDNSRules,omitempty"`
+
+	// relatedMepServices are edge platform services related to this application.
 	// +optional
 	RelatedMepServices []string `json:"relatedMepServices,omitempty"`
+
+	// relatedMeaServices are edge application services related to this application.
 	// +optional
 	RelatedMeaServices []string `json:"relatedMeaServices,omitempty"`
 
+	// service contains vendor-specific Knative configuration used to realize this
+	// MEC application as a Knative Service and (optionally) Trigger(s).
 	// +optional
 	Service *KnativeServiceSpec `json:"service,omitempty"`
 
+	// replicas optionally defines extra Knative services derived from spec.service
+	// while keeping the base service running (only when autoReplicas is NOT set).
 	// +optional
 	Replicas []KnativeServiceReplicaSpec `json:"replicas,omitempty"`
 
+	// autoReplicas creates one KService per node that matches each rule's matchNodes.
+	// If autoReplicas is set (non-empty), the controller runs in daemon mode (no base + no replicas).
 	// +optional
 	AutoReplicas []AutoReplicaRule `json:"autoReplicas,omitempty"`
 }
 
 // EdgeApplicationStatus defines the observed state of EdgeApplication.
 type EdgeApplicationStatus struct {
+	// instantiationState corresponds to the ETSI lifecycle state:
+	// one of "NOT_INSTANTIATED" or "INSTANTIATED".
 	// +optional
 	InstantiationState string `json:"instantiationState,omitempty"`
+
+	// appState corresponds to the ETSI application state:
+	// one of "STARTED" or "STOPPED".
 	// +optional
 	AppState string `json:"appState,omitempty"`
+
+	// operationalState is a read-only indicator of operational state:
+	// one of "ACTIVE" or "INACTIVE".
 	// +optional
 	OperationalState string `json:"operationalState,omitempty"`
 
+	// conditions represent the current state of the EdgeApplication resource.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -166,14 +250,24 @@ type EdgeApplicationStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:path=edgeapplications,scope=Namespaced,shortName=mea;meapp,categories=mec
+
+// EdgeApplication is the Schema for the edgeapplications API
 type EdgeApplication struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              EdgeApplicationSpec   `json:"spec"`
-	Status            EdgeApplicationStatus `json:"status,omitempty"`
+
+	// spec defines the desired state of EdgeApplication
+	// +required
+	Spec EdgeApplicationSpec `json:"spec"`
+
+	// status defines the observed state of EdgeApplication
+	// +optional
+	Status EdgeApplicationStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
+
+// EdgeApplicationList contains a list of EdgeApplication
 type EdgeApplicationList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`

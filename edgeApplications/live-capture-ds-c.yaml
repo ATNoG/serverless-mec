@@ -10,23 +10,29 @@ spec:
   softVersion: "latest"
   dVersion: "1.0.0"
   description: "Per-node live packet capture (Knative per-node services)"
+
   service:
     hostNetwork: true
     dnsPolicy: ClusterFirstWithHostNet
-    minScale: 1
+
     volumes:
       - name: varlog
         emptyDir: {}
+
     container:
       name: user-container
       image: ghcr.io/pmacoutinho/its-live-capture-c:latest
+
       env:
         - name: K8S_NODE_NAME
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+
+        # Send directly to broker ingress (producer-only)
         - name: K_SINK
           value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
+
         - name: IFACE
           value: "cw-mon-rxa"
         - name: BPF
@@ -52,9 +58,15 @@ spec:
         capabilities:
           drop: ["ALL"]
           add: ["NET_RAW", "NET_ADMIN"]
+
       volumeMounts:
         - name: varlog
           mountPath: /var/log
+
+    minScale: 1
+
+    # triggerFilters omitted on purpose: no Trigger should be created.
+
   autoReplicas:
     - matchNodes:
         snifftest: "true"

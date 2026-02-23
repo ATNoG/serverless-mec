@@ -43,7 +43,8 @@ import (
 )
 
 const (
-	handoffFinalizer = "mec.atnog.org/handoff-finalizer"
+	handoffFinalizer      = "mec.atnog.org/handoff-finalizer"
+	defaultRSULabelKeyHO  = "mec.atnog.org/rsu"
 )
 
 // EdgeApplicationHandoffReconciler reconciles EdgeApplicationHandoff objects.
@@ -128,9 +129,7 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, nil
 	}
 
-	// NOTE: in daemon mode, EdgeApplication controller ignores spec.replicas.
-	// We don't fail here (maybe you still use replicas mode), but it won't take effect if autoReplicas is set.
-
+	// Build desired replica spec:
 	desiredRep, err := r.buildTargetReplica(&app, &ho)
 	if err != nil {
 		r.setFailed(ctx, &ho, "BuildReplicaFailed", err.Error())
@@ -150,7 +149,7 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 	svcName := fmt.Sprintf("%s-%s", app.Name, ho.Spec.TargetReplicaName)
 	ho.Status.TargetKService = fmt.Sprintf("%s/%s", app.Namespace, svcName)
 
-	// Triggers only exist if spec.service.triggerFilters is non-empty
+	// NEW semantics: trigger exists only if app.spec.service.triggerFilters is non-empty
 	trigNs, trigName := "", ""
 	if app.Spec.Service != nil && len(app.Spec.Service.TriggerFilters) > 0 {
 		trigNs, trigName = r.expectedTrigger(ctx, svcName)
@@ -225,10 +224,10 @@ func (r *EdgeApplicationHandoffReconciler) buildTargetReplica(
 		if out.NodeSelector == nil {
 			out.NodeSelector = map[string]string{}
 		}
-		out.NodeSelector[rsuLabelKey] = ho.Spec.TargetReplicaName
+		out.NodeSelector[defaultRSULabelKeyHO] = ho.Spec.TargetReplicaName
 	}
 
-	// Optional overrides (placement only)
+	// Optional overrides
 	if ho.Spec.Affinity != nil {
 		out.Affinity = ho.Spec.Affinity
 	}
@@ -286,7 +285,8 @@ func (r *EdgeApplicationHandoffReconciler) cleanupTargetReplica(ctx context.Cont
 	return r.Patch(ctx, &app, client.MergeFrom(orig))
 }
 
-// Determine expected trigger name/namespace using operator config.
+// Determine expected trigger name/namespace.
+// Uses mec-operator-config (same as EdgeApplication controller).
 func (r *EdgeApplicationHandoffReconciler) expectedTrigger(ctx context.Context, svcName string) (trigNs string, trigName string) {
 	cfgNs := r.ConfigNamespace
 	if cfgNs == "" {

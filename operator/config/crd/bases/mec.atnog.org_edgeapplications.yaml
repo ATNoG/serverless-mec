@@ -22,6 +22,7 @@ spec:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
+        description: EdgeApplication is the Schema for the edgeapplications API
         properties:
           apiVersion:
             description: |-
@@ -41,17 +42,27 @@ spec:
           metadata:
             type: object
           spec:
-            description: EdgeApplicationSpec defines the desired state of EdgeApplication
+            description: spec defines the desired state of EdgeApplication
             properties:
               autoReplicas:
+                description: |-
+                  autoReplicas creates one KService per node that matches each rule's matchNodes.
+                  If autoReplicas is set (non-empty), the controller runs in daemon mode (no base + no replicas).
                 items:
                   description: |-
                     AutoReplicaRule defines an auto-fanout rule: one KService per matching node.
-                    New semantics: ONLY matchNodes is allowed.
+
+                    NEW semantics:
+                    - autoReplicas entries ONLY contain matchNodes.
                   properties:
                     matchNodes:
                       additionalProperties:
                         type: string
+                      description: |-
+                        matchNodes selects the nodes that should receive a replica service.
+                        Example:
+                          matchNodes:
+                            road-rsu: "true"
                       minProperties: 1
                       type: object
                   required:
@@ -59,35 +70,51 @@ spec:
                   type: object
                 type: array
               dId:
+                description: dId is the identifier of the edge application descriptor
+                  (dId).
                 type: string
               dVersion:
+                description: dVersion is the version of the application descriptor.
                 type: string
               description:
+                description: description is a human readable description of the MEC
+                  application.
                 type: string
               infoName:
+                description: infoName is a human readable product name.
                 type: string
               instanceId:
+                description: instanceId is the application instance identifier.
                 type: string
               name:
+                description: name is the human readable name of the MEC application.
                 type: string
               provider:
+                description: provider is the provider of the MEC application.
                 type: string
               relatedMeaServices:
+                description: relatedMeaServices are edge application services related
+                  to this application.
                 items:
                   type: string
                 type: array
               relatedMepServices:
+                description: relatedMepServices are edge platform services related
+                  to this application.
                 items:
                   type: string
                 type: array
               replicas:
+                description: |-
+                  replicas optionally defines extra Knative services derived from spec.service
+                  while keeping the base service running (only when autoReplicas is NOT set).
                 items:
                   description: |-
                     KnativeServiceReplicaSpec describes an additional Knative Service instance derived
-                    from the base EdgeApplication.spec.service. Placement-only overrides.
+                    from the base EdgeApplication.spec.service.
                   properties:
                     affinity:
-                      description: Affinity is a group of affinity scheduling rules.
+                      description: affinity configures pod/node affinity.
                       properties:
                         nodeAffinity:
                           description: Describes node affinity scheduling rules for
@@ -1007,13 +1034,20 @@ spec:
                           type: object
                       type: object
                     name:
+                      description: |-
+                        name is the replica identifier. The resulting Knative Service will be:
+                        <edgeapplication name>-<replica name>
                       minLength: 1
                       type: string
                     nodeSelector:
                       additionalProperties:
                         type: string
+                      description: nodeSelector selects the nodes on which this replica's
+                        pods may run.
                       type: object
                     tolerations:
+                      description: tolerations applied to the pods created for this
+                        replica.
                       items:
                         description: |-
                           The pod this Toleration is attached to tolerates any taint that matches
@@ -1057,11 +1091,12 @@ spec:
                 type: array
               service:
                 description: |-
-                  KnativeServiceSpec is the vendor-specific "service" block in the CRD,
-                  used to realize the EdgeApplication as Knative Services (and optionally Triggers).
+                  service contains vendor-specific Knative configuration used to realize this
+                  MEC application as a Knative Service and (optionally) Trigger(s).
                 properties:
                   affinity:
-                    description: Affinity is a group of affinity scheduling rules.
+                    description: affinity configures pod/node affinity (typically
+                      NodeAffinity).
                     properties:
                       nodeAffinity:
                         description: Describes node affinity scheduling rules for
@@ -1980,15 +2015,19 @@ spec:
                         type: object
                     type: object
                   automountServiceAccountToken:
+                    description: automountServiceAccountToken controls automounting
+                      SA token.
                     type: boolean
                   container:
-                    description: KnativeContainerSpec holds the container configuration
-                      for the Knative Service.
+                    description: container describes the container configuration for
+                      the Knative Service.
                     properties:
                       env:
+                        description: env is an optional list of environment variables
+                          for the container.
                         items:
                           description: EnvVarSpec supports either a literal value
-                            OR a valueFrom.
+                            OR a valueFrom (Downward API, ConfigMapKeyRef, SecretKeyRef).
                           properties:
                             name:
                               type: string
@@ -2130,12 +2169,16 @@ spec:
                           type: object
                         type: array
                       image:
+                        description: image is the container image for the Knative
+                          Service implementing this EdgeApplication.
                         type: string
                       name:
+                        description: name is the container name (optional). If omitted,
+                          Knative will assign one.
                         type: string
                       resources:
-                        description: ResourceRequirements describes the compute resource
-                          requirements.
+                        description: resources are the resource requests and limits
+                          for this container.
                         properties:
                           claims:
                             description: |-
@@ -2194,10 +2237,8 @@ spec:
                             type: object
                         type: object
                       securityContext:
-                        description: |-
-                          SecurityContext holds security configuration that will be applied to a container.
-                          Some fields are present in both SecurityContext and PodSecurityContext.  When both
-                          are set, the values in SecurityContext take precedence.
+                        description: securityContext is the container security context
+                          (capabilities, runAsUser, etc).
                         properties:
                           allowPrivilegeEscalation:
                             description: |-
@@ -2389,6 +2430,8 @@ spec:
                             type: object
                         type: object
                       volumeMounts:
+                        description: volumeMounts are mounts for volumes defined at
+                          the pod level.
                         items:
                           description: VolumeMount describes a mounting of a Volume
                             within a container.
@@ -2455,23 +2498,30 @@ spec:
                     - image
                     type: object
                   dnsPolicy:
-                    description: DNSPolicy defines how a pod's DNS will be configured.
+                    description: dnsPolicy allows setting ClusterFirstWithHostNet
+                      when hostNetwork=true.
                     type: string
                   hostNetwork:
+                    description: hostNetwork puts the pod into the host's network
+                      namespace (needed for sniffing host interfaces).
                     type: boolean
                   minScale:
                     description: |-
-                      minScale sets autoscaling.knative.dev/minScale and applies to ALL derived services
-                      (base, replicas, autoReplicas).
+                      minScale sets autoscaling.knative.dev/minScale.
+                      Applies to base service, replicas, and autoReplicas services.
                     format: int32
                     type: integer
                   nodeSelector:
                     additionalProperties:
                       type: string
+                    description: |-
+                      nodeSelector selects the nodes on which the Knative Service's pods may run.
+                      This is a direct pass-through to pod.spec.nodeSelector.
                     type: object
                   podSecurityContext:
-                    description: podSecurityContext applies to ALL containers (including
-                      queue-proxy). Use with care.
+                    description: |-
+                      podSecurityContext is the pod-level security context (runAsUser, fsGroup, etc).
+                      NOTE: This applies to queue-proxy too. Prefer container.securityContext.runAsUser for root sniffers.
                     properties:
                       appArmorProfile:
                         description: |-
@@ -2703,8 +2753,12 @@ spec:
                         type: object
                     type: object
                   serviceAccountName:
+                    description: serviceAccountName sets the pod's serviceAccountName
+                      (optional).
                     type: string
                   tolerations:
+                    description: tolerations applied to the pods created for this
+                      Knative Service.
                     items:
                       description: |-
                         The pod this Toleration is attached to tolerates any taint that matches
@@ -2746,10 +2800,16 @@ spec:
                     additionalProperties:
                       type: string
                     description: |-
-                      triggerFilters are CloudEvent attribute filters for the Trigger.
-                      If omitted or empty, NO triggers are created.
+                      triggerFilters are the CloudEvent attribute filters for the Knative Trigger
+                      (maps to spec.filter.attributes).
+
+                      NEW semantics:
+                      - This exists ONLY here (service-level).
+                      - If triggerFilters is empty/nil, the operator will NOT create any Trigger resources.
                     type: object
                   volumes:
+                    description: volumes are pod volumes (e.g., emptyDir) that can
+                      be mounted by the container.
                     items:
                       description: Volume represents a named volume in a pod that
                         may be accessed by any container in the pod.
@@ -4643,28 +4703,39 @@ spec:
                 - container
                 type: object
               softVersion:
+                description: softVersion is the version of the MEC application software.
                 type: string
               usedDNSRules:
+                description: usedDNSRules references DNSRule resources used by this
+                  app (active rules only).
                 items:
                   description: EdgeRuleRef represents a reference to another MEC resource
                     (e.g. TrafficRule, DNSRule).
                   properties:
                     name:
+                      description: name of the referenced resource (required in CRD)
                       type: string
                     namespace:
+                      description: namespace of the referenced resource (optional
+                        in CRD)
                       type: string
                   required:
                   - name
                   type: object
                 type: array
               usedTrafficRules:
+                description: usedTrafficRules references TrafficRule resources used
+                  by this app (active rules only).
                 items:
                   description: EdgeRuleRef represents a reference to another MEC resource
                     (e.g. TrafficRule, DNSRule).
                   properties:
                     name:
+                      description: name of the referenced resource (required in CRD)
                       type: string
                     namespace:
+                      description: namespace of the referenced resource (optional
+                        in CRD)
                       type: string
                   required:
                   - name
@@ -4678,11 +4749,16 @@ spec:
             - softVersion
             type: object
           status:
-            description: EdgeApplicationStatus defines the observed state of EdgeApplication.
+            description: status defines the observed state of EdgeApplication
             properties:
               appState:
+                description: |-
+                  appState corresponds to the ETSI application state:
+                  one of "STARTED" or "STOPPED".
                 type: string
               conditions:
+                description: conditions represent the current state of the EdgeApplication
+                  resource.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -4742,8 +4818,14 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               instantiationState:
+                description: |-
+                  instantiationState corresponds to the ETSI lifecycle state:
+                  one of "NOT_INSTANTIATED" or "INSTANTIATED".
                 type: string
               operationalState:
+                description: |-
+                  operationalState is a read-only indicator of operational state:
+                  one of "ACTIVE" or "INACTIVE".
                 type: string
             type: object
         required:

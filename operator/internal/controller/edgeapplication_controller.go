@@ -68,6 +68,8 @@ type desiredService struct {
 	Namespace     string
 	PodSpec       corev1.PodSpec
 	MinScale      *int32
+	CreateTrigger bool
+
 	TriggerNs     string
 	TriggerName   string
 	TriggerBroker string
@@ -82,10 +84,6 @@ var (
 	reNonDNS = regexp.MustCompile(`[^a-z0-9-]+`)
 )
 
-func hasTriggerFilters(m map[string]string) bool {
-	return len(m) > 0
-}
-
 func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
 
@@ -98,7 +96,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	// If no "service" spec, do nothing (and don't manage any knative resources)
+	// If no "service" spec, do nothing (and also don't manage any knative resources)
 	if app.Spec.Service == nil {
 		logger.V(1).Info("EdgeApplication has no service spec; skipping Knative reconciliation",
 			"edgeApplication", app.Name)
@@ -131,6 +129,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// 3) Base Knative inputs (ONLY from spec.service.*)
 	baseEnv := buildEnvVars(app.Spec.Service.Container.Env)
+
 	basePodSpec := corev1.PodSpec{
 		Containers: []corev1.Container{{
 			Name:            app.Spec.Service.Container.Name,
@@ -139,6 +138,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			Resources:       app.Spec.Service.Container.Resources,
 			SecurityContext: app.Spec.Service.Container.SecurityContext,
 			VolumeMounts:    nilIfEmptyVolumeMounts(app.Spec.Service.Container.VolumeMounts),
+			// ReadinessProbe may be set below when triggerFilters are absent (background app)
 		}},
 		NodeSelector:                 nilIfEmptyMap(app.Spec.Service.NodeSelector),
 		Tolerations:                  nilIfEmptyTolerations(app.Spec.Service.Tolerations),
@@ -150,19 +150,37 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		ServiceAccountName:           app.Spec.Service.ServiceAccountName,
 		AutomountServiceAccountToken: app.Spec.Service.AutomountServiceAccountToken,
 	}
-	// Sensible default when HostNetwork=true and DNSPolicy omitted
+
+	// Sensible default when HostNetwork=true and DNSPolicy was omitted
 	if basePodSpec.HostNetwork && basePodSpec.DNSPolicy == "" {
 		basePodSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 	}
 
-	// New semantics:
-	// - minScale ONLY from spec.service.minScale and applies to all derived services
-	// - triggerFilters ONLY from spec.service.triggerFilters
 	baseMinScale := app.Spec.Service.MinScale
 	baseFilters := app.Spec.Service.TriggerFilters
 
+	// NEW semantics:
+	// - triggerFilters ONLY exist in spec.service
+	// - if triggerFilters is empty/nil => DO NOT create triggers anywhere
+	createTriggers := len(baseFilters) > 0
+
+	// If there are NO trigger filters, this is a "background" app (no HTTP contract).
+	// Prevent Knative "Initial scale was never achieved" by setting a readinessProbe
+	// that always succeeds (requires config-features: kubernetes.containerspec-readinessprobe=enabled).
+	if !createTriggers {
+		basePodSpec.Containers[0].ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", "exit 0"}},
+			},
+			PeriodSeconds:    5,
+			TimeoutSeconds:   1,
+			FailureThreshold: 1,
+		}
+	}
+
 	desired := make(map[string]desiredService)
 
+	// Daemon mode: only auto replicas (one service per matching node) when autoReplicas is set
 	daemonMode := len(app.Spec.AutoReplicas) > 0
 	if daemonMode {
 		logger.Info("autoReplicas enabled: daemon mode (no base service, no spec.replicas)",
@@ -178,6 +196,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			Namespace:     app.Namespace,
 			PodSpec:       basePodSpec,
 			MinScale:      baseMinScale,
+			CreateTrigger: createTriggers,
 			TriggerNs:     brokerNamespace,
 			TriggerName:   baseSvcName + "-trigger",
 			TriggerBroker: brokerName,
@@ -198,6 +217,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				Namespace:     app.Namespace,
 				PodSpec:       repPod,
 				MinScale:      baseMinScale,
+				CreateTrigger: createTriggers,
 				TriggerNs:     brokerNamespace,
 				TriggerName:   svcName + "-trigger",
 				TriggerBroker: brokerName,
@@ -206,7 +226,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Daemon mode: auto replicas (one service per matching node)
+	// Daemon mode: only auto replicas (one service per matching node)
 	if daemonMode {
 		for _, ar := range app.Spec.AutoReplicas {
 			var nodeList corev1.NodeList
@@ -220,14 +240,17 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				"count", len(nodeList.Items),
 			)
 
+			// NEW semantics: autoReplicas ONLY has matchNodes; pin by kubernetes.io/hostname always.
 			pinKey := defaultPinByLabelKey
 
 			for _, n := range nodeList.Items {
 				pinVal := n.Labels[pinKey]
 				if pinVal == "" {
+					// hostname label missing; fall back to node name
 					pinVal = n.Name
 				}
 
+				// Name MUST be servicename-nodename (node name)
 				svcName := makeServiceName(app.Name, n.Name)
 
 				repPod := basePodSpec
@@ -238,6 +261,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					Namespace:     app.Namespace,
 					PodSpec:       repPod,
 					MinScale:      baseMinScale,
+					CreateTrigger: createTriggers,
 					TriggerNs:     brokerNamespace,
 					TriggerName:   svcName + "-trigger",
 					TriggerBroker: brokerName,
@@ -259,9 +283,9 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	// 6) Reconcile Triggers (ONLY if triggerFilters is present/non-empty)
+	// 6) Reconcile Triggers (ONLY if triggerFilters exist)
 	for _, d := range desired {
-		if !hasTriggerFilters(d.TriggerFilter) {
+		if !d.CreateTrigger {
 			continue
 		}
 		if err := r.reconcileTrigger(ctx, &app, d); err != nil {
@@ -270,6 +294,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// 7) Cleanup orphan Triggers
+	// If triggerFilters are empty, desired triggers set is empty => this deletes any existing triggers for this app.
 	if err := r.cleanupOrphanTriggers(ctx, &app, desired, brokerNamespace); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -332,6 +357,7 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 
 	updated := existing.DeepCopy()
 
+	// PodSpec update
 	ps := &updated.Spec.ConfigurationSpec.Template.Spec.PodSpec
 	if len(ps.Containers) == 0 {
 		ps.Containers = []corev1.Container{{}}
@@ -345,12 +371,15 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	ps.Containers[0].SecurityContext = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].SecurityContext
 	ps.Containers[0].VolumeMounts = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].VolumeMounts
 
+	// IMPORTANT: readiness probe passthrough (fixes "Initial scale was never achieved" for background apps)
+	ps.Containers[0].ReadinessProbe = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].ReadinessProbe
+
 	// scheduling / placement
 	ps.NodeSelector = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.NodeSelector
 	ps.Tolerations = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Tolerations
 	ps.Affinity = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Affinity
 
-	// pod-level passthrough
+	// pod-level passthrough (Option B fields)
 	ps.HostNetwork = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.HostNetwork
 	ps.DNSPolicy = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.DNSPolicy
 	ps.SecurityContext = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.SecurityContext
@@ -358,7 +387,7 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	ps.ServiceAccountName = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.ServiceAccountName
 	ps.AutomountServiceAccountToken = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.AutomountServiceAccountToken
 
-	// Ensure template label exists
+	// Ensure template label exists (pods selection)
 	if updated.Spec.ConfigurationSpec.Template.Labels == nil {
 		updated.Spec.ConfigurationSpec.Template.Labels = map[string]string{}
 	}
@@ -479,7 +508,7 @@ func (r *EdgeApplicationReconciler) cleanupOrphanKServices(ctx context.Context, 
 func (r *EdgeApplicationReconciler) cleanupOrphanTriggers(ctx context.Context, app *mecv1alpha1.EdgeApplication, desired map[string]desiredService, triggerNs string) error {
 	desiredTriggerNames := map[string]struct{}{}
 	for _, d := range desired {
-		if hasTriggerFilters(d.TriggerFilter) {
+		if d.CreateTrigger {
 			desiredTriggerNames[d.TriggerName] = struct{}{}
 		}
 	}
@@ -612,7 +641,9 @@ func min(a, b int) int {
 	return b
 }
 
-// Requeue EdgeApplications in daemon mode (spec.autoReplicas set) when nodes change.
+// When a Node is added/removed or its labels change, requeue all EdgeApplications
+// that are in daemon mode (have spec.autoReplicas set). This makes the operator
+// create/delete per-node services as the matching node set changes.
 func (r *EdgeApplicationReconciler) nodeToDaemonEdgeApps(ctx context.Context, obj client.Object) []reconcile.Request {
 	if _, ok := obj.(*corev1.Node); !ok {
 		return nil

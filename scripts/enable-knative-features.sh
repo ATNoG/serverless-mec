@@ -42,7 +42,9 @@ kubectl -n "${NAMESPACE}" patch configmap "${CONFIGMAP}" \
       "kubernetes.podspec-volumes-emptydir": "enabled",
       "kubernetes.podspec-fieldref": "enabled",
       "kubernetes.podspec-securitycontext": "enabled",
-      "kubernetes.containerspec-addcapabilities": "enabled"
+
+      "kubernetes.containerspec-addcapabilities": "enabled",
+      "kubernetes.containerspec-readinessprobe": "enabled"
     }
   }'
 
@@ -55,7 +57,6 @@ if ! kubectl get clusterrole "${CLUSTERROLE}" >/dev/null 2>&1; then
 fi
 
 echo "🔧 Ensuring ClusterRole '${CLUSTERROLE}' can list/watch nodes..."
-# Idempotent check: does a rule already exist granting get/list/watch on nodes?
 if kubectl get clusterrole "${CLUSTERROLE}" -o jsonpath='{range .rules[*]}{.resources}{"|"}{.verbs}{"\n"}{end}' \
   | grep -q '\[nodes\].*\[get list watch\]'; then
   echo "✅ Node permissions already present on '${CLUSTERROLE}'."
@@ -68,7 +69,7 @@ else
 fi
 
 echo
-echo "Done! Knative should now accept the needed PodSpec features (hostNetwork, dnsPolicy, emptyDir, fieldRef, securityContext, addcapabilities, etc)."
+echo "Done! Knative should now accept the needed PodSpec/container features (hostNetwork, dnsPolicy, emptyDir, fieldRef, securityContext, addcapabilities, readinessProbe, etc)."
 echo "and your operator should be able to list/watch nodes."
 echo
 echo "If things still look off, try restarting the Knative webhook pod:"
