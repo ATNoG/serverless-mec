@@ -1,0 +1,60 @@
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
+metadata:
+  name: live-capture
+  namespace: default
+spec:
+  dId: "live-capture"
+  name: "live-capture"
+  provider: "pmacoutinho"
+  softVersion: "latest"
+  dVersion: "1.0.0"
+  description: "Per-node live packet capture (Knative per-node services)"
+  service:
+    hostNetwork: true
+    dnsPolicy: ClusterFirstWithHostNet
+    minScale: 1
+    volumes:
+      - name: varlog
+        emptyDir: {}
+    container:
+      name: user-container
+      image: ghcr.io/pmacoutinho/its-live-capture-c:latest
+      env:
+        - name: K8S_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: K_SINK
+          value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
+        - name: IFACE
+          value: "cw-mon-rxa"
+        - name: BPF
+          value: ""
+        - name: DISPLAY_FILTER
+          value: ""
+        - name: LOG_EVERY
+          value: "10"
+        - name: CE_TYPE
+          value: "its.cam"
+        - name: STDOUT_NDJSON
+          value: "0"
+        - name: PROMISCUOUS
+          value: "1"
+        - name: SEND_QUEUE_MAX
+          value: "1000"
+        - name: CE_INCLUDE_RAW_HEX
+          value: "1"
+
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_RAW", "NET_ADMIN"]
+      volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+  autoReplicas:
+    - matchNodes:
+        snifftest: "true"
