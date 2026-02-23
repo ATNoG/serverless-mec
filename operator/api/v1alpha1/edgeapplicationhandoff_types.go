@@ -24,22 +24,9 @@ type EdgeApplicationHandoffSpec struct {
 	// +optional
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 
-	// +optional
-	MinScale *int32 `json:"minScale,omitempty"`
-
-	// +optional
-	CreateTrigger *bool `json:"createTrigger,omitempty"`
-
-	// +optional
-	TriggerFilters map[string]string `json:"triggerFilters,omitempty"`
-
 	// If true, deleting this handoff object removes the target replica from EdgeApplication.spec.replicas.
 	// +optional
 	CleanupOnDelete bool `json:"cleanupOnDelete,omitempty"`
-
-	// Optional: if true, we disable the BASE (legacy) trigger while keeping the base KService alive.
-	// +optional
-	DisableBaseTrigger bool `json:"disableBaseTrigger,omitempty"`
 }
 
 type EdgeApplicationHandoffStatus struct {

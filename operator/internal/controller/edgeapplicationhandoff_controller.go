@@ -128,10 +128,9 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, nil
 	}
 
-	// Build desired replica spec:
-	// - copy sourceReplicaName if provided and found
-	// - set Name = targetReplicaName
-	// - default nodeSelector to pin by RSU label if NodeSelector not provided
+	// NOTE: in daemon mode, EdgeApplication controller ignores spec.replicas.
+	// We don't fail here (maybe you still use replicas mode), but it won't take effect if autoReplicas is set.
+
 	desiredRep, err := r.buildTargetReplica(&app, &ho)
 	if err != nil {
 		r.setFailed(ctx, &ho, "BuildReplicaFailed", err.Error())
@@ -151,7 +150,11 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 	svcName := fmt.Sprintf("%s-%s", app.Name, ho.Spec.TargetReplicaName)
 	ho.Status.TargetKService = fmt.Sprintf("%s/%s", app.Namespace, svcName)
 
-	trigNs, trigName := r.expectedTrigger(ctx, svcName)
+	// Triggers only exist if spec.service.triggerFilters is non-empty
+	trigNs, trigName := "", ""
+	if app.Spec.Service != nil && len(app.Spec.Service.TriggerFilters) > 0 {
+		trigNs, trigName = r.expectedTrigger(ctx, svcName)
+	}
 	if trigNs != "" && trigName != "" {
 		ho.Status.TargetTrigger = fmt.Sprintf("%s/%s", trigNs, trigName)
 	} else {
@@ -225,28 +228,18 @@ func (r *EdgeApplicationHandoffReconciler) buildTargetReplica(
 		out.NodeSelector[rsuLabelKey] = ho.Spec.TargetReplicaName
 	}
 
-	// Optional overrides
+	// Optional overrides (placement only)
 	if ho.Spec.Affinity != nil {
 		out.Affinity = ho.Spec.Affinity
 	}
 	if len(ho.Spec.Tolerations) > 0 {
 		out.Tolerations = ho.Spec.Tolerations
 	}
-	if ho.Spec.MinScale != nil {
-		out.MinScale = ho.Spec.MinScale
-	}
-	if ho.Spec.CreateTrigger != nil {
-		out.CreateTrigger = ho.Spec.CreateTrigger
-	}
-	if ho.Spec.TriggerFilters != nil {
-		out.TriggerFilters = ho.Spec.TriggerFilters
-	}
 
 	return out, nil
 }
 
 func upsertReplica(list *[]mecv1alpha1.KnativeServiceReplicaSpec, desired mecv1alpha1.KnativeServiceReplicaSpec) bool {
-	// list pointer is never nil when passed as &app.Spec.Replicas; handle nil slice instead
 	if *list == nil {
 		*list = []mecv1alpha1.KnativeServiceReplicaSpec{desired}
 		return true
@@ -293,8 +286,7 @@ func (r *EdgeApplicationHandoffReconciler) cleanupTargetReplica(ctx context.Cont
 	return r.Patch(ctx, &app, client.MergeFrom(orig))
 }
 
-// Determine expected trigger name/namespace.
-// Uses mec-operator-config (same as EdgeApplication controller).
+// Determine expected trigger name/namespace using operator config.
 func (r *EdgeApplicationHandoffReconciler) expectedTrigger(ctx context.Context, svcName string) (trigNs string, trigName string) {
 	cfgNs := r.ConfigNamespace
 	if cfgNs == "" {

@@ -957,18 +957,9 @@ spec:
                 description: If true, deleting this handoff object removes the target
                   replica from EdgeApplication.spec.replicas.
                 type: boolean
-              createTrigger:
-                type: boolean
-              disableBaseTrigger:
-                description: 'Optional: if true, we disable the BASE (legacy) trigger
-                  while keeping the base KService alive.'
-                type: boolean
               edgeApplicationName:
                 minLength: 1
                 type: string
-              minScale:
-                format: int32
-                type: integer
               nodeSelector:
                 additionalProperties:
                   type: string
@@ -1016,10 +1007,6 @@ spec:
                       type: string
                   type: object
                 type: array
-              triggerFilters:
-                additionalProperties:
-                  type: string
-                type: object
             required:
             - edgeApplicationName
             - targetReplicaName
