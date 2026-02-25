@@ -1,5 +1,6 @@
 // sniffer_libpcap.c — libpcap + libcurl CloudEvents structured sender
 // Build (Alpine): gcc -O2 -Wall -Wextra -pthread sniffer_libpcap.c -lpcap -lcurl -o sniffer_libpcap
+//
 #define _GNU_SOURCE
 #include <pcap/pcap.h>
 
@@ -21,6 +22,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/types.h>
+
 #include <curl/curl.h>
 
 /* -------------------------
@@ -37,6 +42,10 @@ static const char *ENV_SINK_URL;              /* K_SINK */
 static bool  ENV_STDOUT_NDJSON = true;
 static bool  ENV_PROMISCUOUS = false;
 static int   ENV_SEND_QUEUE_MAX = 1000;
+
+/* Knative readiness: if PORT is set, we start a tiny server on it */
+static int  ENV_PORT = 8080;
+static bool ENV_HAS_PORT = false;
 
 static char CE_SOURCE[256] = {0};
 
@@ -156,6 +165,91 @@ static bool uuid4(char out[37]) {
            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
   return true;
+}
+
+/* -------------------------
+ * Knative health server (to satisfy default readiness on $PORT)
+ * ------------------------- */
+static void *health_thread_fn(void *arg) {
+  (void)arg;
+
+  int port = ENV_PORT;
+
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  if (s < 0) {
+    loge("[health] socket() failed: %s", strerror(errno));
+    return NULL;
+  }
+
+  int one = 1;
+  (void)setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)port);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+  if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    loge("[health] bind(0.0.0.0:%d) failed: %s", port, strerror(errno));
+    close(s);
+    return NULL;
+  }
+
+  if (listen(s, 16) < 0) {
+    loge("[health] listen() failed: %s", strerror(errno));
+    close(s);
+    return NULL;
+  }
+
+  logi("[health] listening on 0.0.0.0:%d (Knative PORT)", port);
+
+  const char resp[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "OK";
+
+  while (!g_stop) {
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(s, &rfds);
+
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+
+    int r = select(s + 1, &rfds, NULL, NULL, &tv);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      logw("[health] select() error: %s", strerror(errno));
+      continue;
+    }
+    if (r == 0) continue;
+
+    if (FD_ISSET(s, &rfds)) {
+      int c = accept(s, NULL, NULL);
+      if (c < 0) {
+        if (errno == EINTR) continue;
+        logw("[health] accept() error: %s", strerror(errno));
+        continue;
+      }
+
+      /* Read a bit (ignore contents) */
+      char buf[512];
+      (void)read(c, buf, sizeof(buf));
+
+      /* Respond OK */
+      (void)write(c, resp, sizeof(resp) - 1);
+      close(c);
+    }
+  }
+
+  close(s);
+  logi("[health] stopped");
+  return NULL;
 }
 
 /* -------------------------
@@ -1340,15 +1434,28 @@ static void set_defaults_from_env(void) {
     getenv("HOSTNAME")      ? getenv("HOSTNAME")      : "host";
 
   snprintf(CE_SOURCE, sizeof(CE_SOURCE), "sniffer://%s/%s", host, ENV_IFACE);
+
+  /* Knative sets PORT (usually 8080). If present, we will listen on it for readiness. */
+  const char *port = getenv("PORT");
+  if (port && port[0]) {
+    ENV_HAS_PORT = true;
+    ENV_PORT = atoi(port);
+    if (ENV_PORT <= 0 || ENV_PORT > 65535) ENV_PORT = 8080;
+  }
 }
 
 int main(void) {
   setvbuf(stdout, NULL, _IOLBF, 0);
 
+  int exit_code = 0;
+  pthread_t health_th;
+  bool health_on = false;
+
   set_defaults_from_env();
 
   signal(SIGINT, on_sig);
   signal(SIGTERM, on_sig);
+  signal(SIGPIPE, SIG_IGN);
 
   logi(">> LIVE capture iface='%s' promisc=%s", ENV_IFACE, ENV_PROMISCUOUS ? "on" : "off");
   logi(">> BPF='%s'", ENV_BPF);
@@ -1361,8 +1468,19 @@ int main(void) {
   logi(">> CE_INCLUDE_RAW_HEX=%s (CloudEvents include full frame hex)", ENV_CE_INCLUDE_RAW_HEX ? "true" : "false");
   logi(">> SEND_QUEUE_MAX=%d", ENV_SEND_QUEUE_MAX);
 
+  if (ENV_HAS_PORT) {
+    health_on = true;
+    if (pthread_create(&health_th, NULL, health_thread_fn, NULL) != 0) {
+      loge("[health] failed to start health thread");
+      exit_code = 1;
+      g_stop = 1;
+      goto shutdown;
+    }
+  }
+
   bool sink_on = (ENV_SINK_URL && ENV_SINK_URL[0]);
   pthread_t sender_th;
+  bool sender_started = false;
 
   jobq_init(&g_q, ENV_SEND_QUEUE_MAX);
 
@@ -1370,7 +1488,10 @@ int main(void) {
     curl_global_init(CURL_GLOBAL_ALL);
     if (pthread_create(&sender_th, NULL, sender_thread_fn, NULL) != 0) {
       loge("failed to start sender thread (disabling sink)");
+      curl_global_cleanup();
       sink_on = false;
+    } else {
+      sender_started = true;
     }
   }
 
@@ -1378,6 +1499,7 @@ int main(void) {
   pcap_t *pc = pcap_create(ENV_IFACE, errbuf);
   if (!pc) {
     loge("pcap_create failed: %s", errbuf);
+    exit_code = 1;
     g_stop = 1;
     goto shutdown;
   }
@@ -1390,6 +1512,7 @@ int main(void) {
   if (rc < 0) {
     loge("pcap_activate failed: %s", pcap_geterr(pc));
     pcap_close(pc);
+    exit_code = 1;
     g_stop = 1;
     goto shutdown;
   }
@@ -1398,6 +1521,7 @@ int main(void) {
   if (pcap_compile(pc, &fp, ENV_BPF, 1, PCAP_NETMASK_UNKNOWN) < 0) {
     loge("pcap_compile failed: %s", pcap_geterr(pc));
     pcap_close(pc);
+    exit_code = 1;
     g_stop = 1;
     goto shutdown;
   }
@@ -1405,6 +1529,7 @@ int main(void) {
     loge("pcap_setfilter failed: %s", pcap_geterr(pc));
     pcap_freecode(&fp);
     pcap_close(pc);
+    exit_code = 1;
     g_stop = 1;
     goto shutdown;
   }
@@ -1414,6 +1539,7 @@ int main(void) {
     int r = pcap_dispatch(pc, 64, on_packet, NULL);
     if (r < 0) {
       loge("pcap_dispatch error: %s", pcap_geterr(pc));
+      exit_code = 1;
       break;
     }
     /* r==0 is timeout */
@@ -1430,11 +1556,15 @@ shutdown:
   pthread_cond_broadcast(&g_q.cv_not_empty);
   pthread_mutex_unlock(&g_q.mu);
 
-  if (sink_on) {
+  if (sink_on && sender_started) {
     pthread_join(sender_th, NULL);
     curl_global_cleanup();
   }
 
+  if (health_on) {
+    pthread_join(health_th, NULL);
+  }
+
   jobq_destroy(&g_q);
-  return g_stop ? 1 : 0;
+  return exit_code;
 }
