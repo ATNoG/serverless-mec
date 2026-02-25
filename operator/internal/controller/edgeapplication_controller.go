@@ -159,7 +159,6 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	baseMinScale := app.Spec.Service.MinScale
 	baseFilters := app.Spec.Service.TriggerFilters
 
-	// NEW semantics:
 	// - triggerFilters ONLY exist in spec.service
 	// - if triggerFilters is empty/nil => DO NOT create triggers anywhere
 	createTriggers := len(baseFilters) > 0

@@ -149,7 +149,7 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 	svcName := fmt.Sprintf("%s-%s", app.Name, ho.Spec.TargetReplicaName)
 	ho.Status.TargetKService = fmt.Sprintf("%s/%s", app.Namespace, svcName)
 
-	// NEW semantics: trigger exists only if app.spec.service.triggerFilters is non-empty
+	// trigger exists only if app.spec.service.triggerFilters is non-empty
 	trigNs, trigName := "", ""
 	if app.Spec.Service != nil && len(app.Spec.Service.TriggerFilters) > 0 {
 		trigNs, trigName = r.expectedTrigger(ctx, svcName)
