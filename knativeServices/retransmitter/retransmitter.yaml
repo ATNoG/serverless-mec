@@ -1,0 +1,28 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: benchmark-app
+  namespace: default
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: rsu-mk6-a-db7f2d0f
+      containers:
+        - image: ghcr.io/pmacoutinho/retransmitter:latest
+          imagePullPolicy: Always
+          env:
+            - name: FORWARD_URL
+              value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/kafka-broker"
+            - name: HOP_NAME
+              value: "edge-bench-1"
+            - name: OUT_CONTENT_TYPE
+              value: "application/octet-stream"
+          ports:
+            - containerPort: 8080
+  traffic:
+    - latestRevision: true
+      percent: 100

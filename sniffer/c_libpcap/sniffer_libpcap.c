@@ -47,6 +47,9 @@ static int   ENV_SEND_QUEUE_MAX = 1000;
 static int  ENV_PORT = 8080;
 static bool ENV_HAS_PORT = false;
 
+/* Bench: node name */
+static char ENV_NODE[128] = {0};
+
 static char CE_SOURCE[256] = {0};
 
 /* -------------------------
@@ -78,6 +81,22 @@ static void loge(const char *fmt, ...) {
  * ------------------------- */
 static volatile sig_atomic_t g_stop = 0;
 static void on_sig(int sig) { (void)sig; g_stop = 1; }
+
+/* Bench helpers */
+static int64_t now_unix_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+static int64_t mono_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+static int64_t unix_ns_from_timeval(const struct timeval *tv) {
+  if (!tv) return 0;
+  return (int64_t)tv->tv_sec * 1000000000LL + (int64_t)tv->tv_usec * 1000LL;
+}
 
 static void iso8601_from_timeval(const struct timeval *tv, char *out, size_t out_sz) {
   /* UTC ISO8601 with microseconds: YYYY-MM-DDTHH:MM:SS.uuuuuuZ */
@@ -258,6 +277,13 @@ static void *health_thread_fn(void *arg) {
 typedef struct {
   char *body;
   size_t body_len;
+
+  /* Bench metadata */
+  char ce_id[37];
+  uint64_t frame_no;
+  int64_t t_capture_unix_ns;
+  int64_t t_ce_built_unix_ns;
+  int64_t t_enqueue_unix_ns;
 } job_t;
 
 typedef struct {
@@ -359,20 +385,21 @@ static void *sender_thread_fn(void *arg) {
     job_t *job = jobq_pop_block(&g_q);
     if (!job) continue;
 
+    int64_t t_send_start_unix_ns = now_unix_ns();
+    int64_t t0m = mono_ns();
+
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, job->body);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)job->body_len);
 
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
     CURLcode rc = curl_easy_perform(curl);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    int64_t t1m = mono_ns();
+    int64_t t_send_end_unix_ns = now_unix_ns();
 
     long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 
-    long long elapsed_ns =
-      (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL +
-      (long long)(t1.tv_nsec - t0.tv_nsec);
+    long long elapsed_ns = (long long)(t1m - t0m);
 
     if (rc != CURLE_OK) {
       logw("sniffer POST elapsed_ns=%lld status=%ld curl_err=%s",
@@ -380,6 +407,32 @@ static void *sender_thread_fn(void *arg) {
     } else {
       logi("sniffer POST elapsed_ns=%lld status=%ld", elapsed_ns, status);
     }
+
+    /* Bench NDJSON record */
+    fprintf(stdout,
+      "{\"kind\":\"bench\",\"component\":\"sniffer\",\"node\":\"%s\",\"ce_id\":\"%s\","
+      "\"frame_no\":%" PRIu64 ","
+      "\"t_capture_unix_ns\":%" PRId64 ","
+      "\"t_ce_built_unix_ns\":%" PRId64 ","
+      "\"t_enqueue_unix_ns\":%" PRId64 ","
+      "\"t_send_start_unix_ns\":%" PRId64 ","
+      "\"t_send_end_unix_ns\":%" PRId64 ","
+      "\"send_elapsed_ns\":%lld,"
+      "\"http_status\":%ld,"
+      "\"curl_rc\":%d}\n",
+      ENV_NODE[0] ? ENV_NODE : "unknown",
+      job->ce_id,
+      job->frame_no,
+      job->t_capture_unix_ns,
+      job->t_ce_built_unix_ns,
+      job->t_enqueue_unix_ns,
+      t_send_start_unix_ns,
+      t_send_end_unix_ns,
+      elapsed_ns,
+      status,
+      (int)rc
+    );
+    fflush(stdout);
 
     free(job->body);
     free(job);
@@ -664,60 +717,38 @@ static bool skip_bvc_hf_optional_fields(bitr_t *br, uint8_t optmap7) {
     present[i] = ((optmap7 >> (6 - i)) & 1u) != 0;
   }
 
-  /* Order (ETSI CAM BVC HF):
-   * 0 accelerationControl (BIT STRING SIZE(7))
-   * 1 lanePosition (INTEGER(-1..14))
-   * 2 steeringWheelAngle (INTEGER(-511..512))
-   * 3 lateralAcceleration (value -160..161, confidence 0..102)  [approx skip]
-   * 4 verticalAcceleration (value -160..161, confidence 0..102) [approx skip]
-   * 5 performanceClass (INTEGER(0..7))
-   * 6 cenDsrcTollingZone (approx skip: lat, lon, radius, id)
-   */
   uint64_t tmp = 0;
   int32_t si = 0;
   uint32_t ui = 0;
 
   if (present[0]) { if (!br_read_bits_u64(br, 7, &tmp)) return false; }
-
   if (present[1]) { if (!br_read_constrained_i32(br, -1, 14, &si)) return false; }
-
   if (present[2]) { if (!br_read_constrained_i32(br, -511, 512, &si)) return false; }
 
   if (present[3]) {
     if (!br_read_constrained_i32(br, -160, 161, &si)) return false;
     if (!br_read_constrained_u32(br, 0, 102, &ui)) return false;
   }
-
   if (present[4]) {
     if (!br_read_constrained_i32(br, -160, 161, &si)) return false;
     if (!br_read_constrained_u32(br, 0, 102, &ui)) return false;
   }
-
   if (present[5]) { if (!br_read_constrained_u32(br, 0, 7, &ui)) return false; }
 
   if (present[6]) {
-    /* Best-effort skip; this rarely appears in typical CAM traffic. */
     if (!br_read_constrained_i32(br, -900000000, 900000001, &si)) return false;
     if (!br_read_constrained_i32(br, -1800000000, 1800000001, &si)) return false;
-    if (!br_read_constrained_u32(br, 0, 255, &ui)) return false;      /* radius (guess) */
-    if (!br_read_constrained_u32(br, 0, 65535, &ui)) return false;    /* id (guess) */
+    if (!br_read_constrained_u32(br, 0, 255, &ui)) return false;
+    if (!br_read_constrained_u32(br, 0, 65535, &ui)) return false;
   }
 
   return true;
 }
 
 static bool skip_sequence_extensions(bitr_t *br) {
-  /* For a SEQUENCE with extension bit already read as 1:
-   * - normally-small length N of extension bitmap (0..63, short form only)
-   * - N presence bits
-   * - for each present extension: open type (length determinant + value)
-   *
-   * We handle N==0 and the common short length determinants.
-   */
   uint32_t n = 0;
   if (!br_read_normally_small_len(br, &n)) return false;
 
-  /* read presence bitmap */
   bool any_present = false;
   for (uint32_t i = 0; i < n; i++) {
     bool b = false;
@@ -726,13 +757,6 @@ static bool skip_sequence_extensions(bitr_t *br) {
   }
 
   if (!any_present) return true;
-
-  /* If any are present, we try to skip open types in order.
-   * We don't know which ones are present (we didn't store the bitmap), but
-   * in practice this is rare for CAM; keeping this simple: bail if any present.
-   *
-   * If you *need* these, implement bitmap storage and open-type skipping per bit.
-   */
   return false;
 }
 
@@ -751,13 +775,9 @@ static bool decode_cam_uper_min(const uint8_t *cam_bytes, size_t cam_len, cam_de
   if (!br_read_bool(&br, &d.camparams_extension_bit)) return false;
   if (!br_read_bool(&br, &d.camparams_lowfreq_present)) return false;
   if (!br_read_bool(&br, &d.camparams_special_present)) return false;
-
-  /* We only handle the common CAM with no special vehicle container. */
   if (d.camparams_special_present) return false;
 
   if (!br_read_bits_u64(&br, 8, &u)) return false; d.station_type = (uint8_t)u;
-
-  /* ReferencePosition has an extension bit (this was the missing 1-bit in your logs). */
   if (!br_read_bool(&br, &d.refpos_extension_bit)) return false;
 
   int32_t si = 0;
@@ -772,19 +792,14 @@ static bool decode_cam_uper_min(const uint8_t *cam_bytes, size_t cam_len, cam_de
 
   if (!br_read_constrained_i32(&br, -1000, 8001, &si)) return false; d.altitude_value = si;
   if (!br_read_constrained_u32(&br, 0, 15, &ui)) return false; d.altitude_confidence = ui;
-  /* per_enum_index in your sample matches altitudeconfidence */
-  /* HighFrequencyContainer (CHOICE with extension marker): ext bit + 1-bit index for root alternatives */
+
   if (!br_read_bool(&br, &d.hf_ext_bit)) return false;
   if (!br_read_bits_u64(&br, 1, &u)) return false; d.hf_choice = (uint8_t)u;
-
-  /* We only handle basicVehicleContainerHighFrequency (choice 0). */
   if (d.hf_choice != 0) return false;
 
-  /* BasicVehicleContainerHighFrequency: extension bit + 7 optional bits */
   if (!br_read_bool(&br, &d.bvc_hf_ext_bit)) return false;
   if (!br_read_bits_u64(&br, 7, &u)) return false; d.bvc_hf_optmap = (uint8_t)u;
 
-  /* Required fields (ranges picked to keep decoding stable across common CAM variants) */
   if (!br_read_constrained_u32(&br, 0, 28801, &ui)) return false; d.heading_value = ui;
   if (!br_read_constrained_u32(&br, 0, 127, &ui)) return false; d.heading_confidence = ui;
 
@@ -801,7 +816,6 @@ static bool decode_cam_uper_min(const uint8_t *cam_bytes, size_t cam_len, cam_de
   if (!br_read_constrained_i32(&br, -160, 161, &si)) return false; d.longitudinal_acc_value = si;
   if (!br_read_constrained_u32(&br, 0, 102, &ui)) return false; d.longitudinal_acc_conf = ui;
 
-  /* Curvature: keep extension-present bit (exposed as per_extension_present_bit) */
   if (!br_read_bool(&br, &d.curvature_ext_bit)) return false;
   if (!br_read_constrained_i32(&br, -1023, 1023, &si)) return false; d.curvature_value = si;
   if (!br_read_constrained_u32(&br, 0, 7, &ui)) return false; d.curvature_confidence = ui;
@@ -811,22 +825,16 @@ static bool decode_cam_uper_min(const uint8_t *cam_bytes, size_t cam_len, cam_de
   if (!br_read_constrained_i32(&br, -32766, 32767, &si)) return false; d.yaw_rate_value = si;
   if (!br_read_constrained_u32(&br, 0, 15, &ui)) return false; d.yaw_rate_confidence = ui;
 
-  /* Optional fields (skip values so we land correctly for LowFrequencyContainer). */
   if (!skip_bvc_hf_optional_fields(&br, d.bvc_hf_optmap)) return false;
 
-  /* Extension additions for BVC HF: if ext bit is set, try to skip.
-   * Common case: bitmap length = 0 (like your frames).
-   * If any present, we currently bail.
-   */
   if (d.bvc_hf_ext_bit) {
     if (!skip_sequence_extensions(&br)) return false;
   }
 
-  /* LowFrequencyContainer is present only if camparams_lowfreq_present bit is set */
   if (d.camparams_lowfreq_present) {
     if (!br_read_bool(&br, &d.lf_ext_bit)) return false;
     if (!br_read_bits_u64(&br, 1, &u)) return false; d.lf_choice = (uint8_t)u;
-    if (d.lf_choice != 0) return false; /* only basicVehicleContainerLowFrequency */
+    if (d.lf_choice != 0) return false;
 
     if (!br_read_bool(&br, &d.bvc_lf_ext_bit)) return false;
     if (!br_read_bool(&br, &d.path_history_present)) return false;
@@ -836,10 +844,8 @@ static bool decode_cam_uper_min(const uint8_t *cam_bytes, size_t cam_len, cam_de
     if (!br_read_bits_u64(&br, 8, &u)) return false; d.exterior_lights = (uint8_t)u;
 
     if (d.path_history_present) {
-      /* PathHistory is a SEQUENCE OF; for your desired output we only need length */
       if (!br_read_constrained_u32(&br, 0, 40, &ui)) return false;
       d.path_history_len = ui;
-      /* Not decoding entries; just skip none (entries decoding omitted). */
     } else {
       d.path_history_len = 0;
     }
@@ -859,7 +865,6 @@ static char *build_cam_fields_json_from_decoded(const cam_decoded_t *d) {
   char exterior_hex[3];
   snprintf(exterior_hex, sizeof(exterior_hex), "%02x", (unsigned)d->exterior_lights);
 
-  /* individual exterior light bits (spec mapping is tool-dependent; this matches your sample naming) */
   bool lowbeam  = (d->exterior_lights & (1u<<0)) != 0;
   bool highbeam = (d->exterior_lights & (1u<<1)) != 0;
   bool left     = (d->exterior_lights & (1u<<2)) != 0;
@@ -869,22 +874,18 @@ static char *build_cam_fields_json_from_decoded(const cam_decoded_t *d) {
   bool fog      = (d->exterior_lights & (1u<<6)) != 0;
   bool parking  = (d->exterior_lights & (1u<<7)) != 0;
 
-  /* cam_highfrequencycontainer and cam_lowfrequencycontainer are CHOICE indexes in your sample */
   char hf_choice_s[8]; snprintf(hf_choice_s, sizeof(hf_choice_s), "%u", (unsigned)d->hf_choice);
   char lf_choice_s[8]; snprintf(lf_choice_s, sizeof(lf_choice_s), "%u", (unsigned)d->lf_choice);
 
-  /* per_enum_index / per_choice_index etc are debug-ish in your sample */
   char per_enum_index[16]; snprintf(per_enum_index, sizeof(per_enum_index), "%u", (unsigned)d->altitude_confidence);
   char per_choice_index[16]; snprintf(per_choice_index, sizeof(per_choice_index), "%u", (unsigned)d->hf_choice);
 
-  /* per_sequence_of_length + cam_pathhistory in your sample */
   char ph_len_s[16]; snprintf(ph_len_s, sizeof(ph_len_s), "%u", (unsigned)d->path_history_len);
 
   size_t buf_sz = 4096;
   char *buf = (char *)malloc(buf_sz);
   if (!buf) return NULL;
 
-  /* Keep keys aligned with your example as much as possible. */
   int n = snprintf(
     buf, buf_sz,
     "{"
@@ -1236,13 +1237,13 @@ static char *build_record_json(
 static char *build_cloudevent_structured(
     const char *event_type,
     const char *source,
+    const char *id_raw,
     const char *subject_or_null,
     const char *data_json_obj,   /* must be JSON object string */
     size_t *out_len,
     int stationtype_or_neg       /* >=0 => include as CE extension */
 ) {
-  char id[37];
-  if (!uuid4(id)) snprintf(id, sizeof(id), "00000000-0000-4000-8000-000000000000");
+  const char *id = (id_raw && id_raw[0]) ? id_raw : "00000000-0000-4000-8000-000000000000";
 
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -1270,7 +1271,6 @@ static char *build_cloudevent_structured(
   if (stationtype_or_neg >= 0) {
     snprintf(station_part, sizeof(station_part), ",\"stationtype\":%d", stationtype_or_neg);
   }
-
   if (!type_esc || !src_esc || !id_esc || !time_esc || !subj_part) {
     free(type_esc); free(src_esc); free(id_esc); free(time_esc); free(subj_part);
     return NULL;
@@ -1320,6 +1320,8 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *b
 
   g_frame_no++;
 
+  int64_t t_capture_unix_ns = unix_ns_from_timeval(&h->ts);
+
   cam_decoded_t decoded;
   cam_decoded_init(&decoded);
 
@@ -1346,7 +1348,7 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *b
       rec_ce = rec_out;
     } else {
       rec_ce_is_separate = true;
-      decoded = decoded2; /* prefer decoded from CE build (it had raw hex anyway) */
+      decoded = decoded2;
     }
   }
 
@@ -1354,11 +1356,18 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *b
     char subj[32];
     snprintf(subj, sizeof(subj), "%" PRIu64, g_frame_no);
 
+    char ce_id[37];
+    if (!uuid4(ce_id)) snprintf(ce_id, sizeof(ce_id), "00000000-0000-4000-8000-000000000000");
+
+    int64_t t_ce_built_unix_ns = now_unix_ns();
+
     int stationtype_ext = -1;
     if (decoded.ok) stationtype_ext = (int)decoded.station_type;
 
     size_t body_len = 0;
-    char *ce = build_cloudevent_structured(ENV_CE_TYPE, CE_SOURCE, subj, rec_ce, &body_len, stationtype_ext);
+    char *ce = build_cloudevent_structured(
+        ENV_CE_TYPE, CE_SOURCE, ce_id, subj, rec_ce, &body_len,
+        stationtype_ext);
     if (ce) {
       job_t *job = (job_t *)calloc(1, sizeof(job_t));
       if (!job) {
@@ -1366,6 +1375,12 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *b
       } else {
         job->body = ce;
         job->body_len = body_len;
+        snprintf(job->ce_id, sizeof(job->ce_id), "%s", ce_id);
+        job->frame_no = g_frame_no;
+        job->t_capture_unix_ns = t_capture_unix_ns;
+        job->t_ce_built_unix_ns = t_ce_built_unix_ns;
+        job->t_enqueue_unix_ns = now_unix_ns();
+
         if (!jobq_try_push(&g_q, job)) {
           logw("SEND_QUEUE full, dropping event");
           free(job->body);
@@ -1391,8 +1406,6 @@ static void set_defaults_from_env(void) {
 
   ENV_BPF = getenv("BPF");
   if (!ENV_BPF || !ENV_BPF[0]) {
-    /* Note: if your interface is monitor/cooked capture, ether/vlan filters may not match.
-       You can also filter later; decoding uses SNAP scan anyway. */
     ENV_BPF = "(ether proto 0x8947 or (vlan and ether[16:2]==0x8947)) or udp port 2001";
   }
 
@@ -1406,7 +1419,6 @@ static void set_defaults_from_env(void) {
 
   ENV_INCLUDE_RAW_HEX = truthy(getenv("INCLUDE_RAW_HEX")) != NULL;
 
-  /* CloudEvents raw frame hex (default ON). If set (even to empty), it is honored. */
   const char *cer = getenv("CE_INCLUDE_RAW_HEX");
   if (cer == NULL) {
     ENV_CE_INCLUDE_RAW_HEX = true;
@@ -1433,9 +1445,9 @@ static void set_defaults_from_env(void) {
     getenv("NODE_NAME")     ? getenv("NODE_NAME")     :
     getenv("HOSTNAME")      ? getenv("HOSTNAME")      : "host";
 
+  snprintf(ENV_NODE, sizeof(ENV_NODE), "%s", host);
   snprintf(CE_SOURCE, sizeof(CE_SOURCE), "sniffer://%s/%s", host, ENV_IFACE);
 
-  /* Knative sets PORT (usually 8080). If present, we will listen on it for readiness. */
   const char *port = getenv("PORT");
   if (port && port[0]) {
     ENV_HAS_PORT = true;
@@ -1506,7 +1518,8 @@ int main(void) {
 
   pcap_set_snaplen(pc, 262144);
   pcap_set_promisc(pc, ENV_PROMISCUOUS ? 1 : 0);
-  pcap_set_timeout(pc, 1000);
+  pcap_set_timeout(pc, 1);  // 1ms timeout
+  pcap_set_immediate_mode(pc, 1);   // deliver packets ASAP (Linux supports this)
 
   int rc = pcap_activate(pc);
   if (rc < 0) {
@@ -1542,7 +1555,6 @@ int main(void) {
       exit_code = 1;
       break;
     }
-    /* r==0 is timeout */
   }
 
   pcap_breakloop(pc);
@@ -1551,7 +1563,6 @@ int main(void) {
 shutdown:
   g_stop = 1;
 
-  /* wake sender thread */
   pthread_mutex_lock(&g_q.mu);
   pthread_cond_broadcast(&g_q.cv_not_empty);
   pthread_mutex_unlock(&g_q.mu);

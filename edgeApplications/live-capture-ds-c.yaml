@@ -28,11 +28,9 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
-
         # Send directly to broker ingress (producer-only)
         - name: K_SINK
           value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
-
         - name: IFACE
           value: "cw-mon-rxa"
         - name: BPF

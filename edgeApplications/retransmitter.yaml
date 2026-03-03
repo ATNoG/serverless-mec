@@ -1,0 +1,31 @@
+# File: benchmark-app.yaml
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
+metadata:
+  name: retransmitter
+  namespace: default
+spec:
+  # --- ETSI bits ---
+  dId: "retransmitter-appd-v1"
+  name: "retransmitter"
+  provider: "example.mec"
+  softVersion: "1.0.0"
+  dVersion: "1.0.0"
+  infoName: "App to retransmit packet"
+  description: "App to retransmit packet"
+  # --- Vendor-specific block ---
+  service:
+    container:
+      image: ghcr.io/pmacoutinho/retransmitter:latest
+      env:
+        - name: FORWARD_URL
+          value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/kafka-broker"
+        - name: HOP_NAME
+          value: "edge-bench-1"
+        - name: OUT_TYPE
+          value: "its.cam.benchmarked"
+    triggerFilters:
+      type: its.cam
+  autoReplicas:
+    - matchNodes:
+        rsu-b: "true"
