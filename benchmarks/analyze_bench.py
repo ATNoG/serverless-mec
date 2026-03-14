@@ -2,11 +2,12 @@
 """
 analyze_bench.py — correlate sniffer + retransmitter NDJSON bench logs and print averages + stats.
 
-Usage:
-  python3 analyze_bench.py --sniffer benchlogs/sniffer.ndjson --retrans benchlogs/retransmitter.ndjson
-
-Optional:
-  python3 analyze_bench.py --sniffer sniffer.ndjson --retrans retransmitter.ndjson --csv matched.csv
+What changed from the original:
+- Removed the misleading interpretation of `sniffer send_end -> retrans recv` as a normal latency.
+- Added the causal metric `sniffer send_start -> retrans recv`.
+- Kept `post_complete -> retrans recv` only as a diagnostic, clearly marked as topology-dependent.
+- Prefer monotonic elapsed fields when the logs provide them, falling back to wall-clock deltas.
+- Added a diagnostic sign summary so mixed/negative values are obvious instead of being silently presented as a latency.
 """
 
 from __future__ import annotations
@@ -93,6 +94,20 @@ class Stats:
         )
 
 
+@dataclass
+class SignSummary:
+    negative: int
+    zero: int
+    positive: int
+
+    @staticmethod
+    def from_values(vals: List[float]) -> "SignSummary":
+        neg = sum(1 for v in vals if v < 0)
+        zer = sum(1 for v in vals if v == 0)
+        pos = sum(1 for v in vals if v > 0)
+        return SignSummary(negative=neg, zero=zer, positive=pos)
+
+
 def fmt_ms(x: float) -> str:
     if math.isnan(x):
         return "nan"
@@ -155,6 +170,25 @@ def _table(title: str, rows: List[Tuple[str, Stats]]) -> str:
     return "\n".join(lines)
 
 
+def _add_value(vals: List[float], v: Optional[int]) -> None:
+    if v is None:
+        return
+    vals.append(float(v))
+
+
+def _add_delta(vals: List[float], a: Optional[int], b: Optional[int]) -> None:
+    if a is None or b is None:
+        return
+    vals.append(float(b - a))
+
+
+def _add_field_or_delta(vals: List[float], explicit_ns: Optional[int], a: Optional[int], b: Optional[int]) -> None:
+    if explicit_ns is not None:
+        vals.append(float(explicit_ns))
+        return
+    _add_delta(vals, a, b)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sniffer", required=True, help="sniffer NDJSON (or .gz) or '-' for stdin")
@@ -197,17 +231,14 @@ def main() -> int:
         else:
             matched.append((s, r))
 
-    sn_matched_ids = set()
+    # Count unmatched sniffers across both id and frame fallback keys.
+    matched_keys = set()
     for s, _ in matched:
-        if isinstance(s.get("ce_id"), str):
-            sn_matched_ids.add(s["ce_id"])
-    sn_unmatched = sum(1 for r in sn if isinstance(r.get("ce_id"), str) and r["ce_id"] not in sn_matched_ids)
+        ce_id, frame = _key_sniffer(s)
+        matched_keys.add((ce_id, frame))
+    sn_unmatched = sum(1 for r in sn if _key_sniffer(r) not in matched_keys)
 
     # ---- Metrics (all in ns; convert to ms at the end) ----
-    def add_delta(vals: List[float], a: Optional[int], b: Optional[int]) -> None:
-        if a is None or b is None:
-            return
-        vals.append(float(b - a))
 
     # Sniffer-only
     sn_cap_to_built: List[float] = []
@@ -220,24 +251,27 @@ def main() -> int:
         t_cap = _get_int(s, "t_capture_unix_ns")
         t_bld = _get_int(s, "t_ce_built_unix_ns")
         t_enq = _get_int(s, "t_enqueue_unix_ns")
-        t_ss  = _get_int(s, "t_send_start_unix_ns")
-        t_se  = _get_int(s, "t_send_end_unix_ns")
-        add_delta(sn_cap_to_built, t_cap, t_bld)
-        add_delta(sn_built_to_enqueue, t_bld, t_enq)
-        add_delta(sn_enqueue_to_send_start, t_enq, t_ss)
-        add_delta(sn_send_start_to_end, t_ss, t_se)
-        add_delta(sn_cap_to_send_end, t_cap, t_se)
+        t_ss = _get_int(s, "t_send_start_unix_ns")
+        t_se = _get_int(s, "t_send_end_unix_ns")
+        send_elapsed_ns = _get_int(s, "send_elapsed_ns")
+
+        _add_delta(sn_cap_to_built, t_cap, t_bld)
+        _add_delta(sn_built_to_enqueue, t_bld, t_enq)
+        _add_delta(sn_enqueue_to_send_start, t_enq, t_ss)
+        _add_field_or_delta(sn_send_start_to_end, send_elapsed_ns, t_ss, t_se)
+        _add_delta(sn_cap_to_send_end, t_cap, t_se)
 
     # Matched end-to-end
     e2e_cap_to_rt_recv: List[float] = []
-    net_send_end_to_rt_recv: List[float] = []
+    e2e_send_start_to_rt_recv: List[float] = []
+    diag_post_complete_to_rt_recv: List[float] = []
+
     rt_recv_to_body: List[float] = []
     rt_body_to_parsed: List[float] = []
     rt_parsed_to_fwd_start: List[float] = []
     rt_fwd_start_to_fwd_end: List[float] = []
     rt_recv_to_fwd_end: List[float] = []
 
-    # NEW: capture -> forward_start / forward_end (matched)
     e2e_cap_to_fwd_start: List[float] = []
     e2e_cap_to_fwd_end: List[float] = []
 
@@ -247,26 +281,33 @@ def main() -> int:
 
     for s, r in matched:
         t_cap = _get_int(s, "t_capture_unix_ns")
-        t_se  = _get_int(s, "t_send_end_unix_ns")
+        t_ss = _get_int(s, "t_send_start_unix_ns")
+        t_se = _get_int(s, "t_send_end_unix_ns")
 
-        t_rr  = _get_int(r, "t_recv_unix_ns")
-        t_rb  = _get_int(r, "t_body_unix_ns")
-        t_rp  = _get_int(r, "t_parsed_unix_ns")
-        t_fs  = _get_int(r, "t_forward_start_unix_ns")
-        t_fe  = _get_int(r, "t_forward_end_unix_ns")
+        t_rr = _get_int(r, "t_recv_unix_ns")
+        t_rb = _get_int(r, "t_body_unix_ns")
+        t_rp = _get_int(r, "t_parsed_unix_ns")
+        t_fs = _get_int(r, "t_forward_start_unix_ns")
+        t_fe = _get_int(r, "t_forward_end_unix_ns")
 
-        add_delta(e2e_cap_to_rt_recv, t_cap, t_rr)
-        add_delta(net_send_end_to_rt_recv, t_se, t_rr)
+        body_read_elapsed_ns = _get_int(r, "body_read_elapsed_ns")
+        parse_elapsed_ns = _get_int(r, "parse_elapsed_ns")
+        forward_prep_elapsed_ns = _get_int(r, "forward_prep_elapsed_ns")
+        forward_elapsed_ns = _get_int(r, "forward_elapsed_ns")
+        handler_elapsed_ns = _get_int(r, "handler_elapsed_ns")
 
-        add_delta(rt_recv_to_body, t_rr, t_rb)
-        add_delta(rt_body_to_parsed, t_rb, t_rp)
-        add_delta(rt_parsed_to_fwd_start, t_rp, t_fs)
-        add_delta(rt_fwd_start_to_fwd_end, t_fs, t_fe)
-        add_delta(rt_recv_to_fwd_end, t_rr, t_fe)
+        _add_delta(e2e_cap_to_rt_recv, t_cap, t_rr)
+        _add_delta(e2e_send_start_to_rt_recv, t_ss, t_rr)
+        _add_delta(diag_post_complete_to_rt_recv, t_se, t_rr)
 
-        # NEW metrics requested
-        add_delta(e2e_cap_to_fwd_start, t_cap, t_fs)  # (forward_start - capture)
-        add_delta(e2e_cap_to_fwd_end, t_cap, t_fe)    # (forward_end - capture)
+        _add_field_or_delta(rt_recv_to_body, body_read_elapsed_ns, t_rr, t_rb)
+        _add_field_or_delta(rt_body_to_parsed, parse_elapsed_ns, t_rb, t_rp)
+        _add_field_or_delta(rt_parsed_to_fwd_start, forward_prep_elapsed_ns, t_rp, t_fs)
+        _add_field_or_delta(rt_fwd_start_to_fwd_end, forward_elapsed_ns, t_fs, t_fe)
+        _add_field_or_delta(rt_recv_to_fwd_end, handler_elapsed_ns, t_rr, t_fe)
+
+        _add_delta(e2e_cap_to_fwd_start, t_cap, t_fs)
+        _add_delta(e2e_cap_to_fwd_end, t_cap, t_fe)
 
         st = r.get("forward_status")
         st_key = "null" if st is None else str(st)
@@ -281,6 +322,8 @@ def main() -> int:
 
     def stats_ms(vals_ns: List[float]) -> Stats:
         return Stats.from_values([ns_to_ms(v) for v in vals_ns])
+
+    diag_signs = SignSummary.from_values(diag_post_complete_to_rt_recv)
 
     # ---- Print report ----
     print()
@@ -304,16 +347,25 @@ def main() -> int:
 
     print(_table("End-to-end (matched by ce_id/frame)", [
         ("sniffer capture -> retrans recv", stats_ms(e2e_cap_to_rt_recv)),
-        ("sniffer send_end -> retrans recv", stats_ms(net_send_end_to_rt_recv)),
+        ("sniffer send_start -> retrans recv", stats_ms(e2e_send_start_to_rt_recv)),
         ("retrans recv -> body read", stats_ms(rt_recv_to_body)),
         ("retrans body -> parsed", stats_ms(rt_body_to_parsed)),
         ("retrans parsed -> forward_start", stats_ms(rt_parsed_to_fwd_start)),
         ("retrans forward_start -> forward_end", stats_ms(rt_fwd_start_to_fwd_end)),
         ("retrans recv -> forward_end", stats_ms(rt_recv_to_fwd_end)),
-        # NEW rows requested
         ("sniffer capture -> retrans fwrd_start", stats_ms(e2e_cap_to_fwd_start)),
         ("sniffer capture -> retrans forward_end", stats_ms(e2e_cap_to_fwd_end)),
     ]))
+    print()
+
+    print(_table("Topology-dependent diagnostic (do not read as one-way latency)", [
+        ("sniffer post_complete -> retrans recv", stats_ms(diag_post_complete_to_rt_recv)),
+    ]))
+    print(f"signs: negative={diag_signs.negative} zero={diag_signs.zero} positive={diag_signs.positive}")
+    if diag_signs.negative > 0:
+        print("note: negative values here are expected when the sniffer's POST completes after the retransmitter has already received the request (direct POST semantics).")
+    if diag_signs.negative > 0 and diag_signs.positive > 0:
+        print("note: mixed signs usually mean this is not a direct point-to-point hop; there is likely an intermediate sink/broker/proxy between producer and retransmitter.")
     print()
 
     print("Retransmitter forward_status distribution")
@@ -356,14 +408,16 @@ def main() -> int:
                 "ce_id",
                 "frame_no",
                 "sn_t_capture_ns",
+                "sn_t_send_start_ns",
                 "sn_t_send_end_ns",
                 "rt_t_recv_ns",
                 "rt_t_forward_start_ns",
                 "rt_t_forward_end_ns",
                 "e2e_capture_to_recv_ms",
+                "e2e_send_start_to_recv_ms",
+                "diag_post_complete_to_recv_ms",
                 "e2e_capture_to_forward_start_ms",
                 "e2e_capture_to_forward_end_ms",
-                "send_end_to_recv_ms",
                 "rt_recv_to_fwd_end_ms",
                 "forward_status",
             ])
@@ -371,29 +425,36 @@ def main() -> int:
                 ce_id = s.get("ce_id") or r.get("ce_id") or ""
                 frame_no = s.get("frame_no") or r.get("frame_number") or ""
                 t_cap = _get_int(s, "t_capture_unix_ns")
-                t_se  = _get_int(s, "t_send_end_unix_ns")
-                t_rr  = _get_int(r, "t_recv_unix_ns")
-                t_fs  = _get_int(r, "t_forward_start_unix_ns")
-                t_fe  = _get_int(r, "t_forward_end_unix_ns")
+                t_ss = _get_int(s, "t_send_start_unix_ns")
+                t_se = _get_int(s, "t_send_end_unix_ns")
+                t_rr = _get_int(r, "t_recv_unix_ns")
+                t_fs = _get_int(r, "t_forward_start_unix_ns")
+                t_fe = _get_int(r, "t_forward_end_unix_ns")
+                handler_elapsed_ns = _get_int(r, "handler_elapsed_ns")
 
                 e2e_ms = ns_to_ms(float(t_rr - t_cap)) if (t_rr is not None and t_cap is not None) else float("nan")
+                ss_rr_ms = ns_to_ms(float(t_rr - t_ss)) if (t_rr is not None and t_ss is not None) else float("nan")
+                diag_se_rr_ms = ns_to_ms(float(t_rr - t_se)) if (t_rr is not None and t_se is not None) else float("nan")
                 cap_fs_ms = ns_to_ms(float(t_fs - t_cap)) if (t_fs is not None and t_cap is not None) else float("nan")
                 cap_fe_ms = ns_to_ms(float(t_fe - t_cap)) if (t_fe is not None and t_cap is not None) else float("nan")
-                se_rr_ms = ns_to_ms(float(t_rr - t_se)) if (t_rr is not None and t_se is not None) else float("nan")
-                rt_ms = ns_to_ms(float(t_fe - t_rr)) if (t_fe is not None and t_rr is not None) else float("nan")
+                rt_ms = ns_to_ms(float(handler_elapsed_ns)) if handler_elapsed_ns is not None else (
+                    ns_to_ms(float(t_fe - t_rr)) if (t_fe is not None and t_rr is not None) else float("nan")
+                )
 
                 w.writerow([
                     ce_id,
                     frame_no,
                     fmt_int(t_cap),
+                    fmt_int(t_ss),
                     fmt_int(t_se),
                     fmt_int(t_rr),
                     fmt_int(t_fs),
                     fmt_int(t_fe),
                     f"{e2e_ms:.3f}" if not math.isnan(e2e_ms) else "",
+                    f"{ss_rr_ms:.3f}" if not math.isnan(ss_rr_ms) else "",
+                    f"{diag_se_rr_ms:.3f}" if not math.isnan(diag_se_rr_ms) else "",
                     f"{cap_fs_ms:.3f}" if not math.isnan(cap_fs_ms) else "",
                     f"{cap_fe_ms:.3f}" if not math.isnan(cap_fe_ms) else "",
-                    f"{se_rr_ms:.3f}" if not math.isnan(se_rr_ms) else "",
                     f"{rt_ms:.3f}" if not math.isnan(rt_ms) else "",
                     r.get("forward_status"),
                 ])

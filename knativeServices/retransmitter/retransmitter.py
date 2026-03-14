@@ -18,14 +18,15 @@ HOP_NAME = os.getenv("HOP_NAME", "retransmitter")
 OUT_CONTENT_TYPE = os.getenv("OUT_CONTENT_TYPE", "application/octet-stream").strip()
 SESSION = requests.Session()
 
+
 def hex_to_bytes(hex_str: str) -> bytes:
     s = (hex_str or "").strip()
     if s.startswith("0x") or s.startswith("0X"):
         s = s[2:]
     return bytes.fromhex(s)
 
+
 def as_int(v):
-    # CloudEvents libs may give ints, floats or strings depending on parsing.
     try:
         if v is None:
             return None
@@ -41,21 +42,33 @@ def as_int(v):
         return None
     return None
 
+
+def get_ce_int(event, *names):
+    for name in names:
+        v = as_int(event.get(name))
+        if v is not None:
+            return v
+    return None
+
+
 def emit_bench(record: dict):
-    # NDJSON (one JSON per line)
     print(json.dumps(record, separators=(",", ":"), ensure_ascii=False), flush=True)
+
 
 @app.post("/")
 def handle():
     if not FORWARD_URL:
         return Response("FORWARD_URL not configured", status=500)
 
+    # Wall clock: keep these for cross-host correlation.
     t_recv = time.time_ns()
+    t_recv_mono = time.monotonic_ns()
 
     # 1) Read raw HTTP request
     headers_in = dict(request.headers)
     body_in = request.get_data()
     t_body = time.time_ns()
+    t_body_mono = time.monotonic_ns()
 
     # 2) Parse CloudEvent
     try:
@@ -63,6 +76,7 @@ def handle():
     except Exception:
         return Response("Invalid CloudEvent", status=400)
     t_parsed = time.time_ns()
+    t_parsed_mono = time.monotonic_ns()
 
     ce_id = event_in.get("id")
     ce_type = event_in.get("type")
@@ -70,9 +84,10 @@ def handle():
     ce_time = event_in.get("time")
     ce_subject = event_in.get("subject")
 
-    # Producer timestamp extensions from sniffer (added by our C patch)
-    ts_capture_unix_ns = as_int(event_in.get("ts_capture_unix_ns"))
-    ts_ce_built_unix_ns = as_int(event_in.get("ts_ce_built_unix_ns"))
+    # Prefer spec-compliant extension names, but also accept the old underscored names.
+    ts_capture_unix_ns = get_ce_int(event_in, "tscaptureunixns", "ts_capture_unix_ns")
+    ts_ce_built_unix_ns = get_ce_int(event_in, "tscebuiltunixns", "ts_ce_built_unix_ns")
+    ts_enqueue_unix_ns = get_ce_int(event_in, "tsenqueueunixns", "ts_enqueue_unix_ns")
 
     # 3) Extract packet hex from CE data
     data_in = event_in.data
@@ -91,7 +106,6 @@ def handle():
     size_in = len(body_in)
     size_out = len(packet_bytes)
 
-    # Extract these if present (your sniffer sometimes uses string frame_number)
     frame_number = data_in.get("frame_number")
     frame_timestamp = data_in.get("timestamp")
 
@@ -104,14 +118,24 @@ def handle():
         headers_out["X-Orig-CE-Id"] = str(ce_id)
 
     t_forward_start = time.time_ns()
+    t_forward_start_mono = time.monotonic_ns()
+    forward_error = None
     try:
         resp = SESSION.post(FORWARD_URL, headers=headers_out, data=packet_bytes, timeout=5.0)
         forward_status = resp.status_code
-    except Exception:
+    except Exception as exc:
         forward_status = -1
+        forward_error = str(exc)
     t_forward_end = time.time_ns()
+    t_forward_end_mono = time.monotonic_ns()
 
-    # Emit NDJSON bench record
+    # Prefer monotonic elapsed values for same-process timings.
+    body_read_elapsed_ns = t_body_mono - t_recv_mono
+    parse_elapsed_ns = t_parsed_mono - t_body_mono
+    forward_prep_elapsed_ns = t_forward_start_mono - t_parsed_mono
+    forward_elapsed_ns = t_forward_end_mono - t_forward_start_mono
+    handler_elapsed_ns = t_forward_end_mono - t_recv_mono
+
     record = {
         "kind": "bench",
         "component": "retransmitter",
@@ -122,22 +146,32 @@ def handle():
         "ce_time": str(ce_time) if ce_time is not None else None,
         "ce_subject": str(ce_subject) if ce_subject is not None else None,
 
+        # Cross-host wall-clock timestamps.
         "t_recv_unix_ns": t_recv,
         "t_body_unix_ns": t_body,
         "t_parsed_unix_ns": t_parsed,
         "t_forward_start_unix_ns": t_forward_start,
         "t_forward_end_unix_ns": t_forward_end,
 
+        # Same-process monotonic elapsed values.
+        "body_read_elapsed_ns": body_read_elapsed_ns,
+        "parse_elapsed_ns": parse_elapsed_ns,
+        "forward_prep_elapsed_ns": forward_prep_elapsed_ns,
+        "forward_elapsed_ns": forward_elapsed_ns,
+        "handler_elapsed_ns": handler_elapsed_ns,
+
         "forward_status": forward_status,
+        "forward_error": forward_error,
         "size_in": size_in,
         "size_out": size_out,
 
         "frame_number": frame_number,
         "frame_timestamp": frame_timestamp,
 
-        # Producer extensions (from sniffer)
-        "ts_capture_unix_ns": ts_capture_unix_ns,
-        "ts_ce_built_unix_ns": ts_ce_built_unix_ns,
+        # Producer extensions from the sniffer.
+        "tscaptureunixns": ts_capture_unix_ns,
+        "tscebuiltunixns": ts_ce_built_unix_ns,
+        "tsenqueueunixns": ts_enqueue_unix_ns,
     }
     emit_bench(record)
 
