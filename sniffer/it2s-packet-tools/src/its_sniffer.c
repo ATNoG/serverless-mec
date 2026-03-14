@@ -155,14 +155,16 @@ void generic_cb(int tx_access, uint8_t* packet, size_t packet_len) {
     asn_TYPE_descriptor_t *its_msg_descriptor = NULL;
     void *its_msg = NULL;
     switch (btp_dst_port) {
-        case BTP_PORT_CAM:
+        case BTP_PORT_CAM: {
             its_msg_descriptor = &asn_DEF_EI2_CAM;
             its_msg = calloc(1, sizeof(EI2_CAM_t));
             break;
-        case BTP_PORT_DENM:
+        }
+        case BTP_PORT_DENM: {
             its_msg_descriptor = &asn_DEF_EI2_DENM;
             its_msg = calloc(1, sizeof(EI2_DENM_t));
             break;
+        }
         default:
             log_warn("[btp] unsupported BTP port: %u, skipping...", btp_dst_port);
             return;
@@ -183,16 +185,18 @@ void generic_cb(int tx_access, uint8_t* packet, size_t packet_len) {
 
     /* Process ITS messages */
     switch (btp_dst_port) {
-        case BTP_PORT_CAM:
+        case BTP_PORT_CAM: {
             EI2_CAM_t* cam = (EI2_CAM_t*) its_msg;
             log_debug("[its] UPER decode ok | cam.stationId: %d]", cam->header.stationId);
             cam_cb(cam);
             break;
-        case BTP_PORT_DENM:
+        }
+        case BTP_PORT_DENM: {
             EI2_DENM_t* denm = (EI2_DENM_t*) its_msg;
             log_debug("[its] UPER decode ok | denm.stationId: %d]", denm->header.stationId);
             denm_cb(denm);
             break;
+        }
     }
     ASN_STRUCT_FREE(*its_msg_descriptor, its_msg);
 }
