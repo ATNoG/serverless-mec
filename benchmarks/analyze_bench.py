@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """
 analyze_bench.py — correlate sniffer + retransmitter NDJSON bench logs and print averages + stats.
-
-What changed from the original:
-- Removed the misleading interpretation of `sniffer send_end -> retrans recv` as a normal latency.
-- Added the causal metric `sniffer send_start -> retrans recv`.
-- Kept `post_complete -> retrans recv` only as a diagnostic, clearly marked as topology-dependent.
-- Prefer monotonic elapsed fields when the logs provide them, falling back to wall-clock deltas.
-- Added a diagnostic sign summary so mixed/negative values are obvious instead of being silently presented as a latency.
 """
 
 from __future__ import annotations
