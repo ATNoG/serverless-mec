@@ -25,7 +25,8 @@ spec:
         - name: OUT_TYPE
           value: "its.cam.benchmarked"
     triggerFilters:
-      type: its.cam
+      - type: its.cam
+      - type: its.denm
   autoReplicas:
     - matchNodes:
         rsu-b: "true"
