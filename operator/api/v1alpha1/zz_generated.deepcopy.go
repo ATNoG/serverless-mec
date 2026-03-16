@@ -413,9 +413,15 @@ func (in *KnativeServiceSpec) DeepCopyInto(out *KnativeServiceSpec) {
 	}
 	if in.TriggerFilters != nil {
 		in, out := &in.TriggerFilters, &out.TriggerFilters
-		*out = make(map[string]string, len(*in))
-		for key, val := range *in {
-			(*out)[key] = val
+		*out = make([]map[string]string, len(*in))
+		for i := range *in {
+			if (*in)[i] != nil {
+				in, out := &(*in)[i], &(*out)[i]
+				*out = make(map[string]string, len(*in))
+				for key, val := range *in {
+					(*out)[key] = val
+				}
+			}
 		}
 	}
 	if in.NodeSelector != nil {

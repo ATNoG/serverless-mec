@@ -79,14 +79,17 @@ type KnativeServiceSpec struct {
 	// +optional
 	MinScale *int32 `json:"minScale,omitempty"`
 
-	// triggerFilters are the CloudEvent attribute filters for the Knative Trigger
-	// (maps to spec.filter.attributes).
+	// triggerFilters is a list of CloudEvent attribute filter maps.
+	// Each entry creates one Knative Trigger pointing to the same Knative Service.
 	//
-	// NEW semantics:
-	// - This exists ONLY here (service-level).
-	// - If triggerFilters is empty/nil, the operator will NOT create any Trigger resources.
+	// Example:
+	//   triggerFilters:
+	//     - type: its.cam
+	//     - type: its.denm
+	//
+	// If triggerFilters is empty/nil, the operator will NOT create any Trigger resources.
 	// +optional
-	TriggerFilters map[string]string `json:"triggerFilters,omitempty"`
+	TriggerFilters []map[string]string `json:"triggerFilters,omitempty"`
 
 	// nodeSelector selects the nodes on which the Knative Service's pods may run.
 	// This is a direct pass-through to pod.spec.nodeSelector.

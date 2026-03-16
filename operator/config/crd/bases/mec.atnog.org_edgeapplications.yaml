@@ -2797,16 +2797,21 @@ spec:
                       type: object
                     type: array
                   triggerFilters:
-                    additionalProperties:
-                      type: string
                     description: |-
-                      triggerFilters are the CloudEvent attribute filters for the Knative Trigger
-                      (maps to spec.filter.attributes).
+                      triggerFilters is a list of CloudEvent attribute filter maps.
+                      Each entry creates one Knative Trigger pointing to the same Knative Service.
 
-                      NEW semantics:
-                      - This exists ONLY here (service-level).
-                      - If triggerFilters is empty/nil, the operator will NOT create any Trigger resources.
-                    type: object
+                      Example:
+                        triggerFilters:
+                          - type: its.cam
+                          - type: its.denm
+
+                      If triggerFilters is empty/nil, the operator will NOT create any Trigger resources.
+                    items:
+                      additionalProperties:
+                        type: string
+                      type: object
+                    type: array
                   volumes:
                     description: volumes are pod volumes (e.g., emptyDir) that can
                       be mounted by the container.
