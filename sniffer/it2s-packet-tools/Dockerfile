@@ -1,0 +1,46 @@
+FROM ubuntu:noble
+
+ARG ES_PUB_KEY=5F7B0456310E773ACC6F08D6A83C2A5775CA676F
+ARG TARGETARCH
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt update && \
+    apt install -y --no-install-recommends gnupg ca-certificates && \
+    gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys ${ES_PUB_KEY} && \
+    gpg --export ${ES_PUB_KEY} | gpg --dearmor -o /usr/share/keyrings/es-key.gpg && \
+    rm -rf /root/.gnupg
+
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        echo "deb [signed-by=/usr/share/keyrings/es-key.gpg arch=amd64] https://es.av.it.pt/repo/ubuntu/noble stable main" > /etc/apt/sources.list.d/es.list ; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        echo "deb [signed-by=/usr/share/keyrings/es-key.gpg arch=arm64] https://es.av.it.pt/repo/ubuntu/noble stable main" > /etc/apt/sources.list.d/es.list ; \
+    else \
+        echo "Unsupported TARGETARCH: $TARGETARCH" && exit 1 ; \
+    fi
+
+RUN apt update && \
+    apt install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        libcurl4-openssl-dev \
+        cw-mk6-firmware-git \
+        it2s-rsock-git \
+        it2s-ublox-git \
+        it2s-mac-git \
+        it2s-llc-git \
+        it2s-gn-git \
+        it2s-asn-itss-etsi-git && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+
+RUN rm -rf build && \
+    mkdir -p build && \
+    cd build && \
+    cmake .. && \
+    make -j"$(nproc)" && \
+    make install
+
+ENTRYPOINT ["/bin/sh", "-c"]
+CMD ["exec its_sniffer rsock lo"]

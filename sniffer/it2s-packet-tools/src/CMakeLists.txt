@@ -1,8 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 
+find_package(Threads REQUIRED)
+find_package(CURL REQUIRED)
+
 add_executable(its_sniffer
     its_sniffer.c
     logger.c
+    cloudevent_sender.c
 )
 
 add_executable(its_producer
@@ -11,7 +15,9 @@ add_executable(its_producer
 )
 
 target_link_libraries(its_sniffer
-    -lpthread
+    PRIVATE
+    Threads::Threads
+    CURL::libcurl
     -lit2s-rsock
     -lit2s-ublox
     -lit2s-mac
@@ -23,7 +29,8 @@ target_link_libraries(its_sniffer
 )
 
 target_link_libraries(its_producer
-    -lpthread
+    PRIVATE
+    Threads::Threads
     -lit2s-rsock
     -lit2s-ublox
     -lit2s-mac

@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: its-producer
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: its-producer
+  template:
+    metadata:
+      labels:
+        app: its-producer
+    spec:
+      nodeSelector:
+        snifftest: "true"
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: its-producer
+          image: ghcr.io/pmacoutinho/its-live-capture-c:latest
+          imagePullPolicy: Always
+          command: ["its_producer"]
+          args: ["rsock", "lo"]
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      tolerations:
+        - operator: Exists

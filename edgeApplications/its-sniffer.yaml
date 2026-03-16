@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: its-sniffer
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: its-sniffer
+  template:
+    metadata:
+      labels:
+        app: its-sniffer
+    spec:
+      nodeSelector:
+        snifftest: "true"
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: its-sniffer
+          image: ghcr.io/pmacoutinho/its-live-capture-c:latest
+          imagePullPolicy: Always
+          command: ["its_sniffer"]
+          args: ["rsock", "lo"]
+          env:
+            - name: K_SINK
+              value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
+            - name: CE_INCLUDE_RAW_HEX
+              value: "true"
+            - name: SEND_QUEUE_MAX
+              value: "1000"
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      tolerations:
+        - operator: Exists
