@@ -26,6 +26,7 @@ typedef struct {
     size_t body_len;
 
     char ce_id[37];
+    char ce_type[128];
     uint64_t seq_no;
     int64_t t_event_unix_ns;
     int64_t t_ce_built_unix_ns;
@@ -85,6 +86,12 @@ static void ce_log_error(const char *fmt, ...) {
 static int64_t now_unix_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
+}
+
+static int64_t mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
 }
 
@@ -439,21 +446,56 @@ static void *sender_thread_fn(void *arg) {
         ce_job_t *job = jobq_pop_block(&g_q);
         if (!job) continue;
 
+        int64_t t_send_start_unix_ns = now_unix_ns();
+        int64_t t0m = mono_ns();
+
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, job->body);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long) job->body_len);
 
         CURLcode rc = curl_easy_perform(curl);
 
+        int64_t t1m = mono_ns();
+        int64_t t_send_end_unix_ns = now_unix_ns();
+
         long status = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 
+        long long elapsed_ns = (long long) (t1m - t0m);
+
         if (rc != CURLE_OK) {
-            ce_log_warn("POST seq=%" PRIu64 " status=%ld curl_err=%s",
-                        job->seq_no, status, curl_easy_strerror(rc));
+            ce_log_warn("POST seq=%" PRIu64 " type=%s elapsed_ns=%lld status=%ld curl_err=%s",
+                        job->seq_no, job->ce_type, elapsed_ns, status, curl_easy_strerror(rc));
         } else {
-            ce_log_info("POST seq=%" PRIu64 " status=%ld",
-                        job->seq_no, status);
+            ce_log_info("POST seq=%" PRIu64 " type=%s elapsed_ns=%lld status=%ld",
+                        job->seq_no, job->ce_type, elapsed_ns, status);
         }
+
+        fprintf(stdout,
+                "{\"kind\":\"bench\",\"component\":\"%s\",\"node\":\"%s\",\"ce_id\":\"%s\","
+                "\"ce_type\":\"%s\","
+                "\"frame_no\":%" PRIu64 ","
+                "\"t_capture_unix_ns\":%" PRId64 ","
+                "\"t_ce_built_unix_ns\":%" PRId64 ","
+                "\"t_enqueue_unix_ns\":%" PRId64 ","
+                "\"t_send_start_unix_ns\":%" PRId64 ","
+                "\"t_send_end_unix_ns\":%" PRId64 ","
+                "\"send_elapsed_ns\":%lld,"
+                "\"http_status\":%ld,"
+                "\"curl_rc\":%d}\n",
+                g_cfg.component ? g_cfg.component : "sniffer",
+                g_cfg.node_name ? g_cfg.node_name : "unknown",
+                job->ce_id,
+                job->ce_type,
+                job->seq_no,
+                job->t_event_unix_ns,
+                job->t_ce_built_unix_ns,
+                job->t_enqueue_unix_ns,
+                t_send_start_unix_ns,
+                t_send_end_unix_ns,
+                elapsed_ns,
+                status,
+                (int) rc);
+        fflush(stdout);
 
         free(job->body);
         free(job);
@@ -601,6 +643,11 @@ int ce_sender_send_json(const char *event_type_or_null,
     if (!g_sender_enabled) return 0;
     if (!data_json_obj || !data_json_obj[0]) return -1;
 
+    const char *resolved_type =
+        (event_type_or_null && event_type_or_null[0])
+            ? event_type_or_null
+            : ((g_cfg.ce_type && g_cfg.ce_type[0]) ? g_cfg.ce_type : "its.packet");
+
     char ce_id[37];
     if (!uuid4(ce_id)) {
         snprintf(ce_id, sizeof(ce_id),
@@ -611,7 +658,7 @@ int ce_sender_send_json(const char *event_type_or_null,
 
     size_t body_len = 0;
     char *body = build_cloudevent_structured(
-        event_type_or_null,
+        resolved_type,
         subject_or_null,
         data_json_obj,
         stationtype_or_neg,
@@ -629,6 +676,7 @@ int ce_sender_send_json(const char *event_type_or_null,
     job->body = body;
     job->body_len = body_len;
     snprintf(job->ce_id, sizeof(job->ce_id), "%s", ce_id);
+    snprintf(job->ce_type, sizeof(job->ce_type), "%s", resolved_type);
     job->seq_no = seq_no;
     job->t_event_unix_ns = t_event_unix_ns;
     job->t_ce_built_unix_ns = t_ce_built_unix_ns;
