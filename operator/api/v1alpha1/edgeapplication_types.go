@@ -51,6 +51,14 @@ type KnativeContainerSpec struct {
 	// image is the container image for the Knative Service implementing this EdgeApplication.
 	Image string `json:"image"`
 
+	// command overrides the container entrypoint.
+	// +optional
+	Command []string `json:"command,omitempty"`
+
+	// args overrides the container command arguments.
+	// +optional
+	Args []string `json:"args,omitempty"`
+
 	// env is an optional list of environment variables for the container.
 	// +optional
 	Env []EnvVarSpec `json:"env,omitempty"`
@@ -152,9 +160,6 @@ type KnativeServiceReplicaSpec struct {
 }
 
 // AutoReplicaRule defines an auto-fanout rule: one KService per matching node.
-//
-// NEW semantics:
-// - autoReplicas entries ONLY contain matchNodes.
 type AutoReplicaRule struct {
 	// matchNodes selects the nodes that should receive a replica service.
 	// Example:

@@ -49,11 +49,8 @@ spec:
                   autoReplicas creates one KService per node that matches each rule's matchNodes.
                   If autoReplicas is set (non-empty), the controller runs in daemon mode (no base + no replicas).
                 items:
-                  description: |-
-                    AutoReplicaRule defines an auto-fanout rule: one KService per matching node.
-
-                    NEW semantics:
-                    - autoReplicas entries ONLY contain matchNodes.
+                  description: 'AutoReplicaRule defines an auto-fanout rule: one KService
+                    per matching node.'
                   properties:
                     matchNodes:
                       additionalProperties:
@@ -2022,6 +2019,16 @@ spec:
                     description: container describes the container configuration for
                       the Knative Service.
                     properties:
+                      args:
+                        description: args overrides the container command arguments.
+                        items:
+                          type: string
+                        type: array
+                      command:
+                        description: command overrides the container entrypoint.
+                        items:
+                          type: string
+                        type: array
                       env:
                         description: env is an optional list of environment variables
                           for the container.

@@ -10,7 +10,7 @@ You may obtain a copy of the License at
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-	See the License for the specific language governing permissions and
+See the License for the specific language governing permissions and
 limitations under the License.
 */
 
@@ -133,6 +133,8 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		Containers: []corev1.Container{{
 			Name:            app.Spec.Service.Container.Name,
 			Image:           app.Spec.Service.Container.Image,
+			Command:         nilIfEmptyStrings(app.Spec.Service.Container.Command),
+			Args:            nilIfEmptyStrings(app.Spec.Service.Container.Args),
 			Env:             baseEnv,
 			Resources:       app.Spec.Service.Container.Resources,
 			SecurityContext: app.Spec.Service.Container.SecurityContext,
@@ -156,7 +158,6 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	baseMinScale := app.Spec.Service.MinScale
 	baseFilters := app.Spec.Service.TriggerFilters
 
-	// If there are no trigger filters, no triggers are created.
 	createTriggers := len(baseFilters) > 0
 
 	// Background app readiness probe when no trigger exists.
@@ -347,6 +348,8 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 
 	ps.Containers[0].Name = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].Name
 	ps.Containers[0].Image = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].Image
+	ps.Containers[0].Command = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].Command
+	ps.Containers[0].Args = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].Args
 	ps.Containers[0].Env = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].Env
 	ps.Containers[0].Resources = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].Resources
 	ps.Containers[0].SecurityContext = desiredSvc.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].SecurityContext
@@ -564,6 +567,13 @@ func nilIfEmptyVolumes(v []corev1.Volume) []corev1.Volume {
 }
 
 func nilIfEmptyVolumeMounts(v []corev1.VolumeMount) []corev1.VolumeMount {
+	if len(v) == 0 {
+		return nil
+	}
+	return v
+}
+
+func nilIfEmptyStrings(v []string) []string {
 	if len(v) == 0 {
 		return nil
 	}
