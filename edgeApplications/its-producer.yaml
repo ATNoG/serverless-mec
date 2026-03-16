@@ -19,7 +19,7 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
         - name: its-producer
-          image: ghcr.io/pmacoutinho/its-live-capture-c:latest
+          image: ghcr.io/pmacoutinho/its-producer:latest
           imagePullPolicy: Always
           command: ["its_producer"]
           args: ["rsock", "lo"]

@@ -18,7 +18,7 @@ spec:
 
     container:
       name: user-container
-      image: ghcr.io/pmacoutinho/its-live-capture-c:latest
+      image: ghcr.io/pmacoutinho/its-sniffer:latest
 
       env:
         - name: K_SINK

@@ -21,4 +21,8 @@ spec:
         - name: LOG_FORMAT
           value: "pretty"
     triggerFilters:
-      type: its.cam
+      - type: its.cam
+      - type: its.denm
+  autoReplicas:
+    - matchNodes:
+        snifftest: "true"
