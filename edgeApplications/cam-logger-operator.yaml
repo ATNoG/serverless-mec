@@ -25,4 +25,4 @@ spec:
       - type: its.denm
   autoReplicas:
     - matchNodes:
-        snifftest: "true"
+        rsu-a: "true"

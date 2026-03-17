@@ -13,7 +13,7 @@ spec:
         app: its-producer
     spec:
       nodeSelector:
-        snifftest: "true"
+        rsu-b: "true"
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       terminationGracePeriodSeconds: 10
