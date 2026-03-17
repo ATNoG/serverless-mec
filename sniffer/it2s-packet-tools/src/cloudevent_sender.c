@@ -447,27 +447,48 @@ static void *sender_thread_fn(void *arg) {
         if (!job) continue;
 
         int64_t t_send_start_unix_ns = now_unix_ns();
-        int64_t t0m = mono_ns();
+        int64_t t_send_start_mono_ns = mono_ns();
 
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, job->body);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long) job->body_len);
 
         CURLcode rc = curl_easy_perform(curl);
 
-        int64_t t1m = mono_ns();
+        int64_t t_send_end_mono_ns = mono_ns();
         int64_t t_send_end_unix_ns = now_unix_ns();
 
         long status = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 
-        long long elapsed_ns = (long long) (t1m - t0m);
-
         if (rc != CURLE_OK) {
-            ce_log_warn("POST seq=%" PRIu64 " type=%s elapsed_ns=%lld status=%ld curl_err=%s",
-                        job->seq_no, job->ce_type, elapsed_ns, status, curl_easy_strerror(rc));
+            ce_log_warn(
+                "POST seq=%" PRIu64 " type=%s "
+                "t_send_start_unix_ns=%" PRId64 " t_send_end_unix_ns=%" PRId64 " "
+                "t_send_start_mono_ns=%" PRId64 " t_send_end_mono_ns=%" PRId64 " "
+                "status=%ld curl_err=%s",
+                job->seq_no,
+                job->ce_type,
+                t_send_start_unix_ns,
+                t_send_end_unix_ns,
+                t_send_start_mono_ns,
+                t_send_end_mono_ns,
+                status,
+                curl_easy_strerror(rc)
+            );
         } else {
-            ce_log_info("POST seq=%" PRIu64 " type=%s elapsed_ns=%lld status=%ld",
-                        job->seq_no, job->ce_type, elapsed_ns, status);
+            ce_log_info(
+                "POST seq=%" PRIu64 " type=%s "
+                "t_send_start_unix_ns=%" PRId64 " t_send_end_unix_ns=%" PRId64 " "
+                "t_send_start_mono_ns=%" PRId64 " t_send_end_mono_ns=%" PRId64 " "
+                "status=%ld",
+                job->seq_no,
+                job->ce_type,
+                t_send_start_unix_ns,
+                t_send_end_unix_ns,
+                t_send_start_mono_ns,
+                t_send_end_mono_ns,
+                status
+            );
         }
 
         fprintf(stdout,
@@ -479,7 +500,8 @@ static void *sender_thread_fn(void *arg) {
                 "\"t_enqueue_unix_ns\":%" PRId64 ","
                 "\"t_send_start_unix_ns\":%" PRId64 ","
                 "\"t_send_end_unix_ns\":%" PRId64 ","
-                "\"send_elapsed_ns\":%lld,"
+                "\"t_send_start_mono_ns\":%" PRId64 ","
+                "\"t_send_end_mono_ns\":%" PRId64 ","
                 "\"http_status\":%ld,"
                 "\"curl_rc\":%d}\n",
                 g_cfg.component ? g_cfg.component : "sniffer",
@@ -492,7 +514,8 @@ static void *sender_thread_fn(void *arg) {
                 job->t_enqueue_unix_ns,
                 t_send_start_unix_ns,
                 t_send_end_unix_ns,
-                elapsed_ns,
+                t_send_start_mono_ns,
+                t_send_end_mono_ns,
                 status,
                 (int) rc);
         fflush(stdout);

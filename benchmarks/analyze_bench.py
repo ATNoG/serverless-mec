@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-analyze_bench.py — correlate sniffer + retransmitter NDJSON bench logs and print averages + stats.
+analyze_bench.py — correlate sniffer + retransmitter NDJSON bench logs and
+compute all timing deltas from raw timestamps only.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import io
 import json
@@ -124,6 +126,42 @@ def _get_int(d: Dict[str, Any], k: str) -> Optional[int]:
         return None
 
 
+def _delta_ns(start: Optional[int], end: Optional[int]) -> Optional[float]:
+    if start is None or end is None:
+        return None
+    return float(end - start)
+
+
+def _preferred_delta_ns(
+    mono_start: Optional[int],
+    mono_end: Optional[int],
+    unix_start: Optional[int],
+    unix_end: Optional[int],
+) -> Optional[float]:
+    d = _delta_ns(mono_start, mono_end)
+    if d is not None:
+        return d
+    return _delta_ns(unix_start, unix_end)
+
+
+def _add_delta(vals: List[float], start: Optional[int], end: Optional[int]) -> None:
+    d = _delta_ns(start, end)
+    if d is not None:
+        vals.append(d)
+
+
+def _add_preferred_delta(
+    vals: List[float],
+    mono_start: Optional[int],
+    mono_end: Optional[int],
+    unix_start: Optional[int],
+    unix_end: Optional[int],
+) -> None:
+    d = _preferred_delta_ns(mono_start, mono_end, unix_start, unix_end)
+    if d is not None:
+        vals.append(d)
+
+
 def _key_sniffer(d: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]:
     ce_id = d.get("ce_id")
     if isinstance(ce_id, str) and ce_id:
@@ -161,25 +199,6 @@ def _table(title: str, rows: List[Tuple[str, Stats]]) -> str:
             f"{name:38s} {st.n:6d} {fmt_ms(st.mean):>12s} {fmt_ms(st.median):>12s} {fmt_ms(st.p95):>12s} {fmt_ms(st.p99):>12s} {fmt_ms(st.min):>12s} {fmt_ms(st.max):>12s}"
         )
     return "\n".join(lines)
-
-
-def _add_value(vals: List[float], v: Optional[int]) -> None:
-    if v is None:
-        return
-    vals.append(float(v))
-
-
-def _add_delta(vals: List[float], a: Optional[int], b: Optional[int]) -> None:
-    if a is None or b is None:
-        return
-    vals.append(float(b - a))
-
-
-def _add_field_or_delta(vals: List[float], explicit_ns: Optional[int], a: Optional[int], b: Optional[int]) -> None:
-    if explicit_ns is not None:
-        vals.append(float(explicit_ns))
-        return
-    _add_delta(vals, a, b)
 
 
 def main() -> int:
@@ -224,7 +243,6 @@ def main() -> int:
         else:
             matched.append((s, r))
 
-    # Count unmatched sniffers across both id and frame fallback keys.
     matched_keys = set()
     for s, _ in matched:
         ce_id, frame = _key_sniffer(s)
@@ -246,12 +264,14 @@ def main() -> int:
         t_enq = _get_int(s, "t_enqueue_unix_ns")
         t_ss = _get_int(s, "t_send_start_unix_ns")
         t_se = _get_int(s, "t_send_end_unix_ns")
-        send_elapsed_ns = _get_int(s, "send_elapsed_ns")
+
+        t_ss_mono = _get_int(s, "t_send_start_mono_ns")
+        t_se_mono = _get_int(s, "t_send_end_mono_ns")
 
         _add_delta(sn_cap_to_built, t_cap, t_bld)
         _add_delta(sn_built_to_enqueue, t_bld, t_enq)
         _add_delta(sn_enqueue_to_send_start, t_enq, t_ss)
-        _add_field_or_delta(sn_send_start_to_end, send_elapsed_ns, t_ss, t_se)
+        _add_preferred_delta(sn_send_start_to_end, t_ss_mono, t_se_mono, t_ss, t_se)
         _add_delta(sn_cap_to_send_end, t_cap, t_se)
 
     # Matched end-to-end
@@ -283,21 +303,21 @@ def main() -> int:
         t_fs = _get_int(r, "t_forward_start_unix_ns")
         t_fe = _get_int(r, "t_forward_end_unix_ns")
 
-        body_read_elapsed_ns = _get_int(r, "body_read_elapsed_ns")
-        parse_elapsed_ns = _get_int(r, "parse_elapsed_ns")
-        forward_prep_elapsed_ns = _get_int(r, "forward_prep_elapsed_ns")
-        forward_elapsed_ns = _get_int(r, "forward_elapsed_ns")
-        handler_elapsed_ns = _get_int(r, "handler_elapsed_ns")
+        t_rr_mono = _get_int(r, "t_recv_mono_ns")
+        t_rb_mono = _get_int(r, "t_body_mono_ns")
+        t_rp_mono = _get_int(r, "t_parsed_mono_ns")
+        t_fs_mono = _get_int(r, "t_forward_start_mono_ns")
+        t_fe_mono = _get_int(r, "t_forward_end_mono_ns")
 
         _add_delta(e2e_cap_to_rt_recv, t_cap, t_rr)
         _add_delta(e2e_send_start_to_rt_recv, t_ss, t_rr)
         _add_delta(diag_post_complete_to_rt_recv, t_se, t_rr)
 
-        _add_field_or_delta(rt_recv_to_body, body_read_elapsed_ns, t_rr, t_rb)
-        _add_field_or_delta(rt_body_to_parsed, parse_elapsed_ns, t_rb, t_rp)
-        _add_field_or_delta(rt_parsed_to_fwd_start, forward_prep_elapsed_ns, t_rp, t_fs)
-        _add_field_or_delta(rt_fwd_start_to_fwd_end, forward_elapsed_ns, t_fs, t_fe)
-        _add_field_or_delta(rt_recv_to_fwd_end, handler_elapsed_ns, t_rr, t_fe)
+        _add_preferred_delta(rt_recv_to_body, t_rr_mono, t_rb_mono, t_rr, t_rb)
+        _add_preferred_delta(rt_body_to_parsed, t_rb_mono, t_rp_mono, t_rb, t_rp)
+        _add_preferred_delta(rt_parsed_to_fwd_start, t_rp_mono, t_fs_mono, t_rp, t_fs)
+        _add_preferred_delta(rt_fwd_start_to_fwd_end, t_fs_mono, t_fe_mono, t_fs, t_fe)
+        _add_preferred_delta(rt_recv_to_fwd_end, t_rr_mono, t_fe_mono, t_rr, t_fe)
 
         _add_delta(e2e_cap_to_fwd_start, t_cap, t_fs)
         _add_delta(e2e_cap_to_fwd_end, t_cap, t_fe)
@@ -318,10 +338,11 @@ def main() -> int:
 
     diag_signs = SignSummary.from_values(diag_post_complete_to_rt_recv)
 
-    # ---- Print report ----
     print()
     print("Bench Log Analysis")
     print("==================")
+    print("input mode: raw timestamps only; all deltas below are computed here")
+    print("same-process phase timings prefer raw monotonic timestamps when available")
     print(f"sniffer events:        {len(sn)}   (duplicate ce_id ignored: {sn_dupes})")
     print(f"retransmitter events:  {len(rt)}")
     print(f"matched pairs:         {len(matched)}")
@@ -394,7 +415,6 @@ def main() -> int:
         print()
 
     if args.csv:
-        import csv
         with open(args.csv, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
@@ -417,22 +437,26 @@ def main() -> int:
             for s, r in matched:
                 ce_id = s.get("ce_id") or r.get("ce_id") or ""
                 frame_no = s.get("frame_no") or r.get("frame_number") or ""
+
                 t_cap = _get_int(s, "t_capture_unix_ns")
                 t_ss = _get_int(s, "t_send_start_unix_ns")
                 t_se = _get_int(s, "t_send_end_unix_ns")
+
                 t_rr = _get_int(r, "t_recv_unix_ns")
                 t_fs = _get_int(r, "t_forward_start_unix_ns")
                 t_fe = _get_int(r, "t_forward_end_unix_ns")
-                handler_elapsed_ns = _get_int(r, "handler_elapsed_ns")
+
+                t_rr_mono = _get_int(r, "t_recv_mono_ns")
+                t_fe_mono = _get_int(r, "t_forward_end_mono_ns")
 
                 e2e_ms = ns_to_ms(float(t_rr - t_cap)) if (t_rr is not None and t_cap is not None) else float("nan")
                 ss_rr_ms = ns_to_ms(float(t_rr - t_ss)) if (t_rr is not None and t_ss is not None) else float("nan")
                 diag_se_rr_ms = ns_to_ms(float(t_rr - t_se)) if (t_rr is not None and t_se is not None) else float("nan")
                 cap_fs_ms = ns_to_ms(float(t_fs - t_cap)) if (t_fs is not None and t_cap is not None) else float("nan")
                 cap_fe_ms = ns_to_ms(float(t_fe - t_cap)) if (t_fe is not None and t_cap is not None) else float("nan")
-                rt_ms = ns_to_ms(float(handler_elapsed_ns)) if handler_elapsed_ns is not None else (
-                    ns_to_ms(float(t_fe - t_rr)) if (t_fe is not None and t_rr is not None) else float("nan")
-                )
+
+                rt_delta_ns = _preferred_delta_ns(t_rr_mono, t_fe_mono, t_rr, t_fe)
+                rt_ms = ns_to_ms(rt_delta_ns) if rt_delta_ns is not None else float("nan")
 
                 w.writerow([
                     ce_id,

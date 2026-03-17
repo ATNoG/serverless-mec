@@ -60,7 +60,7 @@ def handle():
     if not FORWARD_URL:
         return Response("FORWARD_URL not configured", status=500)
 
-    # Wall clock: keep these for cross-host correlation.
+    # Raw wall-clock timestamps for cross-host correlation.
     t_recv = time.time_ns()
     t_recv_mono = time.monotonic_ns()
 
@@ -129,13 +129,6 @@ def handle():
     t_forward_end = time.time_ns()
     t_forward_end_mono = time.monotonic_ns()
 
-    # Prefer monotonic elapsed values for same-process timings.
-    body_read_elapsed_ns = t_body_mono - t_recv_mono
-    parse_elapsed_ns = t_parsed_mono - t_body_mono
-    forward_prep_elapsed_ns = t_forward_start_mono - t_parsed_mono
-    forward_elapsed_ns = t_forward_end_mono - t_forward_start_mono
-    handler_elapsed_ns = t_forward_end_mono - t_recv_mono
-
     record = {
         "kind": "bench",
         "component": "retransmitter",
@@ -146,19 +139,19 @@ def handle():
         "ce_time": str(ce_time) if ce_time is not None else None,
         "ce_subject": str(ce_subject) if ce_subject is not None else None,
 
-        # Cross-host wall-clock timestamps.
+        # Raw wall-clock timestamps.
         "t_recv_unix_ns": t_recv,
         "t_body_unix_ns": t_body,
         "t_parsed_unix_ns": t_parsed,
         "t_forward_start_unix_ns": t_forward_start,
         "t_forward_end_unix_ns": t_forward_end,
 
-        # Same-process monotonic elapsed values.
-        "body_read_elapsed_ns": body_read_elapsed_ns,
-        "parse_elapsed_ns": parse_elapsed_ns,
-        "forward_prep_elapsed_ns": forward_prep_elapsed_ns,
-        "forward_elapsed_ns": forward_elapsed_ns,
-        "handler_elapsed_ns": handler_elapsed_ns,
+        # Raw monotonic timestamps for same-process phase calculations in the analyzer.
+        "t_recv_mono_ns": t_recv_mono,
+        "t_body_mono_ns": t_body_mono,
+        "t_parsed_mono_ns": t_parsed_mono,
+        "t_forward_start_mono_ns": t_forward_start_mono,
+        "t_forward_end_mono_ns": t_forward_end_mono,
 
         "forward_status": forward_status,
         "forward_error": forward_error,
@@ -168,7 +161,7 @@ def handle():
         "frame_number": frame_number,
         "frame_timestamp": frame_timestamp,
 
-        # Producer extensions from the sniffer.
+        # Producer extensions from the sniffer, if present.
         "tscaptureunixns": ts_capture_unix_ns,
         "tscebuiltunixns": ts_ce_built_unix_ns,
         "tsenqueueunixns": ts_enqueue_unix_ns,
