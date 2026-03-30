@@ -1,4 +1,0 @@
-defaultBaseImage: gcr.io/distroless/static:nonroot
-
-labels:
-  ./cmd/queue: queue
