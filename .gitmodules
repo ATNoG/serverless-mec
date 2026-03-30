@@ -1,0 +1,6 @@
+[submodule "container-freezer"]
+	path = container-freezer
+	url = https://github.com/pmacoutinho/container-freezer-criu.git
+[submodule "knative-freezer-plugin"]
+	path = knative-freezer-plugin
+	url = https://github.com/pmacoutinho/knative-freezer-plugin.git
