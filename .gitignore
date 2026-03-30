@@ -1,2 +1,4 @@
 sniffer/rust/Cargo.lock
 sniffer/rust/target/
+benchmarks/benchlog/
+benchmarks/*.ndjson
