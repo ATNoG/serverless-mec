@@ -1,200 +1,281 @@
-# K3s + Knative ITS/CAM Event Pipeline
+# serverless-mec
 
-A Kubernetes-native pipeline to **capture ETSI ITS CAM packets**, turn them into **CloudEvents**, and route them to **Knative** consumers (e.g., loggers, MQTT). Includes optional utilities for normalizing PCAPs and ETSI-compliant CRDs for a MEC orchestrator.
-
----
+A Kubernetes-native MEC (Multi-access Edge Computing) orchestrator that uses **Knative** and **CloudEvents** to deploy and manage edge applications on K3s clusters. Developed as part of a Master's dissertation exploring serverless alternatives to traditional NFV-based MEC platforms (OSM/MANO).
 
 ## Overview
 
-This repo contains:
+This project implements the application lifecycle management layer of an ETSI MEC platform using Kubernetes-native primitives instead of heavyweight NFV orchestrators. It covers:
 
-- A **live capture** component (containerized) that sniffs CAM frames (L2 GeoNetworking `0x8947` or `udp/2001`), writes **NDJSON** for auditing, and posts **CloudEvents** (`type=its.cam`) to a Knative **Broker**. It can add **CloudEvent extensions** like `stationtype` for fine-grained routing.
-- Knative **Triggers** and utility Services (e.g., `event_display`) to filter/inspect traffic, with examples like “only `stationtype=5`”.
-- An optional **MQTT forwarder** (HTTP CloudEvent → MQTT topic) and a **Mosquitto** broker Deployment/Service for downstream consumers.
-- Optional **ETSI MEC 010-1 CRDs** to model MEC resources (MobileEdgeApplication, TrafficRule, DNSRule).
+- An **EdgeApplication CRD** aligned with ETSI MEC 010-2, with a vendor-specific extension that maps to Knative Services and Triggers
+- A **Kubernetes operator** that reconciles EdgeApplications into Knative Services, Triggers, and per-node replicas
+- An **ITS packet capture pipeline** that sniffs ETSI ITS CAM/DENM frames from RSU network interfaces, converts them to CloudEvents, and routes them through a Kafka-backed Knative Broker
+- **CRIU-based container freezing** to checkpoint idle serverless functions and restore them on demand, freeing RAM on resource-constrained edge nodes
+- **Application handoff** between edge nodes via the EdgeApplicationHandoff CRD
 
----
+## Architecture
 
-## Architecture (high-level)
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  RSU / Edge Node                                                    │
+│                                                                     │
+│  ┌─────────────┐    CloudEvents     ┌──────────────────────┐       │
+│  │ ITS Sniffer  │──────────────────►│  Kafka-backed Broker  │       │
+│  │ (DaemonSet)  │   type=its.cam    │  (Knative Eventing)   │       │
+│  │ hostNetwork  │   type=its.denm   └──────────┬───────────┘       │
+│  └─────────────┘                               │                    │
+│                                          Knative Triggers           │
+│                                       (attribute filtering)         │
+│                                                │                    │
+│                        ┌───────────────────────┼──────────┐        │
+│                        ▼                       ▼          ▼        │
+│                 ┌─────────────┐    ┌──────────────┐  ┌────────┐   │
+│                 │Retransmitter│    │  CAM Logger   │  │  MQTT  │   │
+│                 │  (KService) │    │  (KService)   │  │Forwarder│  │
+│                 └──────┬──────┘    └──────────────┘  └────────┘   │
+│                        │                                            │
+│                        ▼                                            │
+│             ┌─────────────────────┐                                 │
+│             │ Queue-Proxy Plugin  │  idle timeout → freeze          │
+│             │ (freezer plugin)    │  new request  → thaw            │
+│             └─────────┬───────────┘                                 │
+│                       │ HTTP                                        │
+│                       ▼                                             │
+│             ┌─────────────────────┐                                 │
+│             │ Freeze Daemon       │  CRIU checkpoint/restore        │
+│             │ (DaemonSet)         │  via containerd                 │
+│             └─────────────────────┘                                 │
+└─────────────────────────────────────────────────────────────────────┘
 
-1. **Network capture (DaemonSet)** on each node, running with `hostNetwork`, parses CAM and posts CloudEvents to a **Kafka-backed Knative Broker**. A **SinkBinding** injects `K_SINK` so the capture knows where to POST.  
-2. **Triggers** route by attributes (e.g., `type=its.cam`, `stationtype=5`) to subscribers (Knative Services), such as a logger or MQTT forwarder.  
-3. **Optional MQTT path:** a Knative Service receives the CloudEvent and republishes to MQTT topics derived from event attributes (e.g., `its/{type}/st{stationtype}`).
+┌─────────────────────────────────────────────────────────────────────┐
+│  MEC Operator (runs in cluster)                                     │
+│                                                                     │
+│  EdgeApplication CR ──► Knative Service(s) + Trigger(s)            │
+│  AutoReplicas      ──► one KService per matching node              │
+│  Handoff CR        ──► migrate app instance between nodes          │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
----
+## Components
+
+### EdgeApplication Operator (`operator/`)
+
+A Go operator (Kubebuilder) that reconciles `EdgeApplication` custom resources into Knative primitives.
+
+**EdgeApplication CRD fields:**
+- **ETSI MEC 010-2 descriptor fields:** `dId`, `name`, `provider`, `softVersion`, `dVersion`, `infoName`, `description`
+- **Vendor-specific service block:** container image, env, resources, securityContext, volumes, nodeSelector, affinity, tolerations, hostNetwork
+- **`triggerFilters`:** list of CloudEvent attribute maps. Each entry creates a Knative Trigger pointing to the service
+- **`replicas`:** additional named instances on specific nodes
+- **`autoReplicas`:** daemon mode. Automatically creates one KService per node matching a label selector (e.g., `road-rsu: "true"`)
+
+**EdgeApplicationHandoff CRD:** manages migration of application instances between edge nodes.
+
+Example EdgeApplication:
+```yaml
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
+metadata:
+  name: its-sniffer
+spec:
+  dId: "its-sniffer-appd-v1"
+  name: "its-sniffer"
+  provider: "atnog.mec"
+  softVersion: "1.0.0"
+  dVersion: "1.0.0"
+  service:
+    container:
+      image: ghcr.io/pmacoutinho/its-sniffer:latest
+      securityContext:
+        capabilities:
+          add: ["NET_ADMIN", "NET_RAW"]
+        runAsUser: 0
+    hostNetwork: true
+    dnsPolicy: ClusterFirstWithHostNet
+    triggerFilters:
+      - type: its.cam
+      - type: its.denm
+    autoReplicas:
+      - matchNodes:
+          road-rsu: "true"
+```
+
+### ITS Packet Capture (`sniffer/`)
+
+Multiple sniffer implementations for capturing ETSI ITS packets:
+
+| Implementation | Language | Method | Use Case |
+|---|---|---|---|
+| `python/` | Python (PyShark) | tshark + pyshark | Development, full protocol dissection |
+| `atnog-capture/` | C | Raw sockets | Production RSUs (no tshark dependency) |
+| `c_libpcap/` | C | libpcap | Alternative to raw sockets |
+| `c_tshark/` | C | tshark pipe | C performance with tshark parsing |
+| `it2s-packet-tools/` | C | Raw sockets | Full ITS stack processing (CAM, DENM, GeoNet) |
+
+The sniffer runs as a DaemonSet with `hostNetwork: true` and `NET_ADMIN`/`NET_RAW` capabilities. It captures GeoNetworking frames (`ether proto 0x8947` or `udp/2001`), extracts ITS fields, and posts CloudEvents to a Kafka-backed Knative Broker via `K_SINK` (injected by SinkBinding).
+
+### CRIU Container Freezing
+
+Two companion repositories handle checkpoint/restore of idle containers:
+
+- **[container-freezer-criu](https://github.com/pmacoutinho/container-freezer-criu)** — DaemonSet that performs CRIU checkpoint (freeze) and restore (thaw) via containerd. Dumps full process state to disk, frees RAM, restores in ~641ms vs ~5258ms cold start (8.2x speedup).
+- **[knative-freezer-plugin](https://github.com/pmacoutinho/knative-freezer-plugin)** — Custom queue-proxy that detects idle containers (30s default) and triggers freeze/thaw automatically. Thaws transparently on incoming requests.
+
+Both are included as **git submodules** in this repo.
+
+Additionally, `kyverno/inject-restart-policy-never.yaml` provides a Kyverno ClusterPolicy that injects `restartPolicy: Never` on Knative user containers to prevent kubelet from restarting containers after CRIU checkpoint kills them.
+
+### Knative Services (`knativeServices/`)
+
+- **Event Display** — simple CloudEvent logger for debugging
+- **MQTT Forwarder** — receives CloudEvents via HTTP and republishes to MQTT topics (e.g., `its/{type}/st{stationtype}`)
+- **Retransmitter** — forwards events between brokers/hops for multi-tier edge architectures and benchmarking
+
+### Event Routing
+
+- **Brokers** (`brokers/`) — Kafka-backed Knative Broker (Strimzi) and optional Mosquitto MQTT broker
+- **Triggers** (`triggers/`) — attribute-based routing examples (e.g., `type=its.cam`, `stationtype=5`)
+- **SinkBinding** (`sinkBinding/`) — injects `K_SINK` into sniffer DaemonSets
 
 ## Prerequisites
 
-- A working **K3s** (or Kubernetes) cluster and `kubectl`.
+- **K3s** (or Kubernetes) cluster with `kubectl` access
+- **Knative Serving + Eventing** installed ([install guide](https://knative.dev/docs/install/yaml-install/))
+- **Strimzi** (Kafka) for the Knative Kafka Broker
+- **Kyverno** (if using CRIU container freezing)
+- **CRIU** installed on worker nodes (if using container freezing, amd64 only)
 
----
+## Quick Start
 
-## Quickstart (cluster setup → first events)
+### 1. Enable Knative features for edge workloads
 
-### 1) Install Knative (Serving/Eventing) + Kourier + default domain
-Follow the [Knative YAML install flow](https://knative.dev/docs/install/yaml-install/).
+The operator needs PodSpec features (hostNetwork, capabilities, nodeSelector, etc.) enabled in Knative:
 
-### 2) Add Kafka (Strimzi) and Knative Kafka components
-Deploy Strimzi (namespace `kafka`) and install the Knative **KafkaChannel** and **Kafka Broker** data planes. Again, follow the [Knative Documentation](https://knative.dev/docs/install/yaml-install/eventing/install-eventing-with-yaml/).
-
-### 3) Create a Kafka-backed Broker
-`kafkaBroker.yaml`:
-```yaml
-apiVersion: eventing.knative.dev/v1
-kind: Broker
-metadata:
-  name: default
-  namespace: default
-  annotations:
-    eventing.knative.dev/broker.class: Kafka
-spec:
-  config:
-    apiVersion: v1
-    kind: ConfigMap
-    name: kafka-broker-config
-    namespace: knative-eventing
-```
-Apply: `kubectl apply -f brokers/kafkaBroker.yaml`.
-
-### 4) Deploy the live capture as a **DaemonSet**
-Example manifest `live-capture-ds.yaml` is provided in the repo; apply and ensure pods are Ready.
-
-### 5) Bind the DaemonSet to the Broker (inject `K_SINK`)
-Create a **SinkBinding** targeting the DaemonSet (Subject = the DS), Sink = the `default` Broker. **Rollout restart** the DS so new pods get `K_SINK`.
-
-### 6) Add a logger Service + Trigger
-A simple `event_display` Knative Service is perfect for verifying delivery; add a Trigger that routes `type=its.cam` to it.
-
-Example Service (`knativeServices/eventDisplayService.yaml`):
-```yaml
-apiVersion: serving.knative.dev/v1
-kind: Service
-metadata:
-  name: cam-logger
-  namespace: default
-spec:
-  template:
-    spec:
-      containers:
-      - image: gcr.io/knative-releases/knative.dev/eventing/cmd/event_display
-        ports:
-        - containerPort: 8080
+```bash
+./scripts/enable-knative-features.sh
 ```
 
-Example Trigger (`triggers/camLoggerTrigger.yaml`):
-```yaml
-apiVersion: eventing.knative.dev/v1
-kind: Trigger
-metadata:
-  name: cam-to-logger
-  namespace: default
-spec:
-  broker: default
-  filter:
-    attributes:
-      type: its.cam
-  subscriber:
-    ref:
-      apiVersion: serving.knative.dev/v1
-      kind: Service
-      name: cam-logger
+### 2. Deploy the Kafka-backed Broker
+
+```bash
+kubectl apply -f configMaps/kafka-broker-config.yaml
+kubectl apply -f brokers/kafkaBroker.yaml
 ```
 
-### 7) (Optional) Install MQTT broker + forwarder
-- Deploy **Mosquitto** (ConfigMap + Deployment + Service).  
-- Deploy the **MQTT forwarder** Knative Service (`/` accepts CloudEvents; republishes to MQTT).  
-- Add a Trigger to route `its.cam` to the forwarder.
+### 3. Deploy the operator
 
----
-
-## Testing the pipeline
-
-1) Start a **PCAP replayer** Pod (hostNetwork) and install `tcpreplay`. Copy a test PCAP/PCAPNG into `/tmp`.  
-2) If your capture is **802.11+radiotap** with LLC/SNAP, normalize it to **Ethernet 0x8947** using the provided Scapy script, then replay the normalized file:  
-   ```
-   python3 /tmp/normalize_to_eth8947.py /tmp/cam.pcap /tmp/cam_eth8947.pcap
-   tcpreplay --intf1=eth0 /tmp/cam_eth8947.pcap
-   ```  
-3) Watch the **logger**:  
-   ```
-   kubectl logs -f -l serving.knative.dev/service=cam-logger -c user-container
-   ```
-   Or tail the sniffer’s NDJSON:  
-   ```
-   kubectl exec -it deploy/live-capture -- sh -lc 'tail -f /var/log/cam.ndjson'
-   ```  
-4) (Optional) Subscribe to **MQTT** topics:
-   ```
-   mosquitto_sub -h mosquitto.default.svc.cluster.local -p 1883 -t 'its/#' -v
-   ```
-
----
-
-## Configuration (capture container)
-
-Key env/args the capture understands (examples; align with your container code):
-
-- `IFACE` (default: `eth0`)  
-- `BPF` – e.g., `ether proto 0x8947` or `udp port 2001`  
-- `K_SINK` – injected by SinkBinding, the HTTP endpoint of the Broker  
-- `CE_TYPE` (default: `its.cam`)  
-- `LOG_EVERY` (progress logging cadence)  
-- `INCLUDE_RAW_HEX` (`1/true` to record frame hex into NDJSON)  
-- May promote `cam_fields.stationtype` to a CloudEvent **extension** (`stationtype`) to enable attribute-based routing and MQTT topic templating.
-
----
-
-## Example: route only `stationtype=5`
-
-Create a Trigger that matches the extension attribute and send it to a dedicated logger:
-Example (`triggers/cam-stationtype-5-trigger.yaml`):
-```yaml
-apiVersion: eventing.knative.dev/v1
-kind: Trigger
-metadata:
-  name: cam-stationtype-5
-  namespace: default
-spec:
-  broker: default
-  filters:
-    - exact:
-        type: its.cam
-        stationtype: "5"
-  subscriber:
-    ref:
-      apiVersion: serving.knative.dev/v1
-      kind: Service
-      name: cam-stationtype-5-logger
+```bash
+kubectl apply -f configMaps/mec-operator-config.yaml
+cd operator && make deploy
 ```
 
-Use `event_display` as the subscriber (with minScale=1 while testing).
+### 4. Deploy an EdgeApplication
 
----
+```bash
+kubectl apply -f edgeApplications/its-sniffer.yaml
+```
 
-## Troubleshooting
+The operator will create:
+- One Knative Service per matching node (autoReplicas mode)
+- Knative Triggers for `its.cam` and `its.denm` events
+- Pods with hostNetwork and NET_ADMIN/NET_RAW capabilities
 
-- **Pods ready?** `kubectl get pods -A` and `kubectl describe` to inspect events; check container logs.  
-- **No events at subscribers?** Confirm the DaemonSet pods have `K_SINK` (restart DS after changing SinkBinding):  
-  ```
-  kubectl exec -it $(kubectl get pod -l app=live-capture -o name | head -n1) -- printenv K_SINK
-  ```  
-- **Wrong BPF filter?** Switch to `ether proto 0x8947`.
-- **Accessing the cluster externally?** Use Kourier + default domain as in the guide; ensure **MetalLB** advertises a reachable IP for the Kourier Service.
+### 5. Verify events are flowing
 
----
+```bash
+# Deploy a logger
+kubectl apply -f edgeApplications/cam-logger-operator.yaml
 
-## Local Tips
+# Watch logs
+kubectl logs -f -l serving.knative.dev/service=cam-logger-operator -c user-container
+```
 
-- Running `kubectl` from your laptop? Copy the K3s kubeconfig and adjust the `server:` endpoint from `127.0.0.1` to your node IP.  
+### 6. (Optional) Enable CRIU container freezing
 
----
+```bash
+# Initialize submodules
+git submodule update --init --recursive
+
+# Deploy freeze daemon (see container-freezer-criu README)
+cd container-freezer && kubectl apply -f config/common/ && kubectl apply -f config/containerd/300-daemon-containerd.yaml
+
+# Deploy Kyverno policy
+kubectl apply -f kyverno/inject-restart-policy-never.yaml
+
+# Deploy custom queue-proxy (see knative-freezer-plugin README)
+cd knative-freezer-plugin && ./build.sh && ./patch.sh
+```
+
+### 7. (Optional) MQTT integration
+
+```bash
+kubectl apply -f brokers/mosquitto-broker.yaml
+kubectl apply -f knativeServices/forwarder/forwarder.yaml
+kubectl apply -f triggers/forward-all-trigger.yaml
+```
+
+## Testing with PCAP Replay
+
+If you don't have live ITS traffic, replay captured packets:
+
+```bash
+# Deploy a replayer pod on a node with hostNetwork
+kubectl apply -f helpers/pcap-replayer.yaml
+
+# If captures are 802.11+radiotap, normalize to Ethernet 0x8947 first
+python3 helpers/normalize_to_eth8947.py input.pcap output.pcap
+
+# Replay
+kubectl exec -it pcap-replayer -- tcpreplay --intf1=eth0 /tmp/output.pcap
+```
+
+## Benchmarking
+
+Latency benchmarks correlate sniffer and retransmitter NDJSON logs:
+
+```bash
+python3 benchmarks/analyze_bench.py
+```
+
+CRIU benchmark (cold start vs checkpoint/restore, 50 iterations):
+```bash
+cd container-freezer && ./benchmark-integration.sh 50
+```
+
+## Project Structure
+
+```
+operator/                  # EdgeApplication + Handoff operator (Kubebuilder)
+  api/v1alpha1/            #   CRD type definitions
+  internal/controller/     #   Reconciliation logic
+  config/                  #   Kustomize manifests (RBAC, CRD, manager)
+sniffer/                   # ITS packet capture implementations
+  python/                  #   PyShark-based (development)
+  atnog-capture/           #   Raw socket (production RSUs)
+  c_libpcap/               #   libpcap-based
+  c_tshark/                #   tshark pipe
+  it2s-packet-tools/       #   Full ITS stack processor
+knativeServices/           # Knative Service definitions
+  forwarder/               #   MQTT forwarder
+  retransmitter/           #   Event retransmitter (benchmarking)
+edgeApplications/          # EdgeApplication CR examples
+triggers/                  # Knative Trigger examples
+brokers/                   # Kafka + Mosquitto broker manifests
+configMaps/                # Operator + broker configuration
+sinkBinding/               # SinkBinding for DaemonSet → Broker
+handoffs/                  # EdgeApplicationHandoff CR examples
+helpers/                   # PCAP normalization, replay pods
+scripts/                   # Cluster setup scripts
+kyverno/                   # Kyverno policies (restartPolicy injection)
+benchmarks/                # Latency analysis scripts
+container-freezer/         # [submodule] CRIU checkpoint/restore daemon
+knative-freezer-plugin/    # [submodule] Queue-proxy freezer plugin
+```
+
+## Related Repositories
+
+- [container-freezer-criu](https://github.com/pmacoutinho/container-freezer-criu) — CRIU checkpoint/restore daemon for Knative containers
+- [knative-freezer-plugin](https://github.com/pmacoutinho/knative-freezer-plugin) — Queue-proxy plugin for automatic idle freeze/thaw
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0**
-
----
-
-## Acknowledgments
-
-This pipeline stands on **Knative**, **Strimzi/Kafka**, **PyShark/TShark**, and **CloudEvents SDK**; the docs and examples above trace the project’s evolution from a single Deployment to a cluster-wide DaemonSet, richer event attributes, and MQTT integrations.
+This project is licensed under the **GNU General Public License v3.0**.
