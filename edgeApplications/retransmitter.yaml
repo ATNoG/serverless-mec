@@ -16,9 +16,10 @@ spec:
   # --- Vendor-specific block ---
   service:
     nodeSelector:
-      rsu-b: "true"
+      worker-vm: "true"
     container:
       image: ghcr.io/pmacoutinho/retransmitter:latest
+      restartPolicy: Never
       env:
         - name: FORWARD_URL
           value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/kafka-broker"
