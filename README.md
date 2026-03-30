@@ -101,17 +101,15 @@ spec:
 
 ### ITS Packet Capture (`sniffer/`)
 
-Multiple sniffer implementations for capturing ETSI ITS packets:
+A C-based ITS packet sniffer and producer that processes all packet layers in sequence (GeoNetworking, BTP, CAM/DENM). Uses raw sockets for capture with no external dependencies (no tshark/pyshark needed), making it suitable for resource-constrained RSU nodes.
 
-| Implementation | Language | Method | Use Case |
-|---|---|---|---|
-| `python/` | Python (PyShark) | tshark + pyshark | Development, full protocol dissection |
-| `atnog-capture/` | C | Raw sockets | Production RSUs (no tshark dependency) |
-| `c_libpcap/` | C | libpcap | Alternative to raw sockets |
-| `c_tshark/` | C | tshark pipe | C performance with tshark parsing |
-| `it2s-packet-tools/` | C | Raw sockets | Full ITS stack processing (CAM, DENM, GeoNet) |
+Components:
+- **`its_sniffer`** — captures GeoNetworking frames (`ether proto 0x8947`) from the network interface, decodes the full ITS stack, and posts CloudEvents to the Knative Broker
+- **`its_producer`** — generates synthetic CAM/DENM packets for testing and benchmarking
+- **`cloudevent_sender`** — shared CloudEvent HTTP posting library
+- **`logger`** — shared logging utilities
 
-The sniffer runs as a DaemonSet with `hostNetwork: true` and `NET_ADMIN`/`NET_RAW` capabilities. It captures GeoNetworking frames (`ether proto 0x8947` or `udp/2001`), extracts ITS fields, and posts CloudEvents to a Kafka-backed Knative Broker via `K_SINK` (injected by SinkBinding).
+The sniffer runs as a DaemonSet with `hostNetwork: true` and `NET_ADMIN`/`NET_RAW` capabilities. Events are posted to a Kafka-backed Knative Broker via `K_SINK` (injected by SinkBinding).
 
 ### CRIU Container Freezing
 
@@ -213,9 +211,16 @@ kubectl apply -f knativeServices/forwarder/forwarder.yaml
 kubectl apply -f triggers/forward-all-trigger.yaml
 ```
 
-## Testing with PCAP Replay
+## Testing without Live ITS Traffic
 
-If you don't have live ITS traffic, replay captured packets:
+If you don't have live ITS traffic, you can generate synthetic packets using the **producer** included in the `sniffer/` folder. It runs natively on ARM64 RSU nodes and produces CAM/DENM packets directly on the network interface:
+
+```bash
+# Deploy the producer as an EdgeApplication
+kubectl apply -f edgeApplications/its-producer.yaml
+```
+
+Alternatively, replay captured PCAP files:
 
 ```bash
 # Deploy a replayer pod on a node with hostNetwork
@@ -248,12 +253,8 @@ operator/                  # EdgeApplication + Handoff operator (Kubebuilder)
   api/v1alpha1/            #   CRD type definitions
   internal/controller/     #   Reconciliation logic
   config/                  #   Kustomize manifests (RBAC, CRD, manager)
-sniffer/                   # ITS packet capture implementations
-  python/                  #   PyShark-based (development)
-  atnog-capture/           #   Raw socket (production RSUs)
-  c_libpcap/               #   libpcap-based
-  c_tshark/                #   tshark pipe
-  it2s-packet-tools/       #   Full ITS stack processor
+sniffer/                   # ITS packet sniffer and producer (C, raw sockets)
+  src/                     #   Source code (sniffer, producer, CloudEvent sender, logger)
 knativeServices/           # Knative Service definitions
   forwarder/               #   MQTT forwarder
   retransmitter/           #   Event retransmitter (benchmarking)
