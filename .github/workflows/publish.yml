@@ -25,18 +25,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: its-sniffer
-            context: ./sniffer
-            file: ./sniffer/Dockerfile.sniffer
-            image: ghcr.io/pmacoutinho/its-sniffer
-            platforms: linux/amd64,linux/arm64
-
-          - name: its-producer
-            context: ./sniffer
-            file: ./sniffer/Dockerfile.producer
-            image: ghcr.io/pmacoutinho/its-producer
-            platforms: linux/amd64,linux/arm64
-
           - name: retransmitter
             context: ./knativeServices/retransmitter
             file: ./knativeServices/retransmitter/Dockerfile
