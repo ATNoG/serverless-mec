@@ -25,10 +25,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: live-capture-rsock
-            context: ./sniffer/atnog-capture
-            file: ./sniffer/atnog-capture/Dockerfile
-            image: ghcr.io/pmacoutinho/live-capture-rsock
+          - name: its-sniffer
+            context: ./sniffer
+            file: ./sniffer/Dockerfile.sniffer
+            image: ghcr.io/pmacoutinho/its-sniffer
+            platforms: linux/amd64,linux/arm64
+
+          - name: its-producer
+            context: ./sniffer
+            file: ./sniffer/Dockerfile.producer
+            image: ghcr.io/pmacoutinho/its-producer
+            platforms: linux/amd64,linux/arm64
+
+          - name: retransmitter
+            context: ./knativeServices/retransmitter
+            file: ./knativeServices/retransmitter/Dockerfile
+            image: ghcr.io/pmacoutinho/retransmitter
             platforms: linux/amd64,linux/arm64
 
           - name: mqtt-forwarder
