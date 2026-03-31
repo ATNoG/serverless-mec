@@ -17,7 +17,7 @@ RUN apk add --no-cache \
 # Install Python dependencies
 RUN pip install --no-cache-dir \
     Flask \
-    cloudevents[http] \
+    "cloudevents[http]<2" \
     requests \
     gunicorn
 
