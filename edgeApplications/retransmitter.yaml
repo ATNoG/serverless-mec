@@ -22,7 +22,7 @@ spec:
       restartPolicy: Never
       env:
         - name: FORWARD_URL
-          value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/kafka-broker"
+          value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
         - name: HOP_NAME
           value: "edge-bench-1"
         - name: OUT_TYPE
