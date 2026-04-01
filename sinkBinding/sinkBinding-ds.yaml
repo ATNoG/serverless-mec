@@ -1,7 +1,7 @@
 apiVersion: sources.knative.dev/v1
 kind: SinkBinding
 metadata:
-  name: cam-sniffer-sink
+  name: edge-app-sink
   namespace: default
 spec:
   sink:
@@ -11,7 +11,9 @@ spec:
       name: default
       namespace: default
   subject:
-    apiVersion: apps/v1
-    kind: DaemonSet
-    name: live-capture
-    namespace: default
+    apiVersion: serving.knative.dev/v1
+    kind: Service
+    selector:
+      matchExpressions:
+        - key: mec.atnog.org/app
+          operator: Exists

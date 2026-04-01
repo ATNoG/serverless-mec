@@ -16,13 +16,12 @@ spec:
   # --- Vendor-specific block ---
   service:
     nodeSelector:
-      worker-vm: "true"
+      rsu-id: "rsu-b"
     container:
       image: ghcr.io/pmacoutinho/retransmitter:latest
-      restartPolicy: Never
       env:
         - name: FORWARD_URL
-          value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
+          value: "http://http-sink.default.svc.cluster.local"
         - name: HOP_NAME
           value: "edge-bench-1"
         - name: OUT_TYPE

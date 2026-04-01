@@ -13,6 +13,9 @@ spec:
   description: "Per-node ITS sniffer that emits CloudEvents"
 
   service:
+    nodeSelector:
+      rsu-id: "rsu-a"
+
     hostNetwork: true
     dnsPolicy: ClusterFirstWithHostNet
 
@@ -21,8 +24,6 @@ spec:
       image: ghcr.io/pmacoutinho/its-sniffer:latest
 
       env:
-        - name: K_SINK
-          value: "http://kafka-broker-ingress.knative-eventing.svc.cluster.local/default/default"
         - name: CE_INCLUDE_RAW_HEX
           value: "true"
         - name: SEND_QUEUE_MAX
@@ -44,7 +45,3 @@ spec:
 
     # No triggerFilters:
     # this is a background publisher, not an event subscriber.
-
-  autoReplicas:
-    - matchNodes:
-        road-rsu: "true"
