@@ -6,7 +6,7 @@ import logging
 
 import requests
 from flask import Flask, request, Response
-from cloudevents.http import from_http
+from cloudevents.v1.http import from_http
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("retransmitter")

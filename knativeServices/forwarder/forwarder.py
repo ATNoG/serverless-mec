@@ -3,7 +3,7 @@ import os, json, logging, socket
 from typing import Any, Dict
 
 from flask import Flask, request, jsonify
-from cloudevents.http import from_http
+from cloudevents.v1.http import from_http
 import paho.mqtt.client as mqtt
 
 # --------- Config (env) ----------
