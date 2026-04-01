@@ -13,7 +13,7 @@ spec:
         app: its-producer
     spec:
       nodeSelector:
-        rsu-b: "true"
+        rsu-id: "rsu-a"
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       terminationGracePeriodSeconds: 10
