@@ -2508,6 +2508,12 @@ spec:
                     description: dnsPolicy allows setting ClusterFirstWithHostNet
                       when hostNetwork=true.
                     type: string
+                  freezeEnabled:
+                    description: |-
+                      freezeEnabled enables the knative-freezer-plugin for this service.
+                      When true, the operator adds the qpoption.knative.dev/freezer-activate annotation
+                      and injects the HOST_IP environment variable via the Downward API.
+                    type: boolean
                   hostNetwork:
                     description: hostNetwork puts the pod into the host's network
                       namespace (needed for sniffing host interfaces).

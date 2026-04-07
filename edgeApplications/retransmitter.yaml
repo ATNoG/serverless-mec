@@ -15,6 +15,7 @@ spec:
   description: "App to retransmit packet"
   # --- Vendor-specific block ---
   service:
+    freezeEnabled: true
     nodeSelector:
       rsu-id: "rsu-b"
     container:

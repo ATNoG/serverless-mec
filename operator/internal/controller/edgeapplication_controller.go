@@ -68,6 +68,7 @@ type desiredService struct {
 	Namespace     string
 	PodSpec       corev1.PodSpec
 	MinScale      *int32
+	FreezeEnabled bool
 	CreateTrigger bool
 
 	TriggerNs      string
@@ -156,6 +157,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	baseMinScale := app.Spec.Service.MinScale
+	baseFreezeEnabled := app.Spec.Service.FreezeEnabled != nil && *app.Spec.Service.FreezeEnabled
 	baseFilters := app.Spec.Service.TriggerFilters
 
 	createTriggers := len(baseFilters) > 0
@@ -188,6 +190,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			Namespace:      app.Namespace,
 			PodSpec:        basePodSpec,
 			MinScale:       baseMinScale,
+			FreezeEnabled:  baseFreezeEnabled,
 			CreateTrigger:  createTriggers,
 			TriggerNs:      brokerNamespace,
 			TriggerBroker:  brokerName,
@@ -207,6 +210,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				Namespace:      app.Namespace,
 				PodSpec:        repPod,
 				MinScale:       baseMinScale,
+				FreezeEnabled:  baseFreezeEnabled,
 				CreateTrigger:  createTriggers,
 				TriggerNs:      brokerNamespace,
 				TriggerBroker:  brokerName,
@@ -247,6 +251,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					Namespace:      app.Namespace,
 					PodSpec:        repPod,
 					MinScale:       baseMinScale,
+					FreezeEnabled:  baseFreezeEnabled,
 					CreateTrigger:  createTriggers,
 					TriggerNs:      brokerNamespace,
 					TriggerBroker:  brokerName,
@@ -296,10 +301,28 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	templateMeta := metav1.ObjectMeta{
 		Labels: appLabel,
 	}
+	templateAnnotations := map[string]string{}
 	if d.MinScale != nil {
-		templateMeta.Annotations = map[string]string{
-			"autoscaling.knative.dev/minScale": strconv.FormatInt(int64(*d.MinScale), 10),
+		templateAnnotations["autoscaling.knative.dev/minScale"] = strconv.FormatInt(int64(*d.MinScale), 10)
+	}
+	if d.FreezeEnabled {
+		templateAnnotations["qpoption.knative.dev/freezer-activate"] = "enable"
+	}
+	if len(templateAnnotations) > 0 {
+		templateMeta.Annotations = templateAnnotations
+	}
+
+	// Inject HOST_IP env var via Downward API when freeze is enabled
+	if d.FreezeEnabled {
+		hostIPEnv := corev1.EnvVar{
+			Name: "HOST_IP",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "status.hostIP",
+				},
+			},
 		}
+		d.PodSpec.Containers[0].Env = append(d.PodSpec.Containers[0].Env, hostIPEnv)
 	}
 
 	desiredSvc := &servingv1.Service{
@@ -371,19 +394,22 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	}
 	updated.Spec.ConfigurationSpec.Template.Labels["mec.atnog.org/app"] = app.Name
 
+	if updated.Spec.ConfigurationSpec.Template.Annotations == nil {
+		updated.Spec.ConfigurationSpec.Template.Annotations = map[string]string{}
+	}
 	if d.MinScale != nil {
-		if updated.Spec.ConfigurationSpec.Template.Annotations == nil {
-			updated.Spec.ConfigurationSpec.Template.Annotations = map[string]string{}
-		}
 		updated.Spec.ConfigurationSpec.Template.Annotations["autoscaling.knative.dev/minScale"] =
 			strconv.FormatInt(int64(*d.MinScale), 10)
 	} else {
-		if updated.Spec.ConfigurationSpec.Template.Annotations != nil {
-			delete(updated.Spec.ConfigurationSpec.Template.Annotations, "autoscaling.knative.dev/minScale")
-			if len(updated.Spec.ConfigurationSpec.Template.Annotations) == 0 {
-				updated.Spec.ConfigurationSpec.Template.Annotations = nil
-			}
-		}
+		delete(updated.Spec.ConfigurationSpec.Template.Annotations, "autoscaling.knative.dev/minScale")
+	}
+	if d.FreezeEnabled {
+		updated.Spec.ConfigurationSpec.Template.Annotations["qpoption.knative.dev/freezer-activate"] = "enable"
+	} else {
+		delete(updated.Spec.ConfigurationSpec.Template.Annotations, "qpoption.knative.dev/freezer-activate")
+	}
+	if len(updated.Spec.ConfigurationSpec.Template.Annotations) == 0 {
+		updated.Spec.ConfigurationSpec.Template.Annotations = nil
 	}
 
 	if updated.Labels == nil {

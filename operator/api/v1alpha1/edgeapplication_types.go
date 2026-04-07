@@ -136,6 +136,12 @@ type KnativeServiceSpec struct {
 	// automountServiceAccountToken controls automounting SA token.
 	// +optional
 	AutomountServiceAccountToken *bool `json:"automountServiceAccountToken,omitempty"`
+
+	// freezeEnabled enables the knative-freezer-plugin for this service.
+	// When true, the operator adds the qpoption.knative.dev/freezer-activate annotation
+	// and injects the HOST_IP environment variable via the Downward API.
+	// +optional
+	FreezeEnabled *bool `json:"freezeEnabled,omitempty"`
 }
 
 // KnativeServiceReplicaSpec describes an additional Knative Service instance derived
