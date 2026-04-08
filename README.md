@@ -50,7 +50,7 @@ This project implements the application lifecycle management layer of an ETSI ME
 │  MEC Operator (runs in cluster)                                     │
 │                                                                     │
 │  EdgeApplication CR ──► Knative Service(s) + Trigger(s)            │
-│  AutoReplicas      ──► one KService per matching node              │
+│  Zones             ──► one KService per matching node              │
 │  Handoff CR        ──► migrate app instance between nodes          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -66,7 +66,7 @@ A Go operator (Kubebuilder) that reconciles `EdgeApplication` custom resources i
 - **Vendor-specific service block:** container image, env, resources, securityContext, volumes, nodeSelector, affinity, tolerations, hostNetwork
 - **`triggerFilters`:** list of CloudEvent attribute maps. Each entry creates a Knative Trigger pointing to the service
 - **`replicas`:** additional named instances on specific nodes
-- **`autoReplicas`:** daemon mode. Automatically creates one KService per node matching a label selector (e.g., `road-rsu: "true"`)
+- **`zones`:** daemon mode. Each zone is a node label selector (e.g., `road-rsu: "true"`); the operator creates one KService per node matching the zone's `matchNodes`
 
 **EdgeApplicationHandoff CRD:** manages migration of application instances between edge nodes.
 
@@ -94,9 +94,9 @@ spec:
     triggerFilters:
       - type: its.cam
       - type: its.denm
-    autoReplicas:
-      - matchNodes:
-          road-rsu: "true"
+  zones:
+    - matchNodes:
+        road-rsu: "true"
 ```
 
 ### ITS Packet Capture (`sniffer/`)
@@ -173,7 +173,7 @@ kubectl apply -f edgeApplications/its-sniffer.yaml
 ```
 
 The operator will create:
-- One Knative Service per matching node (autoReplicas mode)
+- One Knative Service per matching node (zones / daemon mode)
 - Knative Triggers for `its.cam` and `its.denm` events
 - Pods with hostNetwork and NET_ADMIN/NET_RAW capabilities
 
