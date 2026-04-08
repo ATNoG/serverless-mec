@@ -20,12 +20,19 @@
 #      a comparison report.
 #
 # Usage:
-#   ./bench_freeze_vs_coldstart.sh [ITERATIONS]
-# Default: 25 iterations per mode.
+#   ./bench_freeze_vs_coldstart.sh [ITERATIONS] [LABEL]
+#
+# Defaults: 25 iterations per mode, no label.
+# The output filename ALWAYS contains a timestamp, so re-running with the
+# same iteration count or label never overwrites a previous file. The
+# optional LABEL is added as a prefix purely for convenience, e.g.
+#   ./bench_freeze_vs_coldstart.sh 50 baseline
+# produces freeze_vs_coldstart_logs/freeze_vs_coldstart_baseline_<ts>.ndjson
 
 set -uo pipefail
 
 ITERATIONS="${1:-25}"
+LABEL="${2:-}"
 NAMESPACE="default"
 SERVICE_NAME="retransmitter"
 EA_NAME="retransmitter"
@@ -37,10 +44,15 @@ SERVICE_URL="http://retransmitter.default.svc.cluster.local"
 IDLE_TIMEOUT=30
 QUEUE_PROXY_PORT=8012
 
-OUTDIR="$(cd "$(dirname "$0")" && pwd)/benchlogs"
+OUTDIR="$(cd "$(dirname "$0")" && pwd)/freeze_vs_coldstart_logs"
 mkdir -p "$OUTDIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTFILE="$OUTDIR/freeze_vs_coldstart_${TIMESTAMP}.ndjson"
+if [[ -n "$LABEL" ]]; then
+    LABEL_CLEAN="$(printf '%s' "$LABEL" | tr -c 'A-Za-z0-9._-' '-')"
+    OUTFILE="$OUTDIR/freeze_vs_coldstart_${LABEL_CLEAN}_${TIMESTAMP}.ndjson"
+else
+    OUTFILE="$OUTDIR/freeze_vs_coldstart_${TIMESTAMP}.ndjson"
+fi
 
 SNIFFER_BACKUP=""
 EA_BACKUP=""
