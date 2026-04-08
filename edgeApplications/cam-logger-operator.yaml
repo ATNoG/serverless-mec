@@ -23,6 +23,6 @@ spec:
     triggerFilters:
       - type: its.cam
       - type: its.denm
-  autoReplicas:
+  zones:
     - matchNodes:
         rsu-a: "true"

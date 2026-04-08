@@ -65,6 +65,6 @@ spec:
 
     # triggerFilters omitted on purpose: no Trigger should be created.
 
-  autoReplicas:
+  zones:
     - matchNodes:
         snifftest: "true"

@@ -44,28 +44,6 @@ spec:
           spec:
             description: spec defines the desired state of EdgeApplication
             properties:
-              autoReplicas:
-                description: |-
-                  autoReplicas creates one KService per node that matches each rule's matchNodes.
-                  If autoReplicas is set (non-empty), the controller runs in daemon mode (no base + no replicas).
-                items:
-                  description: 'AutoReplicaRule defines an auto-fanout rule: one KService
-                    per matching node.'
-                  properties:
-                    matchNodes:
-                      additionalProperties:
-                        type: string
-                      description: |-
-                        matchNodes selects the nodes that should receive a replica service.
-                        Example:
-                          matchNodes:
-                            road-rsu: "true"
-                      minProperties: 1
-                      type: object
-                  required:
-                  - matchNodes
-                  type: object
-                type: array
               dId:
                 description: dId is the identifier of the edge application descriptor
                   (dId).
@@ -104,7 +82,7 @@ spec:
               replicas:
                 description: |-
                   replicas optionally defines extra Knative services derived from spec.service
-                  while keeping the base service running (only when autoReplicas is NOT set).
+                  while keeping the base service running (only when zones is NOT set).
                 items:
                   description: |-
                     KnativeServiceReplicaSpec describes an additional Knative Service instance derived
@@ -2521,7 +2499,7 @@ spec:
                   minScale:
                     description: |-
                       minScale sets autoscaling.knative.dev/minScale.
-                      Applies to base service, replicas, and autoReplicas services.
+                      Applies to base service, replicas, and zones services.
                     format: int32
                     type: integer
                   nodeSelector:
@@ -4757,6 +4735,33 @@ spec:
                       type: string
                   required:
                   - name
+                  type: object
+                type: array
+              zones:
+                description: |-
+                  zones creates one KService per node that matches each zone's matchNodes.
+                  If zones is set (non-empty), the controller runs in daemon mode
+                  (no base service + no replicas).
+                items:
+                  description: |-
+                    Zone defines an auto-fanout rule: one KService per node matching matchNodes.
+                    Each "zone" represents a logical grouping of nodes (e.g. all RSUs along a
+                    road segment) where the EdgeApplication should run, with one instance per
+                    matching node.
+                  properties:
+                    matchNodes:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        matchNodes selects the nodes that should receive a service instance
+                        for this zone.
+                        Example:
+                          matchNodes:
+                            road-rsu: "true"
+                      minProperties: 1
+                      type: object
+                  required:
+                  - matchNodes
                   type: object
                 type: array
             required:

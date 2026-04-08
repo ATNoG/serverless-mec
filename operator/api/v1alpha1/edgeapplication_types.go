@@ -83,7 +83,7 @@ type KnativeServiceSpec struct {
 	Container KnativeContainerSpec `json:"container"`
 
 	// minScale sets autoscaling.knative.dev/minScale.
-	// Applies to base service, replicas, and autoReplicas services.
+	// Applies to base service, replicas, and zones services.
 	// +optional
 	MinScale *int32 `json:"minScale,omitempty"`
 
@@ -165,9 +165,13 @@ type KnativeServiceReplicaSpec struct {
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 }
 
-// AutoReplicaRule defines an auto-fanout rule: one KService per matching node.
-type AutoReplicaRule struct {
-	// matchNodes selects the nodes that should receive a replica service.
+// Zone defines an auto-fanout rule: one KService per node matching matchNodes.
+// Each "zone" represents a logical grouping of nodes (e.g. all RSUs along a
+// road segment) where the EdgeApplication should run, with one instance per
+// matching node.
+type Zone struct {
+	// matchNodes selects the nodes that should receive a service instance
+	// for this zone.
 	// Example:
 	//   matchNodes:
 	//     road-rsu: "true"
@@ -227,14 +231,15 @@ type EdgeApplicationSpec struct {
 	Service *KnativeServiceSpec `json:"service,omitempty"`
 
 	// replicas optionally defines extra Knative services derived from spec.service
-	// while keeping the base service running (only when autoReplicas is NOT set).
+	// while keeping the base service running (only when zones is NOT set).
 	// +optional
 	Replicas []KnativeServiceReplicaSpec `json:"replicas,omitempty"`
 
-	// autoReplicas creates one KService per node that matches each rule's matchNodes.
-	// If autoReplicas is set (non-empty), the controller runs in daemon mode (no base + no replicas).
+	// zones creates one KService per node that matches each zone's matchNodes.
+	// If zones is set (non-empty), the controller runs in daemon mode
+	// (no base service + no replicas).
 	// +optional
-	AutoReplicas []AutoReplicaRule `json:"autoReplicas,omitempty"`
+	Zones []Zone `json:"zones,omitempty"`
 }
 
 // EdgeApplicationStatus defines the observed state of EdgeApplication.
