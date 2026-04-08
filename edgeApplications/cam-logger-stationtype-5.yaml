@@ -1,0 +1,34 @@
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
+metadata:
+  name: cam-logger-stationtype-5
+  namespace: default
+spec:
+  # --- ETSI bits ---
+  dId: "cam-logger-stationtype-5-appd-v1"
+  name: "cam-logger-stationtype-5"
+  provider: "example.mec"
+  softVersion: "1.0.0"
+  dVersion: "1.0.0"
+  infoName: "CAM Event Logger (stationType=5)"
+  description: "Logs CAM CloudEvents whose stationType attribute equals 5."
+  # --- Vendor-specific block ---
+  service:
+    nodeSelector:
+      zone: "test-road"
+    container:
+      image: gcr.io/knative-releases/knative.dev/eventing/cmd/event_display
+      env:
+        - name: LOG_FORMAT
+          value: "pretty"
+    # A single trigger-filter map AND-matches all keys, so this creates ONE
+    # Knative Trigger that fires only on its.cam events with stationtype=5.
+    # The sniffer emits stationtype as a top-level CloudEvent attribute
+    # (extension), so Knative's broker filter can match it directly.
+    # Note: CloudEvent attribute values are always strings — even though
+    # ITS stationType is numeric, it must be quoted here.
+    triggerFilters:
+      - type: its.denm
+        stationtype: "5"
+      - type: its.cam
+        stationtype: "5"
