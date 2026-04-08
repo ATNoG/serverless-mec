@@ -176,10 +176,10 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	desired := make(map[string]desiredService)
 
-	daemonMode := len(app.Spec.AutoReplicas) > 0
+	daemonMode := len(app.Spec.Zones) > 0
 	if daemonMode {
-		logger.Info("autoReplicas enabled: daemon mode (no base service, no spec.replicas)",
-			"rules", len(app.Spec.AutoReplicas))
+		logger.Info("zones set: daemon mode (no base service, no spec.replicas)",
+			"zones", len(app.Spec.Zones))
 	}
 
 	// Normal mode: create base service + explicit replicas
@@ -219,17 +219,17 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Daemon mode: one KService per matching node
+	// Daemon mode: one KService per matching node, per zone
 	if daemonMode {
-		for _, ar := range app.Spec.AutoReplicas {
+		for _, zone := range app.Spec.Zones {
 			var nodeList corev1.NodeList
-			if err := r.List(ctx, &nodeList, client.MatchingLabels(ar.MatchNodes)); err != nil {
-				logger.Error(err, "autoReplicas: failed to list nodes", "matchNodes", ar.MatchNodes)
+			if err := r.List(ctx, &nodeList, client.MatchingLabels(zone.MatchNodes)); err != nil {
+				logger.Error(err, "zones: failed to list nodes", "matchNodes", zone.MatchNodes)
 				return ctrl.Result{}, err
 			}
 
-			logger.Info("autoReplicas: matched nodes",
-				"matchNodes", ar.MatchNodes,
+			logger.Info("zones: matched nodes",
+				"matchNodes", zone.MatchNodes,
 				"count", len(nodeList.Items),
 			)
 
@@ -301,9 +301,24 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	templateMeta := metav1.ObjectMeta{
 		Labels: appLabel,
 	}
+	// When freeze is enabled, CRIU replaces scale-to-zero as the idle
+	// reclamation mechanism: the pod must stay alive (queue-proxy +
+	// fake listener) so that incoming events can trigger a thaw. Knative's
+	// autoscaler decides scale-to-zero from queue-proxy request metrics,
+	// which the fake listener does not produce, so without minScale>=1
+	// the pod is torn down before any event can reach the plugin.
+	// Force minScale>=1 in this case, regardless of what the user set.
+	effectiveMinScale := d.MinScale
+	if d.FreezeEnabled {
+		one := int32(1)
+		if effectiveMinScale == nil || *effectiveMinScale < 1 {
+			effectiveMinScale = &one
+		}
+	}
+
 	templateAnnotations := map[string]string{}
-	if d.MinScale != nil {
-		templateAnnotations["autoscaling.knative.dev/minScale"] = strconv.FormatInt(int64(*d.MinScale), 10)
+	if effectiveMinScale != nil {
+		templateAnnotations["autoscaling.knative.dev/minScale"] = strconv.FormatInt(int64(*effectiveMinScale), 10)
 	}
 	if d.FreezeEnabled {
 		templateAnnotations["qpoption.knative.dev/freezer-activate"] = "enable"
@@ -397,9 +412,9 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	if updated.Spec.ConfigurationSpec.Template.Annotations == nil {
 		updated.Spec.ConfigurationSpec.Template.Annotations = map[string]string{}
 	}
-	if d.MinScale != nil {
+	if effectiveMinScale != nil {
 		updated.Spec.ConfigurationSpec.Template.Annotations["autoscaling.knative.dev/minScale"] =
-			strconv.FormatInt(int64(*d.MinScale), 10)
+			strconv.FormatInt(int64(*effectiveMinScale), 10)
 	} else {
 		delete(updated.Spec.ConfigurationSpec.Template.Annotations, "autoscaling.knative.dev/minScale")
 	}
@@ -672,7 +687,7 @@ func min(a, b int) int {
 }
 
 // When a Node is added/removed or its labels change, requeue all EdgeApplications
-// that are in daemon mode (have spec.autoReplicas set).
+// that are in daemon mode (have spec.zones set).
 func (r *EdgeApplicationReconciler) nodeToDaemonEdgeApps(ctx context.Context, obj client.Object) []reconcile.Request {
 	if _, ok := obj.(*corev1.Node); !ok {
 		return nil
@@ -689,7 +704,7 @@ func (r *EdgeApplicationReconciler) nodeToDaemonEdgeApps(ctx context.Context, ob
 		if a.Spec.Service == nil {
 			continue
 		}
-		if len(a.Spec.AutoReplicas) == 0 {
+		if len(a.Spec.Zones) == 0 {
 			continue
 		}
 		reqs = append(reqs, reconcile.Request{
