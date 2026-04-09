@@ -70,12 +70,13 @@ else
     COMBINED="$OUTDIR/pipeline_${RUN_ID}.ndjson"
 fi
 
-echo "[capture] run_id=$RUN_ID"
-echo "[capture] output : $COMBINED"
+log() { echo "[$(date +%H:%M:%S)] $*"; }
+log "run_id=$RUN_ID"
+log "output : $COMBINED"
 if [[ "$COUNT" -gt 0 ]]; then
-    echo "[capture] limit  : $COUNT bench rows per stream (Ctrl+C to stop early)"
+    log "limit  : $COUNT bench rows per stream (Ctrl+C to stop early)"
 else
-    echo "[capture] limit  : unlimited (press Ctrl+C to stop and analyze)"
+    log "limit  : unlimited (press Ctrl+C to stop and analyze)"
 fi
 echo
 
@@ -83,8 +84,12 @@ TAGGER="$(mktemp -t pipeline_tagger.XXXXXX.py)"
 trap 'rm -f "$TAGGER"' EXIT
 
 cat > "$TAGGER" <<'PY'
-import sys, json, time
+import sys, json, time, datetime, os
 run_id, src, out, limit_s = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+def log_stderr(msg):
+    """Atomic write to stderr so concurrent processes don't interleave lines."""
+    os.write(2, (msg + "\n").encode())
 limit = int(limit_s)
 
 # Print a progress line every PROGRESS_EVERY rows AND at least every
@@ -105,11 +110,12 @@ def emit(force=False):
     now = time.monotonic()
     if not force and (now - last_emit) < PROGRESS_INTERVAL_S and n % PROGRESS_EVERY != 0:
         return
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
     if limit > 0:
-        msg = f"[capture] {tag}: {n:>6d} / {limit} rows"
+        msg = f"[{ts}] {tag}: {n:>6d} / {limit} rows"
     else:
-        msg = f"[capture] {tag}: {n:>6d} rows"
-    print(msg, file=sys.stderr, flush=True)
+        msg = f"[{ts}] {tag}: {n:>6d} rows"
+    log_stderr(msg)
     last_emit = now
 
 with open(out, "a", buffering=1) as f:
@@ -139,18 +145,18 @@ with open(out, "a", buffering=1) as f:
         emit()
         if limit > 0 and n >= limit:
             emit(force=True)
-            print(f"[capture] {tag}: limit reached, exiting", file=sys.stderr, flush=True)
+            log_stderr(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {tag}: limit reached, exiting")
             break
 
 # Final count if loop ended without hitting the limit (e.g. SIGPIPE).
 emit(force=True)
 PY
 
-kubectl logs -f -n "$NAMESPACE" -l "$SNIFFER_LABEL" -c user-container 2>/dev/null \
+kubectl logs -f --tail=0 -n "$NAMESPACE" -l "$SNIFFER_LABEL" -c user-container 2>/dev/null \
     | python3 -u "$TAGGER" "$RUN_ID" sniffer "$COMBINED" "$COUNT" &
 JOB_SNIFF=$!
 
-kubectl logs -f -n "$NAMESPACE" -l "$RETRANS_LABEL" -c user-container 2>/dev/null \
+kubectl logs -f --tail=0 -n "$NAMESPACE" -l "$RETRANS_LABEL" -c user-container 2>/dev/null \
     | python3 -u "$TAGGER" "$RUN_ID" retransmitter "$COMBINED" "$COUNT" &
 JOB_RETRANS=$!
 
@@ -159,16 +165,16 @@ cleanup() {
     [[ $stopped -eq 1 ]] && return
     stopped=1
     echo
-    echo "[capture] stopping streams..."
+    log "stopping streams..."
     kill -- "-$JOB_SNIFF" "-$JOB_RETRANS" 2>/dev/null
     wait 2>/dev/null
     n=$(wc -l < "$COMBINED" 2>/dev/null || echo 0)
-    echo "[capture] captured $n bench rows total (this file)"
+    log "captured $n bench rows total (this file)"
     echo
     if [[ -s "$COMBINED" ]]; then
         python3 "$SCRIPT_DIR/analyze_pipeline_bench.py" --run-id "$RUN_ID" "$COMBINED"
     else
-        echo "[capture] no rows captured — skipping analysis"
+        log "no rows captured — skipping analysis"
     fi
 }
 trap cleanup INT TERM
