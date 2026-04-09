@@ -4,19 +4,30 @@
 # Self-contained benchmark of CRIU thaw vs Knative cold-start latency.
 #
 # This script handles every prerequisite automatically:
-#   1. Saves and later restores the its-sniffer EdgeApplication (if present)
-#      — its events would otherwise keep the retransmitter warm and
-#      prevent scale-to-zero.
-#   2. Saves and restores the retransmitter EdgeApplication's
-#      freezeEnabled / minScale / nodeSelector so the benchmark can:
-#        a) target a cgroup-v2 worker (required for CRIU), and
-#        b) toggle freezeEnabled between phases.
+#   1. Saves and later restores the retransmitter EdgeApplication so any
+#      mutation made by the benchmark (nodeSelector, freezeEnabled,
+#      triggerFilters) is rolled back on exit.
+#   2. In preflight, SAVES and then DIRECTLY DELETES the retransmitter's
+#      Knative Triggers (and clears triggerFilters on the EA so the
+#      operator does not try to recreate them). With no triggers, the
+#      kafka broker can't dispatch buffered events to the retransmitter,
+#      so the pod actually goes idle and the freezer plugin can
+#      checkpoint it. The sniffer is left running — only the
+#      retransmitter is isolated from the event stream during the
+#      benchmark. We delete the triggers directly because the mec
+#      operator only *creates* triggers from triggerFilters; it does
+#      not reconcile them away when triggerFilters becomes empty, so
+#      patching the EA alone is not sufficient. On cleanup the saved
+#      trigger YAML is re-applied verbatim, restoring the cluster.
 #   3. Spawns an in-cluster curl pod so events can reach both the pod
 #      IP (for the CRIU thaw, which bypasses routing) and the ksvc URL
 #      (for the cold start).
-#   4. Runs ITERATIONS CRIU thaw measurements, then ITERATIONS cold
+#   4. Detects freeze by tailing the queue-proxy log and waiting for the
+#      freezer plugin's "fake listener started" line — no fixed timeout,
+#      so the script tolerates any backlog drain time.
+#   5. Runs ITERATIONS CRIU thaw measurements, then ITERATIONS cold
 #      start measurements, writing NDJSON rows to OUTFILE.
-#   5. Analyzes the results inline (python3 — stdlib only) and prints
+#   6. Analyzes the results inline (python3 — stdlib only) and prints
 #      a comparison report.
 #
 # Usage:
@@ -36,13 +47,15 @@ LABEL="${2:-}"
 NAMESPACE="default"
 SERVICE_NAME="retransmitter"
 EA_NAME="retransmitter"
-SNIFFER_NAME="its-sniffer"
 # cgroup-v2 worker where CRIU checkpoint is supported
 BENCH_NODE_SELECTOR_KEY="vm-id"
 BENCH_NODE_SELECTOR_VAL="worker-1"
 SERVICE_URL="http://retransmitter.default.svc.cluster.local"
-IDLE_TIMEOUT=30
 QUEUE_PROXY_PORT=8012
+# Hard ceiling on how long we wait for the freezer plugin to checkpoint
+# the pod. The actual signal we wait for is the "fake listener started"
+# log line on the queue-proxy; this is just a safety net.
+FREEZE_WAIT_TIMEOUT=300
 
 OUTDIR="$(cd "$(dirname "$0")" && pwd)/freeze_vs_coldstart_logs"
 mkdir -p "$OUTDIR"
@@ -54,64 +67,84 @@ else
     OUTFILE="$OUTDIR/freeze_vs_coldstart_${TIMESTAMP}.ndjson"
 fi
 
-SNIFFER_BACKUP=""
 EA_BACKUP=""
+TRIGGERS_BACKUP=""
 
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
+
+# Strip mutable/server-side fields that make `kubectl apply` reject a
+# round-tripped object. Reads YAML on stdin, writes cleaned YAML on stdout.
+strip_server_fields() {
+    python3 -c "
+import sys, yaml
+docs = list(yaml.safe_load_all(sys.stdin))
+def clean(d):
+    if not isinstance(d, dict):
+        return d
+    d.pop('status', None)
+    m = d.get('metadata') or {}
+    for k in ('resourceVersion','uid','generation','creationTimestamp','managedFields'):
+        m.pop(k, None)
+    return d
+out = []
+for d in docs:
+    if isinstance(d, dict) and d.get('kind') == 'List':
+        items = d.get('items') or []
+        for it in items:
+            out.append(clean(it))
+    elif d is not None:
+        out.append(clean(d))
+print(yaml.safe_dump_all(out))
+"
+}
 
 # ---- state save/restore ------------------------------------------------------
 
 save_state() {
     log "Saving current state..."
-    if kubectl get edgeapplication "$SNIFFER_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
-        SNIFFER_BACKUP=$(kubectl get edgeapplication "$SNIFFER_NAME" -n "$NAMESPACE" -o yaml 2>/dev/null)
-        log "  Saved $SNIFFER_NAME EdgeApplication."
-    fi
     EA_BACKUP=$(kubectl get edgeapplication "$EA_NAME" -n "$NAMESPACE" -o yaml 2>/dev/null || echo "")
-    if [[ -n "$EA_BACKUP" ]]; then
-        log "  Saved $EA_NAME EdgeApplication."
-    else
+    if [[ -z "$EA_BACKUP" ]]; then
         log "  ERROR: $EA_NAME EdgeApplication not found."
         exit 1
     fi
+    log "  Saved $EA_NAME EdgeApplication."
+
+    # Save the Knative Triggers belonging to this EA. We delete these
+    # in preflight (clearing triggerFilters alone is not enough — the
+    # operator does not reconcile triggers away) and re-apply them
+    # verbatim in restore_state.
+    TRIGGERS_BACKUP=$(kubectl get triggers -n "$NAMESPACE" \
+        -l "mec.atnog.org/app=$EA_NAME" -o yaml 2>/dev/null || echo "")
+    local n
+    n=$(printf '%s' "$TRIGGERS_BACKUP" | grep -c '^- apiVersion:' || true)
+    log "  Saved $n trigger(s) for $EA_NAME."
 }
 
 restore_state() {
     log "Restoring original state..."
     if [[ -n "$EA_BACKUP" ]]; then
-        # Strip status/resourceVersion so apply replays cleanly
-        echo "$EA_BACKUP" | python3 -c "
-import sys, yaml
-d = yaml.safe_load(sys.stdin)
-d.pop('status', None)
-d.get('metadata', {}).pop('resourceVersion', None)
-d.get('metadata', {}).pop('uid', None)
-d.get('metadata', {}).pop('generation', None)
-d.get('metadata', {}).pop('creationTimestamp', None)
-print(yaml.safe_dump(d))
-" 2>/dev/null | kubectl apply -f - >/dev/null 2>&1 || \
-            log "  WARNING: failed to restore $EA_NAME"
+        echo "$EA_BACKUP" | strip_server_fields 2>/dev/null \
+            | kubectl apply -f - >/dev/null 2>&1 \
+            || log "  WARNING: failed to restore $EA_NAME"
         log "  Restored $EA_NAME EdgeApplication."
     fi
-    if [[ -n "$SNIFFER_BACKUP" ]]; then
-        echo "$SNIFFER_BACKUP" | python3 -c "
-import sys, yaml
-d = yaml.safe_load(sys.stdin)
-d.pop('status', None)
-d.get('metadata', {}).pop('resourceVersion', None)
-d.get('metadata', {}).pop('uid', None)
-d.get('metadata', {}).pop('generation', None)
-d.get('metadata', {}).pop('creationTimestamp', None)
-print(yaml.safe_dump(d))
-" 2>/dev/null | kubectl apply -f - >/dev/null 2>&1 || \
-            log "  WARNING: failed to restore $SNIFFER_NAME"
-        log "  Restored $SNIFFER_NAME EdgeApplication."
+
+    # Re-apply the saved triggers. The operator will not recreate them
+    # from triggerFilters, so we have to put them back ourselves. The
+    # ownerReferences in the saved YAML still point at the EA's UID,
+    # which has not changed (we patched, not recreated, the EA).
+    if [[ -n "$TRIGGERS_BACKUP" ]] && printf '%s' "$TRIGGERS_BACKUP" | grep -q 'apiVersion:'; then
+        echo "$TRIGGERS_BACKUP" | strip_server_fields 2>/dev/null \
+            | kubectl apply -f - >/dev/null 2>&1 \
+            || log "  WARNING: failed to restore triggers"
+        log "  Restored Knative Triggers for $EA_NAME."
     fi
 }
 
 cleanup() {
     log "Cleanup..."
     kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
     restore_state
 }
 trap cleanup EXIT
@@ -119,14 +152,33 @@ trap cleanup EXIT
 # ---- curl pod ---------------------------------------------------------------
 
 setup_curl_pod() {
-    kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    sleep 2
-    # 6h lifetime is plenty for even 100 iterations of both phases
-    kubectl run bench-curl -n "$NAMESPACE" --image=curlimages/curl \
-        --restart=Never --command -- sleep 21600 >/dev/null 2>&1
-    log "Waiting for bench-curl pod..."
-    kubectl wait --for=condition=Ready pod/bench-curl -n "$NAMESPACE" --timeout=60s >/dev/null 2>&1
-    log "bench-curl pod ready."
+    # Kyverno's admission webhook on this cluster restarts every ~15min with
+    # failurePolicy: Fail, creating ~30s windows where resource creation is
+    # rejected. Retry up to 5 times with 20s backoff to outlast the window.
+    local attempt max_attempts=5
+    for (( attempt=1; attempt<=max_attempts; attempt++ )); do
+        kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
+        # 6h lifetime is plenty for even 100 iterations of both phases
+        if ! kubectl run bench-curl -n "$NAMESPACE" --image=curlimages/curl \
+            --restart=Never --command -- sleep 21600 >/dev/null 2>&1; then
+            log "  bench-curl create failed (attempt $attempt/$max_attempts), retrying in 20s..."
+            sleep 20
+            continue
+        fi
+        log "Waiting for bench-curl pod..."
+        if kubectl wait --for=condition=Ready pod/bench-curl -n "$NAMESPACE" --timeout=60s >/dev/null 2>&1; then
+            local started
+            started=$(kubectl get pod bench-curl -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].state.running.startedAt}' 2>/dev/null)
+            if [[ -n "$started" ]]; then
+                log "bench-curl pod ready."
+                return 0
+            fi
+        fi
+        log "  bench-curl did not become ready (attempt $attempt/$max_attempts), retrying in 20s..."
+        sleep 20
+    done
+    log "ERROR: bench-curl pod failed to start after $max_attempts attempts"
+    exit 1
 }
 
 send_event_internal() {
@@ -192,30 +244,93 @@ wait_for_pod_ready() {
 }
 
 wait_for_freeze() {
+    # Stream the queue-proxy log from "now" and exit on the first
+    # "fake listener started" line, which the freezer plugin emits as
+    # soon as CRIU checkpoint succeeds and the fake listener takes over
+    # the user-container's port. This is the only signal we need.
+    #
+    # Alongside the log stream we run a periodic diagnostic loop that
+    # reports, every 30s:
+    #   - how many Knative Triggers currently point at this EA (should
+    #     be 0 — if it is not, the operator is recreating them and the
+    #     benchmark is not isolating the pod properly);
+    #   - how many bench events the user-container logged in the last
+    #     30s (non-zero means the pod is still receiving traffic, which
+    #     keeps resetting the freezer plugin's idle timer).
+    # This makes a stalled freeze diagnosable without extra tooling.
     local pod="$1"
-    local wait_time=$((IDLE_TIMEOUT + 20))
-    log "  Waiting up to ${wait_time}s for freeze..."
-    local deadline=$((SECONDS + wait_time))
-    while (( SECONDS < deadline )); do
-        local seen
-        seen=$(kubectl logs "$pod" -n "$NAMESPACE" -c queue-proxy --tail=5 2>/dev/null \
-            | grep -c 'fake listener started' || echo 0)
-        seen=$(echo "$seen" | head -1)
-        if [[ "$seen" -gt 0 ]] 2>/dev/null; then
-            # Make sure we haven't already thawed
-            local thawed
-            thawed=$(kubectl logs "$pod" -n "$NAMESPACE" -c queue-proxy --tail=3 2>/dev/null \
-                | grep -c 'thawing' || echo 0)
-            thawed=$(echo "$thawed" | head -1)
-            if [[ "$thawed" -eq 0 ]] 2>/dev/null; then
-                log "  Container frozen."
-                return 0
-            fi
+    log "  Waiting for freezer plugin to checkpoint pod (watching queue-proxy log)..."
+
+    # The watcher writes a single sentinel line to a tempfile when
+    # "fake listener started" is observed. We can't rely on subshell
+    # exit codes because `kubectl logs -f | grep -m1` trips pipefail
+    # (grep exits 0, but kubectl gets SIGPIPE and returns 141), so we
+    # use file existence as the success signal instead.
+    local sentinel
+    sentinel=$(mktemp -t freeze_sentinel.XXXXXX)
+    rm -f "$sentinel"
+
+    # Stream the queue-proxy log to a debug file alongside OUTFILE. We then
+    # poll that file for "fake listener started" in the wait loop below.
+    # Polling the file (instead of piping `kubectl logs -f` through
+    # `grep -m1`) avoids a subtle bug: tee/grep in a pipe block-buffers
+    # stdout on most systems, which delays the match by minutes in a
+    # low-volume log stream and makes freeze look like it never happened.
+    # `--since=1s` is critical so we don't replay stale "fake listener
+    # started" lines from a previous freeze cycle on the same pod.
+    local debug_log="${OUTFILE%.ndjson}.qproxy_${pod}.log"
+    : > "$debug_log"
+    kubectl logs -f "$pod" -n "$NAMESPACE" -c queue-proxy --since=1s \
+        >"$debug_log" 2>/dev/null &
+    local watcher_pid=$!
+    log "  Queue-proxy log saved to $(basename "$debug_log")"
+
+    local start_epoch
+    start_epoch=$(date +%s)
+    local last_diag_epoch=$start_epoch
+    while :; do
+        if grep -q -F 'fake listener started' "$debug_log" 2>/dev/null; then
+            kill "$watcher_pid" 2>/dev/null
+            wait "$watcher_pid" 2>/dev/null
+            rm -f "$sentinel"
+            log "  Container frozen (fake listener active)."
+            return 0
         fi
+        if ! kill -0 "$watcher_pid" 2>/dev/null; then
+            # Watcher died without producing the sentinel — pod/log
+            # stream went away before the freeze happened.
+            wait "$watcher_pid" 2>/dev/null
+            rm -f "$sentinel"
+            log "  WARNING: log watcher exited before freeze (pod may have died)"
+            return 1
+        fi
+
+        local now elapsed
+        now=$(date +%s)
+        elapsed=$((now - start_epoch))
+
+        if (( elapsed >= FREEZE_WAIT_TIMEOUT )); then
+            log "  WARNING: freezer plugin did not checkpoint within ${FREEZE_WAIT_TIMEOUT}s"
+            kill "$watcher_pid" 2>/dev/null
+            wait "$watcher_pid" 2>/dev/null
+            rm -f "$sentinel"
+            return 1
+        fi
+
+        if (( now - last_diag_epoch >= 30 )); then
+            local trig_count bench_count
+            trig_count=$(kubectl get triggers -n "$NAMESPACE" \
+                -l "mec.atnog.org/app=$EA_NAME" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+            bench_count=$(kubectl logs "$pod" -n "$NAMESPACE" \
+                -c user-container --since=30s --tail=-1 2>/dev/null \
+                | grep -c '"kind":"bench"')
+            [[ -z "$bench_count" ]] && bench_count=0
+            log "  [+${elapsed}s] triggers=${trig_count}  bench_events_last_30s=${bench_count}"
+            last_diag_epoch=$now
+        fi
+
         sleep 2
     done
-    log "  WARNING: freeze not confirmed"
-    return 1
 }
 
 wait_for_scale_to_zero() {
@@ -243,6 +358,48 @@ delete_retransmitter_pod() {
         kubectl delete pod "$pod" -n "$NAMESPACE" --grace-period=1 >/dev/null 2>&1 || true
         sleep 2
     fi
+}
+
+ensure_restart_policy_kyverno() {
+    # Knative's field mask strips the per-container restartPolicy field, so we
+    # can't set it via the ksvc or a direct deployment patch (Knative's
+    # controller reverts it). A kyverno MutatingAdmissionWebhook re-injects
+    # restartPolicy: Never on every Deployment CREATE/UPDATE, which survives
+    # Knative reconciliation.
+    #
+    # The script applies the policy itself so it does not depend on the policy
+    # being pre-installed — only on kyverno being present in the cluster.
+    if kubectl get clusterpolicy bench-restart-policy-never >/dev/null 2>&1; then
+        return 0  # already exists from a previous run or manual apply
+    fi
+    log "  Applying kyverno policy: inject restartPolicy=Never on user-container"
+    kubectl apply -f - >/dev/null 2>&1 <<'POLICY'
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: bench-restart-policy-never
+  labels:
+    app.kubernetes.io/managed-by: bench-freeze-vs-coldstart
+spec:
+  rules:
+    - name: set-restart-policy-never
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+              selector:
+                matchLabels:
+                  serving.knative.dev/service: "*"
+      mutate:
+        patchStrategicMerge:
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: user-container
+                    restartPolicy: Never
+POLICY
 }
 
 # ---- result emission --------------------------------------------------------
@@ -274,8 +431,29 @@ wait_for_freezer_annotation() {
     return 1
 }
 
+check_operator_healthy() {
+    # The mec operator must be running for any of our EA patches to take
+    # effect (freezer annotation propagation, ksvc recreation, etc.).
+    # Fail fast if it isn't, so we don't waste 5 minutes waiting for a
+    # freeze that will never happen.
+    local status
+    status=$(kubectl get pods -n operator-system \
+        -l control-plane=controller-manager \
+        -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null)
+    if [[ "$status" != "true" ]]; then
+        log "  ERROR: mec operator pod is not Ready in operator-system namespace."
+        log "         Run: kubectl get pods -n operator-system"
+        log "         If it is in CrashLoopBackOff (often: leader-election lost),"
+        log "         delete it to force a restart and try again."
+        exit 1
+    fi
+}
+
 preflight() {
-    log "Preflight: ensuring retransmitter targets $BENCH_NODE_SELECTOR_KEY=$BENCH_NODE_SELECTOR_VAL (cgroup v2)"
+    log "Preflight: checking mec operator is healthy"
+    check_operator_healthy
+
+    log "Preflight: pinning retransmitter to $BENCH_NODE_SELECTOR_KEY=$BENCH_NODE_SELECTOR_VAL (cgroup v2)"
     # Replace nodeSelector entirely; the original is saved in EA_BACKUP.
     kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=json \
         -p "[{\"op\":\"replace\",\"path\":\"/spec/service/nodeSelector\",\"value\":{\"$BENCH_NODE_SELECTOR_KEY\":\"$BENCH_NODE_SELECTOR_VAL\"}}]" \
@@ -284,23 +462,49 @@ preflight() {
         -p "[{\"op\":\"add\",\"path\":\"/spec/service/nodeSelector\",\"value\":{\"$BENCH_NODE_SELECTOR_KEY\":\"$BENCH_NODE_SELECTOR_VAL\"}}]" \
         >/dev/null 2>&1
 
-    # Phase 1: freezeEnabled=true. The operator now automatically forces
-    # minScale>=1 whenever freezeEnabled is true (CRIU replaces
-    # scale-to-zero as the idle reclamation mechanism), so we don't need
-    # to set minScale here. Clear any leftover minScale from a prior
-    # aborted run to exercise that path.
+    log "Preflight: deleting Knative Triggers for $EA_NAME so the broker stops dispatching events"
+    # This is what makes the benchmark deterministic. With no Knative
+    # Triggers, the kafka-backed broker can't deliver buffered ITS
+    # events to the retransmitter, so the pod actually goes idle and
+    # the freezer plugin can checkpoint it. The sniffer stays running;
+    # we only isolate the retransmitter from the event stream.
+    #
+    # We have to delete the triggers DIRECTLY: the mec operator only
+    # creates triggers from triggerFilters, it does not reconcile them
+    # away when triggerFilters becomes empty. We also clear the EA's
+    # triggerFilters so that any later operator reconcile (e.g. when
+    # we patch freezeEnabled) does not see a mismatch and try to add
+    # them back. The originals are restored from TRIGGERS_BACKUP on
+    # cleanup.
+    kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=merge \
+        -p '{"spec":{"service":{"triggerFilters":[]}}}' >/dev/null 2>&1
+    kubectl delete trigger -n "$NAMESPACE" \
+        -l "mec.atnog.org/app=$EA_NAME" --ignore-not-found >/dev/null 2>&1
+
+    # Ensure kyverno policy exists to inject restartPolicy: Never on
+    # user-containers. Must be in place BEFORE enabling freeze, so the
+    # new deployment created by the operator gets the mutation on CREATE.
+    # Knative's field mask strips the per-container restartPolicy field,
+    # so only an admission webhook can inject it persistently.
+    ensure_restart_policy_kyverno
+
+    log "Preflight: enabling freeze (operator will force minScale>=1 automatically)"
+    # The operator auto-injects minScale=1 whenever freezeEnabled=true,
+    # because CRIU replaces scale-to-zero as the idle reclamation
+    # mechanism. Clear any leftover minScale from a prior aborted run
+    # so we exercise that operator path explicitly.
     kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=merge \
         -p '{"spec":{"service":{"freezeEnabled":true,"minScale":null}}}' >/dev/null 2>&1
 
-    log "Deleting its-sniffer (stops its.cam/its.denm events from keeping retransmitter warm)"
-    kubectl delete edgeapplication "$SNIFFER_NAME" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    # give kube time to tear down
+    # Give the operator a moment to reconcile (delete old triggers,
+    # propagate freezer annotation onto a new ksvc revision).
     sleep 10
 
-    # Wait for the operator to propagate the freezer annotation, otherwise
-    # the first iterations would target old-revision pods that don't have
-    # the freezer plugin loaded.
+    # Wait for the operator to propagate the freezer annotation,
+    # otherwise the first iterations would target old-revision pods
+    # that don't have the freezer plugin loaded.
     wait_for_freezer_annotation
+
     # Force a fresh pod from the latest revision before phase 1.
     delete_retransmitter_pod
 }
@@ -347,6 +551,17 @@ run_cold_start_benchmark() {
     kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=merge \
         -p '{"spec":{"service":{"freezeEnabled":false,"minScale":0}}}' >/dev/null 2>&1
     sleep 10
+
+    # Phase 1 leaves the pod CRIU-frozen. A graceful `kubectl delete` on a
+    # frozen pod is very slow: SIGTERM cannot reach the checkpointed user
+    # process, and the container has to be resumed before it can exit, so
+    # termination can drag past the 180s scale-to-zero wait. Force-delete
+    # all retransmitter pods up front so phase 2 starts from a clean slate.
+    log "  Force-deleting any surviving retransmitter pods (frozen pods terminate slowly)"
+    kubectl delete pods -n "$NAMESPACE" \
+        -l "serving.knative.dev/service=$SERVICE_NAME" \
+        --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
+    sleep 3
 
     local i ts_before ts_after timings
     for (( i=1; i<=ITERATIONS; i++ )); do
