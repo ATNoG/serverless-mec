@@ -538,8 +538,12 @@ run_criu_thaw_benchmark() {
         ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
 
         IFS=',' read -r _ _ _ t_total http_code <<< "$timings"
-        log "  Result: ${t_total}s (HTTP $http_code)"
-        emit_result "criu_thaw" "$i" "$timings" "$ts_before" "$ts_after"
+        if [[ "$http_code" == "422" ]]; then
+            log "  Result: ${t_total}s (HTTP $http_code)"
+            emit_result "criu_thaw" "$i" "$timings" "$ts_before" "$ts_after"
+        else
+            log "  SKIPPED: unexpected HTTP $http_code (expected 422), not recording"
+        fi
     done
 }
 
@@ -578,8 +582,12 @@ run_cold_start_benchmark() {
         ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
 
         IFS=',' read -r _ _ _ t_total http_code <<< "$timings"
-        log "  Result: ${t_total}s (HTTP $http_code)"
-        emit_result "cold_start" "$i" "$timings" "$ts_before" "$ts_after"
+        if [[ "$http_code" == "422" ]]; then
+            log "  Result: ${t_total}s (HTTP $http_code)"
+            emit_result "cold_start" "$i" "$timings" "$ts_before" "$ts_after"
+        else
+            log "  SKIPPED: unexpected HTTP $http_code (expected 422), not recording"
+        fi
     done
 }
 
