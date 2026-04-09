@@ -57,7 +57,11 @@ QUEUE_PROXY_PORT=8012
 # log line on the queue-proxy; this is just a safety net.
 FREEZE_WAIT_TIMEOUT=300
 
-OUTDIR="$(cd "$(dirname "$0")" && pwd)/freeze_vs_coldstart_logs"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_DIR="$SCRIPT_DIR/../knative-freezer-plugin"
+QP_PATCHED_BY_US=false
+
+OUTDIR="$SCRIPT_DIR/freeze_vs_coldstart_logs"
 mkdir -p "$OUTDIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 if [[ -n "$LABEL" ]]; then
@@ -145,6 +149,13 @@ cleanup() {
     log "Cleanup..."
     kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
+    # Revert queue-proxy BEFORE restoring the EA so that the final revision
+    # Knative creates uses the original queue-proxy image + original EA spec
+    # (nodeSelector, triggers, etc.) in one shot, avoiding extra churn.
+    if [[ "$QP_PATCHED_BY_US" == "true" ]]; then
+        log "  Reverting freezer queue-proxy patch..."
+        bash "$PLUGIN_DIR/unpatch.sh" >/dev/null 2>&1 || true
+    fi
     restore_state
 }
 trap cleanup EXIT
@@ -195,9 +206,9 @@ send_event_internal() {
         -H "Ce-Source: benchmark" \
         -H "Host: retransmitter.default.svc.cluster.local" \
         -d '{"benchmark":true}' \
-        --max-time 120 2>&1)
+        --max-time 120 2>/dev/null)
     if [[ -z "$out" || "$out" != *,* ]]; then
-        log "  send_event error: $out"
+        log "  send_event error: ${out:-<empty>}"
         echo "0,0,0,0,0"
     else
         echo "$out"
@@ -333,6 +344,30 @@ wait_for_freeze() {
     done
 }
 
+wait_for_knative_rollout() {
+    # Waits until the ksvc has no in-flight revisions: the
+    # latestCreatedRevisionName equals latestReadyRevisionName.
+    # This is the real "settled" signal — it means every config change
+    # has been processed and the resulting revision is ready.
+    local deadline=$((SECONDS + 300))
+    log "  Waiting for ksvc $SERVICE_NAME revisions to stabilize..."
+    while (( SECONDS < deadline )); do
+        local created ready
+        created=$(kubectl get ksvc "$SERVICE_NAME" -n "$NAMESPACE" \
+            -o jsonpath='{.status.latestCreatedRevisionName}' 2>/dev/null)
+        ready=$(kubectl get ksvc "$SERVICE_NAME" -n "$NAMESPACE" \
+            -o jsonpath='{.status.latestReadyRevisionName}' 2>/dev/null)
+        if [[ -n "$created" && -n "$ready" && "$created" == "$ready" ]]; then
+            log "  Revision stable: $ready (latestCreated == latestReady)"
+            return 0
+        fi
+        log "  created=$created ready=$ready — still rolling out..."
+        sleep 5
+    done
+    log "  WARNING: revisions did not stabilize within 300s, proceeding anyway"
+    return 1
+}
+
 wait_for_scale_to_zero() {
     log "  Waiting for scale-to-zero (no running pods)..."
     local deadline=$((SECONDS + 180))
@@ -450,6 +485,27 @@ check_operator_healthy() {
 }
 
 preflight() {
+    log "Preflight: checking freezer queue-proxy is configured"
+    local qp_image
+    qp_image=$(kubectl get configmap config-deployment -n knative-serving \
+        -o jsonpath='{.data.queue-sidecar-image}' 2>/dev/null)
+    if [[ "$qp_image" != *freezer-queue-proxy* ]]; then
+        log "  Queue-proxy is not the freezer plugin, patching now..."
+        if [[ ! -f "$PLUGIN_DIR/patch.sh" ]]; then
+            log "  ERROR: $PLUGIN_DIR/patch.sh not found"
+            exit 1
+        fi
+        bash "$PLUGIN_DIR/patch.sh" >/dev/null 2>&1
+        QP_PATCHED_BY_US=true
+        log "  Freezer queue-proxy patched (will be reverted on cleanup)."
+        log "  Waiting for Knative to roll out the new queue-proxy image..."
+        # After patching config-deployment, Knative creates a new revision
+        # for every ksvc. We wait for the retransmitter's latest revision
+        # deployment to be fully rolled out before proceeding, so the first
+        # benchmark iteration doesn't hit a half-ready revision.
+        wait_for_knative_rollout
+    fi
+
     log "Preflight: checking mec operator is healthy"
     check_operator_healthy
 
@@ -505,8 +561,22 @@ preflight() {
     # that don't have the freezer plugin loaded.
     wait_for_freezer_annotation
 
-    # Force a fresh pod from the latest revision before phase 1.
+    # Wait for the Knative rollout to fully settle. The preflight changes
+    # (nodeSelector, triggerFilters, freezeEnabled, kyverno policy) can
+    # cause the operator + Knative to create multiple revisions in
+    # sequence. If we start benchmarking before the final revision is
+    # stable, the operator may kill the pod mid-freeze by rolling out
+    # yet another revision.
+    log "Preflight: waiting for revision rollout to stabilize..."
+    wait_for_knative_rollout
+
+    # Now that revisions are stable, delete any leftover pod and wait
+    # for a fresh one from the final revision to be 2/2 Ready. This
+    # frees hostPorts/resources on the target node.
     delete_retransmitter_pod
+    if ! wait_for_pod_ready; then
+        log "  WARNING: warmup pod did not become ready, proceeding anyway"
+    fi
 }
 
 # ---- CRIU thaw benchmark ----------------------------------------------------
@@ -522,7 +592,10 @@ run_criu_thaw_benchmark() {
         # CRIU can only checkpoint a container once per lifetime, so each
         # iteration needs a brand-new pod.
         delete_retransmitter_pod
-        wait_for_pod_ready
+        if ! wait_for_pod_ready; then
+            log "  SKIPPED: pod never became ready"
+            continue
+        fi
 
         pod=$(get_pod_name)
         pod_ip=$(get_pod_ip "$pod")
@@ -567,14 +640,26 @@ run_cold_start_benchmark() {
         --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
     sleep 3
 
+    # Warmup: do one throwaway cold-start cycle so the new revision's image
+    # is pulled and the ksvc routing is settled before real measurements.
+    log "  Warming up cold-start revision..."
+    wait_for_scale_to_zero || true
+    send_event_internal "$SERVICE_URL" >/dev/null 2>&1
+    sleep 5
+
     local i ts_before ts_after timings
     for (( i=1; i<=ITERATIONS; i++ )); do
         log "--- Cold start iteration $i/$ITERATIONS ---"
 
-        # Delete any running pod so scale-to-zero isn't gated by
+        # Force-delete any running pod so scale-to-zero isn't gated by
         # whatever pod was brought up by the previous iteration.
-        delete_retransmitter_pod
-        wait_for_scale_to_zero
+        kubectl delete pods -n "$NAMESPACE" \
+            -l "serving.knative.dev/service=$SERVICE_NAME" \
+            --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
+        if ! wait_for_scale_to_zero; then
+            log "  SKIPPED: pods still running, not a true cold start"
+            continue
+        fi
         sleep 3  # endpoint reprogramming
 
         ts_before=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
