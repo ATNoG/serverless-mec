@@ -1,0 +1,192 @@
+<mxfile host="app.diagrams.net" agent="Claude">
+  <diagram name="Architecture" id="arch-main">
+    <mxGraphModel dx="1488" dy="855" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="label-orch" parent="1" style="text;fontSize=11;fontColor=#888888;fontStyle=1;align=left;" value="ORCHESTRATION" vertex="1">
+          <mxGeometry height="20" width="140" x="20" y="10" as="geometry" />
+        </mxCell>
+        <mxCell id="label-platform" parent="1" style="text;fontSize=11;fontColor=#888888;fontStyle=1;align=left;" value="SERVERLESS PLATFORM" vertex="1">
+          <mxGeometry height="20" width="200" x="20" y="120" as="geometry" />
+        </mxCell>
+        <mxCell id="label-infra" parent="1" style="text;fontSize=11;fontColor=#888888;fontStyle=1;align=left;" value="INFRASTRUCTURE" vertex="1">
+          <mxGeometry height="20" width="200" x="20" y="360" as="geometry" />
+        </mxCell>
+        <mxCell id="user" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#999999;fontSize=11;" value="User / CLI&#xa;kubectl apply" vertex="1">
+          <mxGeometry height="50" width="130" x="30" y="35" as="geometry" />
+        </mxCell>
+        <mxCell id="operator" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;strokeWidth=2;fontSize=11;fontColor=#1D4ED8;" value="&lt;b&gt;MEC Operator&lt;/b&gt;&#xa;EdgeApplication CRD Controller&#xa;&lt;font style=&quot;font-size:9px&quot;&gt;lifecycle · placement · triggers · freeze&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="280" x="240" y="25" as="geometry" />
+        </mxCell>
+        <mxCell id="edge-user-op" edge="1" parent="1" source="user" style="endArrow=classic;strokeColor=#333333;fontSize=9;fontColor=#666666;" target="operator" value="CRD API">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="serving-box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAFAFA;strokeColor=#BBBBBB;strokeWidth=1.5;fontSize=12;fontStyle=1;fontColor=#444444;verticalAlign=top;align=left;spacingLeft=10;spacingTop=5;" value="Knative Serving" vertex="1">
+          <mxGeometry height="195" width="520" x="30" y="145" as="geometry" />
+        </mxCell>
+        <mxCell id="ksvc" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#AAAAAA;fontSize=11;" value="Ksvc&#xa;Revisions" vertex="1">
+          <mxGeometry height="45" width="120" x="50" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="autoscaler" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#AAAAAA;fontSize=11;" value="Autoscaler&#xa;KPA / scale-to-zero" vertex="1">
+          <mxGeometry height="45" width="140" x="185" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="qp-box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#AAAAAA;fontSize=11;fontColor=#444444;verticalAlign=top;align=left;spacingLeft=8;spacingTop=3;" value="Queue-Proxy Sidecar" vertex="1">
+          <mxGeometry height="85" width="480" x="50" y="240" as="geometry" />
+        </mxCell>
+        <mxCell id="freezer-plugin" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;strokeWidth=1.5;fontSize=11;fontColor=#1D4ED8;" value="&lt;b&gt;Freezer Plugin (qpoption)&lt;/b&gt;&#xa;&lt;font style=&quot;font-size:9px&quot;&gt;idle detect · thaw · fake listener :8080&lt;/font&gt;" vertex="1">
+          <mxGeometry height="45" width="265" x="65" y="268" as="geometry" />
+        </mxCell>
+        <mxCell id="health-probes" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#AAAAAA;fontSize=10;" value="Health Probes&#xa;&lt;font style=&quot;font-size:9px&quot;&gt;TCP :8080 → fake listener&lt;/font&gt;" vertex="1">
+          <mxGeometry height="45" width="170" x="345" y="268" as="geometry" />
+        </mxCell>
+        <mxCell id="eventing-box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAFAFA;strokeColor=#BBBBBB;strokeWidth=1.5;fontSize=12;fontStyle=1;fontColor=#444444;verticalAlign=top;align=left;spacingLeft=10;spacingTop=5;" value="Knative Eventing" vertex="1">
+          <mxGeometry height="195" width="530" x="580" y="145" as="geometry" />
+        </mxCell>
+        <mxCell id="kafka-broker" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#AAAAAA;fontSize=11;" value="Kafka Broker&#xa;&lt;font style=&quot;font-size:9px&quot;&gt;CloudEvents ingress&lt;/font&gt;" vertex="1">
+          <mxGeometry height="45" width="145" x="600" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="triggers" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#AAAAAA;fontSize=11;" value="Triggers&#xa;&lt;font style=&quot;font-size:9px&quot;&gt;filter: ce-type, stationType&lt;/font&gt;" vertex="1">
+          <mxGeometry height="45" width="155" x="760" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="sinkbinding" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#AAAAAA;fontSize=11;" value="SinkBinding&#xa;&lt;font style=&quot;font-size:9px&quot;&gt;auto K_SINK injection&lt;/font&gt;" vertex="1">
+          <mxGeometry height="45" width="155" x="930" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="ce-flow" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;strokeWidth=1;dashed=1;fontSize=11;fontColor=#92400E;" value="CloudEvents Flow&lt;br&gt;Sniffer → Broker → Trigger (filter) → Retransmitter&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;ce-type: its.cam, its.denm · ce-source: sniffer · stationType filter&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="490" x="600" y="255" as="geometry" />
+        </mxCell>
+        <mxCell id="edge-op-serving" edge="1" parent="1" source="operator" style="endArrow=classic;strokeColor=#2563EB;fontSize=9;fontColor=#2563EB;" value="manages ksvc">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="380" y="140" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge-op-eventing" edge="1" parent="1" source="operator" style="endArrow=classic;strokeColor=#2563EB;fontSize=9;fontColor=#2563EB;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" value="manages triggers">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="640" y="60" />
+            </Array>
+            <mxPoint x="640" y="140" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="k3s-cluster" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F9FAFB;strokeColor=#9CA3AF;strokeWidth=2;dashed=1;dashPattern=8 4;fontSize=11;fontStyle=1;fontColor=#6B7280;verticalAlign=top;align=left;spacingLeft=15;spacingTop=8;movable=0;resizable=0;rotatable=0;deletable=0;editable=0;locked=1;connectable=0;" value="&amp;nbsp; &amp;nbsp; &amp;nbsp; K3s Cluster (lightweight Kubernetes)" vertex="1">
+          <mxGeometry height="430" width="1140" x="30" y="385" as="geometry" />
+        </mxCell>
+        <mxCell id="rsu-a" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#666666;strokeWidth=1.5;fontSize=12;fontStyle=1;verticalAlign=top;align=left;spacingLeft=10;spacingTop=5;" value="RSU-A&#xa;&lt;font style=&quot;font-size:9px;font-weight:normal&quot;&gt;ARM64 · NXP · rsu-id: rsu-a&lt;/font&gt;" vertex="1">
+          <mxGeometry height="185" width="310" x="55" y="415" as="geometry" />
+        </mxCell>
+        <mxCell id="sniffer" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0FDF4;strokeColor=#16A34A;fontSize=11;fontColor=#166534;" value="&lt;b&gt;ITS Sniffer (Knative Service)&lt;/b&gt;&lt;br&gt;&lt;div&gt;802.11p capture → ITS decode → CloudEvent&lt;font style=&quot;font-size:9px&quot;&gt;&lt;br&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size:9px&quot;&gt;C&amp;nbsp;&lt;/font&gt;&lt;font style=&quot;font-size:9px&quot;&gt;·&amp;nbsp;&lt;/font&gt;&lt;font style=&quot;font-size:9px&quot;&gt;libpcap&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="60" width="265" x="75" y="460" as="geometry" />
+        </mxCell>
+        <mxCell id="radio" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ECFDF5;strokeColor=#16A34A;strokeWidth=0.8;fontSize=10;fontColor=#166534;" value="802.11p Radio Interface (monitor mode)" vertex="1">
+          <mxGeometry height="30" width="265" x="75" y="535" as="geometry" />
+        </mxCell>
+        <mxCell id="edge-sniffer-broker" edge="1" parent="1" source="sniffer" style="endArrow=classic;strokeColor=#D97706;strokeWidth=1.5;dashed=1;dashPattern=5 3;fontSize=9;fontColor=#D97706;exitX=0.75;exitY=0;exitDx=0;exitDy=0;" target="kafka-broker" value="CloudEvent POST">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="274" y="360" />
+              <mxPoint x="570" y="360" />
+              <mxPoint x="570" y="203" />
+            </Array>
+            <mxPoint x="208" y="450" as="sourcePoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="worker1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#666666;strokeWidth=1.5;fontSize=12;fontStyle=1;verticalAlign=top;align=left;spacingLeft=10;spacingTop=5;" value="&amp;nbsp; &amp;nbsp; &amp;nbsp;&lt;span style=&quot;white-space: pre;&quot;&gt;&#x9;&lt;/span&gt;Worker-1&lt;br&gt;&lt;font style=&quot;font-size:9px;font-weight:normal&quot;&gt;&amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp;&lt;span style=&quot;white-space: pre;&quot;&gt;&#x9;&lt;/span&gt;x86_64 · VM · vm-id: worker-1 · cgroup v2&lt;/font&gt;" vertex="1">
+          <mxGeometry height="365" width="410" x="400" y="415" as="geometry" />
+        </mxCell>
+        <mxCell id="retrans-pod" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#888888;fontSize=11;fontStyle=1;fontColor=#444444;verticalAlign=top;align=center;spacingTop=5;" value="Retransmitter Pod (Knative Service)" vertex="1">
+          <mxGeometry height="150" width="330" x="420" y="462" as="geometry" />
+        </mxCell>
+        <mxCell id="user-container" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0FDF4;strokeColor=#16A34A;fontSize=10;fontColor=#166534;" value="&lt;b&gt;User Container&lt;/b&gt;&#xa;Retransmitter&#xa;&lt;font style=&quot;font-size:9px&quot;&gt;Python · Flask&lt;/font&gt;" vertex="1">
+          <mxGeometry height="55" width="145" x="435" y="495" as="geometry" />
+        </mxCell>
+        <mxCell id="qp-pod" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;strokeWidth=1.5;fontSize=10;fontColor=#1D4ED8;" value="&lt;b&gt;Queue-Proxy&lt;/b&gt;&#xa;+ Freezer Plugin&#xa;&lt;font style=&quot;font-size:9px&quot;&gt;:8012 → :8080&lt;/font&gt;" vertex="1">
+          <mxGeometry height="55" width="140" x="595" y="495" as="geometry" />
+        </mxCell>
+        <mxCell id="criu-states" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EFF6FF;strokeColor=#2563EB;strokeWidth=0.8;fontSize=9;fontColor=#1D4ED8;" value="Running → (idle 30s) → Frozen → (request) → Restored" vertex="1">
+          <mxGeometry height="25" width="295" x="435" y="560" as="geometry" />
+        </mxCell>
+        <mxCell id="edge-trigger-pod" edge="1" parent="1" source="triggers" style="endArrow=classic;strokeColor=#D97706;strokeWidth=1.5;dashed=1;dashPattern=5 3;fontSize=9;fontColor=#D97706;entryX=0.75;entryY=0;entryDx=0;entryDy=0;" target="retrans-pod" value="Kafka dispatch">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="840" y="240" />
+              <mxPoint x="1150" y="240" />
+              <mxPoint x="1150" y="360" />
+              <mxPoint x="668" y="360" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="freezer-daemon" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;strokeWidth=2;fontSize=11;fontColor=#1D4ED8;" value="&lt;b&gt;container-freezer-criu (DaemonSet)&lt;/b&gt;&#xa;HTTP API :9696 · CRIU dump/restore&#xa;&lt;font style=&quot;font-size:9px&quot;&gt;containerd → runc → criu --tcp-established&lt;/font&gt;" vertex="1">
+          <mxGeometry height="65" width="330" x="420" y="630" as="geometry" />
+        </mxCell>
+        <mxCell id="edge-plugin-daemon" edge="1" parent="1" source="qp-pod" style="endArrow=classic;strokeColor=#2563EB;strokeWidth=1.5;fontSize=9;fontColor=#2563EB;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" target="freezer-daemon" value="HTTP :9696">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="780" y="523" />
+              <mxPoint x="780" y="663" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="checkpoint-disk" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3F4F6;strokeColor=#9CA3AF;fontSize=10;fontColor=#6B7280;" value="CRIU Checkpoint (memory dump on disk)" vertex="1">
+          <mxGeometry height="35" width="330" x="420" y="715" as="geometry" />
+        </mxCell>
+        <mxCell id="edge-daemon-disk" edge="1" parent="1" source="freezer-daemon" style="endArrow=classic;strokeColor=#9CA3AF;strokeWidth=1.2;" target="checkpoint-disk" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="rsu-b" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#666666;strokeWidth=1.5;fontSize=12;fontStyle=1;verticalAlign=top;align=left;spacingLeft=10;spacingTop=5;" value="RSU-B&#xa;&lt;font style=&quot;font-size:9px;font-weight:normal&quot;&gt;ARM64 · NXP · rsu-id: rsu-b&lt;/font&gt;" vertex="1">
+          <mxGeometry height="130" width="265" x="875" y="430" as="geometry" />
+        </mxCell>
+        <mxCell id="rsu-b-apps" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0FDF4;strokeColor=#16A34A;fontSize=10;fontColor=#166534;" value="&lt;b&gt;Additional MEC Services&lt;/b&gt;&#xa;Retransmitter / other apps&#xa;&lt;font style=&quot;font-size:9px&quot;&gt;(node placement via CRD nodeSelector)&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="230" x="890" y="477" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#CCCCCC;" value="" vertex="1">
+          <mxGeometry height="165" width="265" x="875" y="595" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-title" parent="1" style="text;fontSize=11;fontStyle=1;fontColor=#444444;align=left;" value="Legend" vertex="1">
+          <mxGeometry height="20" width="80" x="890" y="600" as="geometry" />
+        </mxCell>
+        <mxCell id="leg1" parent="1" style="rounded=1;fillColor=#DBEAFE;strokeColor=#2563EB;strokeWidth=1.5;" value="" vertex="1">
+          <mxGeometry height="14" width="18" x="890" y="625" as="geometry" />
+        </mxCell>
+        <mxCell id="leg1t" parent="1" style="text;fontSize=10;fontColor=#333333;align=left;" value="Novel contribution" vertex="1">
+          <mxGeometry height="20" width="130" x="915" y="622" as="geometry" />
+        </mxCell>
+        <mxCell id="leg2" parent="1" style="rounded=1;fillColor=#F0FDF4;strokeColor=#16A34A;" value="" vertex="1">
+          <mxGeometry height="14" width="18" x="890" y="647" as="geometry" />
+        </mxCell>
+        <mxCell id="leg2t" parent="1" style="text;fontSize=10;fontColor=#333333;align=left;" value="ITS application components" vertex="1">
+          <mxGeometry height="20" width="180" x="915" y="644" as="geometry" />
+        </mxCell>
+        <mxCell id="leg3" parent="1" style="rounded=1;fillColor=#FEF3C7;strokeColor=#D97706;dashed=1;" value="" vertex="1">
+          <mxGeometry height="14" width="18" x="890" y="669" as="geometry" />
+        </mxCell>
+        <mxCell id="leg3t" parent="1" style="text;fontSize=10;fontColor=#333333;align=left;" value="CloudEvents data flow" vertex="1">
+          <mxGeometry height="20" width="150" x="915" y="666" as="geometry" />
+        </mxCell>
+        <mxCell id="leg4" parent="1" style="rounded=1;fillColor=#F9FAFB;strokeColor=#9CA3AF;strokeWidth=1.5;dashed=1;dashPattern=8 4;" value="" vertex="1">
+          <mxGeometry height="14" width="18" x="890" y="691" as="geometry" />
+        </mxCell>
+        <mxCell id="leg4t" parent="1" style="text;fontSize=10;fontColor=#333333;align=left;" value="K3s cluster boundary" vertex="1">
+          <mxGeometry height="20" width="150" x="915" y="688" as="geometry" />
+        </mxCell>
+        <mxCell id="leg5" edge="1" parent="1" style="endArrow=classic;strokeColor=#2563EB;strokeWidth=1.5;" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="890" y="717" as="sourcePoint" />
+            <mxPoint x="908" y="717" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="leg5t" parent="1" style="text;fontSize=10;fontColor=#333333;align=left;" value="Control / freeze path" vertex="1">
+          <mxGeometry height="20" width="150" x="915" y="710" as="geometry" />
+        </mxCell>
+        <mxCell id="leg6" edge="1" parent="1" style="endArrow=classic;strokeColor=#D97706;strokeWidth=1.5;dashed=1;dashPattern=5 3;" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="890" y="737" as="sourcePoint" />
+            <mxPoint x="908" y="737" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="leg6t" parent="1" style="text;fontSize=10;fontColor=#333333;align=left;" value="Event data path" vertex="1">
+          <mxGeometry height="20" width="150" x="915" y="730" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
