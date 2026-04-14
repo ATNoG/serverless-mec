@@ -157,14 +157,16 @@ def main() -> int:
         ("TTFB",       "t_ttfb_s"),
         ("Total",      "t_total_s"),
     ]
-    print(f"  {'phase':<14}  {'CRIU':>12}  {'Cold':>12}")
-    print(f"  {'-'*14}  {'-'*12}  {'-'*12}")
+    print(f"  {'phase':<14}  {'CRIU mean':>12}  {'CRIU stddev':>12}  {'Cold mean':>12}  {'Cold stddev':>12}")
+    print(f"  {'-'*14}  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*12}")
     for label, key in phases:
         cv = _phase_values(rows, "criu_thaw", key)
         kv = _phase_values(rows, "cold_start", key)
         c_mean = statistics.fmean(cv) if cv else float("nan")
+        c_sd = statistics.stdev(cv) if len(cv) >= 2 else 0.0 if cv else float("nan")
         k_mean = statistics.fmean(kv) if kv else float("nan")
-        print(f"  {label:<14}  {_fmt_ms(c_mean):>12}  {_fmt_ms(k_mean):>12}")
+        k_sd = statistics.stdev(kv) if len(kv) >= 2 else 0.0 if kv else float("nan")
+        print(f"  {label:<14}  {_fmt_ms(c_mean):>12}  {_fmt_ms(c_sd):>12}  {_fmt_ms(k_mean):>12}  {_fmt_ms(k_sd):>12}")
     print()
 
     # HTTP status code distribution

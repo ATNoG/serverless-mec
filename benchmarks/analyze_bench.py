@@ -109,6 +109,7 @@ class Stats:
     """
     n: int
     mean: float
+    stddev: float
     median: float
     p95: float
     p99: float
@@ -127,12 +128,15 @@ class Stats:
                 float("nan"),
                 float("nan"),
                 float("nan"),
+                float("nan"),
             )
 
         s = sorted(vals)
+        sd = statistics.stdev(s) if len(s) >= 2 else 0.0
         return Stats(
             n=len(s),
             mean=statistics.fmean(s),
+            stddev=sd,
             median=statistics.median(s),
             p95=_percentile(s, 95.0),
             p99=_percentile(s, 99.0),
@@ -280,7 +284,7 @@ def _table(title: str, rows: List[Tuple[str, Stats]]) -> str:
     lines.append("-" * len(title))
 
     header = (
-        f"{'metric':38s} {'n':>6s} {'mean':>12s} {'median':>12s} "
+        f"{'metric':38s} {'n':>6s} {'mean':>12s} {'stddev':>12s} {'median':>12s} "
         f"{'p95':>12s} {'p99':>12s} {'min':>12s} {'max':>12s}"
     )
     lines.append(header)
@@ -289,7 +293,7 @@ def _table(title: str, rows: List[Tuple[str, Stats]]) -> str:
     for name, st in rows:
         lines.append(
             f"{name:38s} {st.n:6d} "
-            f"{fmt_ms(st.mean):>12s} {fmt_ms(st.median):>12s} "
+            f"{fmt_ms(st.mean):>12s} {fmt_ms(st.stddev):>12s} {fmt_ms(st.median):>12s} "
             f"{fmt_ms(st.p95):>12s} {fmt_ms(st.p99):>12s} "
             f"{fmt_ms(st.min):>12s} {fmt_ms(st.max):>12s}"
         )
@@ -520,7 +524,7 @@ def main() -> int:
         def size_line(name: str, st: Stats) -> str:
             return (
                 f"{name:16s} {st.n:6d} "
-                f"{fmt_num(st.mean):>10s} {fmt_num(st.median):>10s} "
+                f"{fmt_num(st.mean):>10s} {fmt_num(st.stddev):>10s} {fmt_num(st.median):>10s} "
                 f"{fmt_num(st.p95):>10s} {fmt_num(st.p99):>10s} "
                 f"{fmt_num(st.min):>10s} {fmt_num(st.max):>10s}"
             )
@@ -528,10 +532,10 @@ def main() -> int:
         print("Sizes (bytes)")
         print("------------")
         print(
-            f"{'metric':16s} {'n':>6s} {'mean':>10s} {'median':>10s} "
+            f"{'metric':16s} {'n':>6s} {'mean':>10s} {'stddev':>10s} {'median':>10s} "
             f"{'p95':>10s} {'p99':>10s} {'min':>10s} {'max':>10s}"
         )
-        print("-" * 86)
+        print("-" * 97)
         if sizes_in:
             print(size_line("size_in", _size_stats(sizes_in)))
         if sizes_out:
