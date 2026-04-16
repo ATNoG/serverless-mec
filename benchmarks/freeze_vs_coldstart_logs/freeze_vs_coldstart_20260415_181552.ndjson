@@ -1,0 +1,6 @@
+{"mode":"criu_thaw","iteration":1,"t_dns_s":0.000083,"t_connect_s":0.001427,"t_ttfb_s":0.681730,"t_total_s":0.681856,"http_code":422,"ts_before":"2026-04-15T17:19:28.321Z","ts_after":"2026-04-15T17:19:29.829Z"}
+{"mode":"criu_thaw","iteration":2,"t_dns_s":0.000073,"t_connect_s":0.000991,"t_ttfb_s":0.592650,"t_total_s":0.592754,"http_code":422,"ts_before":"2026-04-15T17:20:08.275Z","ts_after":"2026-04-15T17:20:09.555Z"}
+{"mode":"criu_thaw","iteration":3,"t_dns_s":0.000075,"t_connect_s":0.001173,"t_ttfb_s":0.659369,"t_total_s":0.659512,"http_code":422,"ts_before":"2026-04-15T17:20:46.341Z","ts_after":"2026-04-15T17:20:47.585Z"}
+{"mode":"cold_start","iteration":1,"t_dns_s":0.008208,"t_connect_s":0.009438,"t_ttfb_s":4.009189,"t_total_s":4.009344,"http_code":422,"ts_before":"2026-04-15T17:22:50.018Z","ts_after":"2026-04-15T17:22:54.640Z"}
+{"mode":"cold_start","iteration":2,"t_dns_s":0.008244,"t_connect_s":0.009474,"t_ttfb_s":3.988767,"t_total_s":3.988935,"http_code":422,"ts_before":"2026-04-15T17:23:52.475Z","ts_after":"2026-04-15T17:23:57.064Z"}
+{"mode":"cold_start","iteration":3,"t_dns_s":0.008338,"t_connect_s":0.009567,"t_ttfb_s":4.862777,"t_total_s":4.863012,"http_code":422,"ts_before":"2026-04-15T17:24:47.682Z","ts_after":"2026-04-15T17:24:53.147Z"}
