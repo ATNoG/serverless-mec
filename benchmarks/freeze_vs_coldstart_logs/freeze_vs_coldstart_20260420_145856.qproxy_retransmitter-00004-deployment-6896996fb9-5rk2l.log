@@ -1,0 +1,4 @@
+{"severity":"INFO","timestamp":"2026-04-20T14:38:30.000202352Z","logger":"queueproxy","caller":"freezer/plug.go:197","message":"Freezer: default/retransmitter-00004-deployment-6896996fb9-5rk2l idle, freezing containers","knative.dev/key":"default/retransmitter-00004","knative.dev/pod":"retransmitter-00004-deployment-6896996fb9-5rk2l"}
+dial tcp 127.0.0.1:8080: connect: connection refused
+dial tcp 127.0.0.1:8080: connect: connection refused
+{"severity":"INFO","timestamp":"2026-04-20T14:38:37.486621031Z","logger":"queueproxy","caller":"freezer/plug.go:100","message":"Freezer: fake listener started on 0.0.0.0:8080 (keeping pod Ready while frozen)","knative.dev/key":"default/retransmitter-00004","knative.dev/pod":"retransmitter-00004-deployment-6896996fb9-5rk2l"}
