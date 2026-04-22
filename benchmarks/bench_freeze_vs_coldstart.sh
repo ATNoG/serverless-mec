@@ -281,20 +281,19 @@ wait_for_freeze() {
     sentinel=$(mktemp -t freeze_sentinel.XXXXXX)
     rm -f "$sentinel"
 
-    # Stream the queue-proxy log to a debug file alongside OUTFILE. We then
-    # poll that file for "fake listener started" in the wait loop below.
-    # Polling the file (instead of piping `kubectl logs -f` through
-    # `grep -m1`) avoids a subtle bug: tee/grep in a pipe block-buffers
-    # stdout on most systems, which delays the match by minutes in a
-    # low-volume log stream and makes freeze look like it never happened.
+    # Stream the queue-proxy log to a temp file and poll it for the
+    # "fake listener started" line. Polling a file (instead of piping
+    # `kubectl logs -f` through `grep -m1`) avoids a subtle bug:
+    # tee/grep in a pipe block-buffers stdout on most systems, which
+    # delays the match by minutes in a low-volume log stream and makes
+    # freeze look like it never happened.
     # `--since=1s` is critical so we don't replay stale "fake listener
     # started" lines from a previous freeze cycle on the same pod.
-    local debug_log="${OUTFILE%.ndjson}.qproxy_${pod}.log"
-    : > "$debug_log"
+    local debug_log
+    debug_log=$(mktemp -t qproxy_log.XXXXXX)
     kubectl logs -f "$pod" -n "$NAMESPACE" -c queue-proxy --since=1s \
         >"$debug_log" 2>/dev/null &
     local watcher_pid=$!
-    log "  Queue-proxy log saved to $(basename "$debug_log")"
 
     local start_epoch
     start_epoch=$(date +%s)
@@ -303,7 +302,7 @@ wait_for_freeze() {
         if grep -q -F 'fake listener started' "$debug_log" 2>/dev/null; then
             kill "$watcher_pid" 2>/dev/null
             wait "$watcher_pid" 2>/dev/null
-            rm -f "$sentinel"
+            rm -f "$sentinel" "$debug_log"
             log "  Container frozen (fake listener active)."
             return 0
         fi
@@ -311,7 +310,7 @@ wait_for_freeze() {
             # Watcher died without producing the sentinel — pod/log
             # stream went away before the freeze happened.
             wait "$watcher_pid" 2>/dev/null
-            rm -f "$sentinel"
+            rm -f "$sentinel" "$debug_log"
             log "  WARNING: log watcher exited before freeze (pod may have died)"
             return 1
         fi
@@ -324,7 +323,7 @@ wait_for_freeze() {
             log "  WARNING: freezer plugin did not checkpoint within ${FREEZE_WAIT_TIMEOUT}s"
             kill "$watcher_pid" 2>/dev/null
             wait "$watcher_pid" 2>/dev/null
-            rm -f "$sentinel"
+            rm -f "$sentinel" "$debug_log"
             return 1
         fi
 
