@@ -1,0 +1,1 @@
+{"severity":"INFO","timestamp":"2026-04-22T14:04:12.988442794Z","logger":"queueproxy","caller":"freezer/plug.go:100","message":"Freezer: fake listener started on 0.0.0.0:8080 (keeping pod Ready while frozen)","knative.dev/key":"default/retransmitter-00004","knative.dev/pod":"retransmitter-00004-deployment-55655fddbd-dm26k"}
