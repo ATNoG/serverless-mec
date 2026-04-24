@@ -510,9 +510,12 @@ preflight() {
 
     log "Preflight: pinning retransmitter to $BENCH_NODE_SELECTOR_KEY=$BENCH_NODE_SELECTOR_VAL (cgroup v2)"
     # Replace nodeSelector entirely; the original is saved in EA_BACKUP.
+    # Two-step: remove then add ensures we don't merge with existing keys
+    # (--type=merge would merge map keys; --type=json "add" on an existing
+    # path replaces the value per RFC 6902, but "remove+add" is unambiguous).
     kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=json \
-        -p "[{\"op\":\"replace\",\"path\":\"/spec/service/nodeSelector\",\"value\":{\"$BENCH_NODE_SELECTOR_KEY\":\"$BENCH_NODE_SELECTOR_VAL\"}}]" \
-        >/dev/null 2>&1 || \
+        -p "[{\"op\":\"remove\",\"path\":\"/spec/service/nodeSelector\"}]" \
+        >/dev/null 2>&1 || true
     kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=json \
         -p "[{\"op\":\"add\",\"path\":\"/spec/service/nodeSelector\",\"value\":{\"$BENCH_NODE_SELECTOR_KEY\":\"$BENCH_NODE_SELECTOR_VAL\"}}]" \
         >/dev/null 2>&1
@@ -693,17 +696,40 @@ with open(path) as f:
             except json.JSONDecodeError:
                 pass
 
+def t_inv(p, df):
+    """Approximate inverse Student's t CDF (Cornish-Fisher)."""
+    t_ = math.sqrt(-2.0 * math.log(1.0 - p))
+    xp = t_ - (2.515517 + 0.802853*t_ + 0.010328*t_**2) / \
+              (1.0 + 1.432788*t_ + 0.189269*t_**2 + 0.001308*t_**3)
+    g1 = (xp**3 + xp) / (4*df)
+    g2 = (5*xp**5 + 16*xp**3 + 3*xp) / (96*df**2)
+    return xp + g1 + g2
+
+def ci95(vals):
+    n = len(vals)
+    if n < 2:
+        return (float("nan"), float("nan"))
+    mean = statistics.fmean(vals)
+    se = statistics.stdev(vals) / math.sqrt(n)
+    t = t_inv(0.975, n - 1)
+    return (mean - t*se, mean + t*se)
+
 def stats(vals):
     if not vals:
         n = float("nan")
-        return dict(n=0, mean=n, median=n, stdev=n, p95=n, p99=n, min=n, max=n)
+        return dict(n=0, mean=n, median=n, stdev=n,
+                    ci95_lo=n, ci95_hi=n,
+                    p95=n, p99=n, min=n, max=n)
     s = sorted(vals)
     n = len(s)
+    lo, hi = ci95(s)
     return dict(
         n=n,
         mean=statistics.fmean(s),
         median=statistics.median(s),
         stdev=statistics.stdev(s) if n > 1 else 0.0,
+        ci95_lo=lo,
+        ci95_hi=hi,
         p95=s[int(n * 0.95)] if n > 1 else s[-1],
         p99=s[int(n * 0.99)] if n > 1 else s[-1],
         min=s[0],
@@ -715,10 +741,15 @@ def fmt(x):
 
 def print_block(label, st):
     print(f"  {label}:")
-    for k in ("n", "mean", "median", "stdev", "p95", "p99", "min", "max"):
-        v = st[k]
-        val = str(v) if k == "n" else fmt(v)
-        print(f"    {k:<7} = {val}")
+    for k in ("n", "mean", "median", "stdev", "ci95", "p95", "p99", "min", "max"):
+        if k == "ci95":
+            lo, hi = st["ci95_lo"], st["ci95_hi"]
+            val = "n/a" if math.isnan(lo) else f"[{lo:.1f}, {hi:.1f}] ms"
+            print(f"    {k:<7} = {val}")
+        else:
+            v = st[k]
+            val = str(v) if k == "n" else fmt(v)
+            print(f"    {k:<7} = {val}")
 
 criu = [r["t_total_s"] * 1000 for r in rows if r.get("mode") == "criu_thaw"  and r.get("t_total_s", 0) > 0]
 cold = [r["t_total_s"] * 1000 for r in rows if r.get("mode") == "cold_start" and r.get("t_total_s", 0) > 0]
