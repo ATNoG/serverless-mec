@@ -56,6 +56,10 @@ QUEUE_PROXY_PORT=8012
 # the pod. The actual signal we wait for is the "fake listener started"
 # log line on the queue-proxy; this is just a safety net.
 FREEZE_WAIT_TIMEOUT=300
+# How often (in iterations) to purge leftover CRIU checkpoint dirs from
+# the bench node's /tmp.  Each checkpoint is ~49 MB; at 500 iterations
+# that is ~24 GB, enough to trigger disk-pressure taints.
+CHECKPOINT_CLEANUP_INTERVAL=10
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_DIR="$SCRIPT_DIR/../knative-freezer-plugin"
@@ -147,6 +151,7 @@ restore_state() {
 
 cleanup() {
     log "Cleanup..."
+    cleanup_node_disk
     kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
     # Revert queue-proxy BEFORE restoring the EA so that the final revision
@@ -394,6 +399,70 @@ delete_retransmitter_pod() {
     fi
 }
 
+cleanup_node_disk() {
+    # CRIU checkpoint/restore leaves two kinds of disk waste on the bench node:
+    #   1. /tmp/ctrd-checkpoint* dirs (~49 MB each)
+    #   2. Orphaned blobs in the containerd content store (~10 MB each)
+    # Together they can fill the disk within ~100 iterations and trigger a
+    # disk-pressure taint that blocks all further scheduling.
+    #
+    # Uses a privileged pod with hostPID + nsenter so it works even when
+    # the node already has a disk-pressure taint (tolerates all taints).
+    if [[ -z "$BENCH_NODE_NAME" ]]; then
+        return
+    fi
+    local pod_name="bench-disk-cleanup"
+    kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    sleep 2
+    kubectl run "$pod_name" -n "$NAMESPACE" --restart=Never --image=busybox \
+        --overrides='{
+          "spec": {
+            "nodeName": "'"$BENCH_NODE_NAME"'",
+            "hostPID": true,
+            "tolerations": [{"operator": "Exists"}],
+            "containers": [{
+              "name": "cleanup",
+              "image": "busybox",
+              "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
+                "ckpt=$(ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l); rm -rf /tmp/ctrd-checkpoint*; blobs=$(find /var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content/ -type f 2>/dev/null | wc -l); echo ${ckpt} ${blobs}"],
+              "securityContext": {"privileged": true}
+            }]
+          }
+        }' >/dev/null 2>&1
+    # Wait for it to finish (up to 30s)
+    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=30s >/dev/null 2>&1; then
+        local result ckpt blobs
+        result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
+        read -r ckpt blobs <<< "$result"
+        if [[ "${ckpt:-0}" -gt 0 || "${blobs:-0}" -gt 50 ]]; then
+            log "  Node cleanup: removed $ckpt checkpoint dirs, $blobs content blobs on $BENCH_NODE_NAME"
+            if [[ "${blobs:-0}" -gt 50 ]]; then
+                # Prune orphaned content store blobs; needs containerd stopped briefly
+                kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+                sleep 2
+                kubectl run "$pod_name" -n "$NAMESPACE" --restart=Never --image=busybox \
+                    --overrides='{
+                      "spec": {
+                        "nodeName": "'"$BENCH_NODE_NAME"'",
+                        "hostPID": true,
+                        "tolerations": [{"operator": "Exists"}],
+                        "containers": [{
+                          "name": "prune",
+                          "image": "busybox",
+                          "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
+                            "find /var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content/ -type f -delete 2>/dev/null; echo done"],
+                          "securityContext": {"privileged": true}
+                        }]
+                      }
+                    }' >/dev/null 2>&1
+                kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s >/dev/null 2>&1
+                log "  Pruned containerd content store on $BENCH_NODE_NAME"
+            fi
+        fi
+    fi
+    kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+}
+
 ensure_restart_policy_kyverno() {
     # Knative's field mask strips the per-container restartPolicy field, so we
     # can't set it via the ksvc or a direct deployment patch (Knative's
@@ -508,6 +577,11 @@ preflight() {
     log "Preflight: checking mec operator is healthy"
     check_operator_healthy
 
+    # Resolve the bench node's k8s name for checkpoint cleanup later.
+    BENCH_NODE_NAME=$(kubectl get nodes -l "$BENCH_NODE_SELECTOR_KEY=$BENCH_NODE_SELECTOR_VAL" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    log "Preflight: bench node resolved to $BENCH_NODE_NAME"
+
     log "Preflight: pinning retransmitter to $BENCH_NODE_SELECTOR_KEY=$BENCH_NODE_SELECTOR_VAL (cgroup v2)"
     # Replace nodeSelector entirely; the original is saved in EA_BACKUP.
     # Two-step: remove then add ensures we don't merge with existing keys
@@ -590,6 +664,12 @@ run_criu_thaw_benchmark() {
     local i pod pod_ip ts_before ts_after timings
     for (( i=1; i<=ITERATIONS; i++ )); do
         log "--- CRIU thaw iteration $i/$ITERATIONS ---"
+
+        # Purge leftover CRIU checkpoint dirs periodically to prevent
+        # disk-pressure taints on the bench node.
+        if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
+            cleanup_node_disk
+        fi
 
         # CRIU can only checkpoint a container once per lifetime, so each
         # iteration needs a brand-new pod.
