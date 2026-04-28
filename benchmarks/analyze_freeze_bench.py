@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
 import sys
 from typing import Dict, List, Tuple
@@ -113,6 +114,20 @@ def _print_block(label: str, st: Dict[str, float]) -> None:
             print(f"    {k:<7} = {val}")
 
 
+def _iqr_filter(vals: List[float]) -> List[float]:
+    """Remove outliers using Tukey's fences: keep values in [Q1-1.5*IQR, Q3+1.5*IQR]."""
+    if len(vals) < 4:
+        return vals
+    s = sorted(vals)
+    n = len(s)
+    q1 = s[n // 4]
+    q3 = s[(3 * n) // 4]
+    iqr = q3 - q1
+    lo = q1 - 1.5 * iqr
+    hi = q3 + 1.5 * iqr
+    return [v for v in vals if lo <= v <= hi]
+
+
 def _values(rows: List[dict], mode: str) -> List[float]:
     return [
         r["t_total_s"] * 1000.0
@@ -145,11 +160,62 @@ def _http_codes(rows: List[dict], mode: str) -> Dict[str, int]:
     return out
 
 
+def _generate_plot(rows: List[dict], output: str, use_iqr: bool) -> None:
+    """Generate seaborn box plots comparing CRIU thaw vs Cold start."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    phases: List[Tuple[str, str]] = [
+        ("DNS", "t_dns_s"),
+        ("TCP Connect", "t_connect_s"),
+        ("TTFB", "t_ttfb_s"),
+        ("Total", "t_total_s"),
+    ]
+
+    records = []
+    for label, key in phases:
+        for mode, mode_label in [("criu_thaw", "CRIU Thaw"), ("cold_start", "Cold Start")]:
+            vals = _phase_values(rows, mode, key)
+            if use_iqr:
+                vals = _iqr_filter(vals)
+            for v in vals:
+                records.append({"Phase": label, "Scenario": mode_label, "Time (ms)": v})
+
+    if not records:
+        print("  No data for plot", file=sys.stderr)
+        return
+
+    df = pd.DataFrame(records)
+
+    sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.boxplot(
+        data=df, x="Phase", y="Time (ms)", hue="Scenario",
+        palette={"CRIU Thaw": "#2196F3", "Cold Start": "#4CAF50"},
+        showfliers=True, flierprops=dict(marker="o", markersize=4, alpha=0.5),
+        ax=ax,
+    )
+    ax.set_title("CRIU Thaw vs Cold Start — Response Time Breakdown")
+    ax.legend(loc="upper left")
+    plt.xticks(rotation=20, ha="right")
+    plt.tight_layout()
+    fig.savefig(output)
+    plt.close(fig)
+    print(f"  Plot saved to {output}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("inputs", nargs="+", help="freeze_vs_coldstart NDJSON file(s)")
     ap.add_argument("--per-iter", action="store_true",
                     help="print per-iteration table (default: skip if >50 samples)")
+    ap.add_argument("--iqr", action="store_true",
+                    help="filter outliers using Tukey's IQR fences before computing stats")
+    ap.add_argument("--plot", nargs="?", const="auto", default=None,
+                    help="generate box plot (optionally specify output path, default: auto)")
     args = ap.parse_args()
 
     rows = _read(args.inputs)
@@ -157,8 +223,11 @@ def main() -> int:
         print("no rows found", file=sys.stderr)
         return 1
 
-    criu = _values(rows, "criu_thaw")
-    cold = _values(rows, "cold_start")
+    criu_raw = _values(rows, "criu_thaw")
+    cold_raw = _values(rows, "cold_start")
+
+    criu = _iqr_filter(criu_raw) if args.iqr else criu_raw
+    cold = _iqr_filter(cold_raw) if args.iqr else cold_raw
 
     c_st = _stats(criu)
     k_st = _stats(cold)
@@ -168,6 +237,8 @@ def main() -> int:
     print("  CRIU Thaw vs Cold Start — Benchmark Results")
     print("=" * 60)
     print(f"  inputs            : {', '.join(args.inputs)}")
+    if args.iqr:
+        print(f"  IQR filtering     : ON (CRIU {len(criu_raw)}->{len(criu)}, Cold {len(cold_raw)}->{len(cold)})")
     print(f"  CRIU thaw samples : {c_st['n']}")
     print(f"  Cold start samples: {k_st['n']}")
     print()
@@ -211,6 +282,9 @@ def main() -> int:
     for label, key in phases:
         cv = _phase_values(rows, "criu_thaw", key)
         kv = _phase_values(rows, "cold_start", key)
+        if args.iqr:
+            cv = _iqr_filter(cv)
+            kv = _iqr_filter(kv)
         c_mean = statistics.fmean(cv) if cv else float("nan")
         k_mean = statistics.fmean(kv) if kv else float("nan")
         print(f"  {label:<14}  {_fmt_ms(c_mean):>12}  {_ci_str(cv):>22}  {_fmt_ms(k_mean):>12}  {_ci_str(kv):>22}")
@@ -241,6 +315,18 @@ def main() -> int:
     else:
         print(f"  (per-iteration table suppressed; pass --per-iter to show all {max(len(criu), len(cold))} rows)")
         print()
+
+    if args.plot is not None:
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if args.plot == "auto":
+            base = os.path.splitext(args.inputs[0])[0]
+            plot_path = f"{base}_boxplot_{ts}.svg"
+        elif os.path.isdir(args.plot):
+            plot_path = os.path.join(args.plot, f"freeze_vs_coldstart_boxplot_{ts}.svg")
+        else:
+            plot_path = args.plot
+        _generate_plot(rows, plot_path, use_iqr=args.iqr)
 
     return 0
 

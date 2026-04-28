@@ -95,6 +95,10 @@ def main() -> int:
     ap.add_argument("--run-id", default="", help="analyze only rows with this run_id (default: all)")
     ap.add_argument("--list-runs", action="store_true", help="list run_ids found in the file(s) and exit")
     ap.add_argument("--csv", default="", help="optional CSV path forwarded to analyze_bench.py")
+    ap.add_argument("--iqr", action="store_true",
+                    help="filter outliers using Tukey's IQR fences (forwarded to analyze_bench.py)")
+    ap.add_argument("--plot", nargs="?", const="auto", default=None,
+                    help="generate box plot (forwarded to analyze_bench.py)")
     args = ap.parse_args()
 
     if args.list_runs:
@@ -120,6 +124,10 @@ def main() -> int:
     cmd = [sys.executable, ANALYZE_BENCH, "--sniffer", sn_path, "--retrans", rt_path]
     if args.csv:
         cmd += ["--csv", args.csv]
+    if args.iqr:
+        cmd += ["--iqr"]
+    if args.plot is not None:
+        cmd += ["--plot"] if args.plot == "auto" else ["--plot", args.plot]
 
     try:
         rc = subprocess.call(cmd)

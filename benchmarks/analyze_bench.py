@@ -20,7 +20,9 @@ import gzip
 import io
 import json
 import math
+import os
 import statistics
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -99,6 +101,20 @@ def _percentile(sorted_vals: List[float], p: float) -> float:
 
     frac = idx - lo
     return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+
+def iqr_filter(vals: List[float]) -> List[float]:
+    """Remove outliers using Tukey's fences: keep values in [Q1-1.5*IQR, Q3+1.5*IQR]."""
+    if len(vals) < 4:
+        return vals
+    s = sorted(vals)
+    n = len(s)
+    q1 = s[n // 4]
+    q3 = s[(3 * n) // 4]
+    iqr = q3 - q1
+    lo = q1 - 1.5 * iqr
+    hi = q3 + 1.5 * iqr
+    return [v for v in vals if lo <= v <= hi]
 
 
 @dataclass
@@ -301,12 +317,57 @@ def _table(title: str, rows: List[Tuple[str, Stats]]) -> str:
     return "\n".join(lines)
 
 
+def _generate_plot(metric_data: List[tuple], output: str, use_iqr: bool) -> None:
+    """Generate seaborn box plots for pipeline timing metrics.
+
+    metric_data: list of (label, values_in_ns) tuples.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    records = []
+    for label, vals_ns in metric_data:
+        vals_ms = [ns_to_ms(v) for v in vals_ns]
+        if use_iqr:
+            vals_ms = iqr_filter(vals_ms)
+        for v in vals_ms:
+            records.append({"Phase": label, "Time (ms)": v})
+
+    if not records:
+        print("  No data for plot", file=sys.stderr)
+        return
+
+    df = pd.DataFrame(records)
+
+    sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(12, 6))
+    sns.boxplot(
+        data=df, x="Phase", y="Time (ms)",
+        color="#2196F3",
+        showfliers=True, flierprops=dict(marker="o", markersize=4, alpha=0.5),
+        ax=ax,
+    )
+    ax.set_title("Pipeline Timing Breakdown")
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+    fig.savefig(output)
+    plt.close(fig)
+    print(f"  Plot saved to {output}")
+
+
 def main() -> int:
     # Parse CLI arguments.
     ap = argparse.ArgumentParser()
     ap.add_argument("--sniffer", required=True, help="sniffer NDJSON (or .gz) or '-' for stdin")
     ap.add_argument("--retrans", required=True, help="retransmitter NDJSON (or .gz)")
     ap.add_argument("--csv", default="", help="optional path to write matched rows as CSV (minimal)")
+    ap.add_argument("--iqr", action="store_true",
+                    help="filter outliers using Tukey's IQR fences before computing stats")
+    ap.add_argument("--plot", nargs="?", const="auto", default=None,
+                    help="generate box plot (optionally specify output path, default: auto)")
     args = ap.parse_args()
 
     # Load both input files.
@@ -466,7 +527,10 @@ def main() -> int:
         """
         Convert ns list to ms and compute summary statistics.
         """
-        return Stats.from_values([ns_to_ms(v) for v in vals_ns])
+        vals_ms = [ns_to_ms(v) for v in vals_ns]
+        if args.iqr:
+            vals_ms = iqr_filter(vals_ms)
+        return Stats.from_values(vals_ms)
 
     # -------------------------------------------------------------------------
     # Report output
@@ -476,6 +540,8 @@ def main() -> int:
     print("==================")
     print("input mode: raw timestamps only; all deltas below are computed here")
     print("same-process phase timings prefer raw monotonic timestamps when available")
+    if args.iqr:
+        print("IQR outlier filtering: ON")
     print(f"sniffer events:        {len(sn)}   (duplicate ce_id ignored: {sn_dupes})")
     print(f"retransmitter events:  {len(rt)}")
     print(f"matched pairs:         {len(matched)}")
@@ -608,6 +674,28 @@ def main() -> int:
 
         print(f"Wrote CSV: {args.csv}")
         print()
+
+    if args.plot is not None:
+        metric_data = [
+            ("capture → ce_built", sn_cap_to_built),
+            ("ce_built → enqueue", sn_built_to_enqueue),
+            ("enqueue → send_start", sn_enqueue_to_send_start),
+            ("send_start → send_end", sn_send_start_to_end),
+            ("capture → send_end", sn_cap_to_send_end),
+            ("capture → retrans recv", e2e_cap_to_rt_recv),
+            ("retrans recv → fwd_end", rt_recv_to_fwd_end),
+            ("capture → fwd_end", e2e_cap_to_fwd_end),
+        ]
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if args.plot == "auto":
+            base = os.path.splitext(args.sniffer)[0]
+            plot_path = f"{base}_boxplot_{ts}.svg"
+        elif os.path.isdir(args.plot):
+            plot_path = os.path.join(args.plot, f"pipeline_boxplot_{ts}.svg")
+        else:
+            plot_path = args.plot
+        _generate_plot(metric_data, plot_path, use_iqr=args.iqr)
 
     return 0
 
