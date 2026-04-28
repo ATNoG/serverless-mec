@@ -1,0 +1,1 @@
+{"mode":"criu_thaw","iteration":1,"t_dns_s":0.000065,"t_connect_s":0.000689,"t_ttfb_s":0.008217,"t_total_s":0.008301,"http_code":422,"ts_before":"2026-04-27T10:41:19.665Z","ts_after":"2026-04-27T10:41:20.713Z"}
