@@ -400,14 +400,10 @@ delete_retransmitter_pod() {
 }
 
 cleanup_node_disk() {
-    # CRIU checkpoint/restore leaves ~49 MB temp dirs under /tmp/ctrd-checkpoint*
-    # on the bench node. At 500 iterations that is ~24 GB, enough to trigger
-    # disk-pressure taints. This function purges them periodically.
-    #
-    # NOTE: we intentionally do NOT touch the containerd content store here.
-    # Deleting blobs while containerd is running corrupts its metadata DB and
-    # breaks image pulls. Content store bloat must be handled offline
-    # (stop k3s-agent, delete blobs + metadata, restart).
+    # Cleans up disk space on the bench node to prevent disk-pressure taints:
+    #  1) /tmp/ctrd-checkpoint* — CRIU checkpoint temp dirs (~49 MB each)
+    #  2) crictl rmi --prune    — unused container images
+    #  3) ctr content prune     — unreferenced content store blobs
     #
     # Uses a privileged pod with hostPID + nsenter so it works even when
     # the node already has a disk-pressure taint (tolerates all taints).
@@ -427,13 +423,13 @@ cleanup_node_disk() {
               "name": "cleanup",
               "image": "busybox",
               "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
-                "n=$(ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l); rm -rf /tmp/ctrd-checkpoint*; echo $n"],
+                "n=$(ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l); rm -rf /tmp/ctrd-checkpoint*; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; echo $n"],
               "securityContext": {"privileged": true}
             }]
           }
         }' >/dev/null 2>&1
-    # Wait for it to finish (up to 30s)
-    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=30s >/dev/null 2>&1; then
+    # Wait for it to finish (up to 60s — image prune can be slow)
+    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s >/dev/null 2>&1; then
         local count
         count=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
         if [[ "${count:-0}" -gt 0 ]]; then
@@ -712,6 +708,18 @@ run_cold_start_benchmark() {
     local i ts_before ts_after timings
     for (( i=1; i<=ITERATIONS; i++ )); do
         log "--- Cold start iteration $i/$ITERATIONS ---"
+
+        # Periodic disk cleanup (images + content store) to prevent
+        # disk-pressure taints during long cold-start runs.
+        if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
+            cleanup_node_disk
+        fi
+
+        # Ensure bench-curl pod is alive (may have been evicted by disk pressure)
+        if ! kubectl get pod bench-curl -n "$NAMESPACE" --no-headers 2>/dev/null | grep -q Running; then
+            log "  bench-curl pod not running, restarting..."
+            setup_curl_pod
+        fi
 
         # Force-delete any running pod so scale-to-zero isn't gated by
         # whatever pod was brought up by the previous iteration.
