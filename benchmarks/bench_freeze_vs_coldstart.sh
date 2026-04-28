@@ -819,8 +819,20 @@ def print_block(label, st):
             val = str(v) if k == "n" else fmt(v)
             print(f"    {k:<7} = {val}")
 
-criu = [r["t_total_s"] * 1000 for r in rows if r.get("mode") == "criu_thaw"  and r.get("t_total_s", 0) > 0]
-cold = [r["t_total_s"] * 1000 for r in rows if r.get("mode") == "cold_start" and r.get("t_total_s", 0) > 0]
+def iqr_filter(vals):
+    if len(vals) < 4:
+        return vals
+    s = sorted(vals)
+    n = len(s)
+    q1, q3 = s[n // 4], s[(3 * n) // 4]
+    iqr = q3 - q1
+    lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    return [v for v in vals if lo <= v <= hi]
+
+criu_raw = [r["t_total_s"] * 1000 for r in rows if r.get("mode") == "criu_thaw"  and r.get("t_total_s", 0) > 0]
+cold_raw = [r["t_total_s"] * 1000 for r in rows if r.get("mode") == "cold_start" and r.get("t_total_s", 0) > 0]
+criu = iqr_filter(criu_raw)
+cold = iqr_filter(cold_raw)
 
 c_st = stats(criu)
 k_st = stats(cold)
@@ -829,8 +841,8 @@ print()
 print("=" * 60)
 print("  CRIU Thaw vs Cold Start — Benchmark Results")
 print("=" * 60)
-print(f"  CRIU thaw samples:  {c_st['n']}")
-print(f"  Cold start samples: {k_st['n']}")
+print(f"  CRIU thaw samples:  {c_st['n']} (before IQR: {len(criu_raw)})")
+print(f"  Cold start samples: {k_st['n']} (before IQR: {len(cold_raw)})")
 print()
 print("-" * 60)
 print("  Total Response Time")
