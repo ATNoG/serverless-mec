@@ -1,0 +1,42 @@
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
+metadata:
+  name: retransmitter-handoff
+  namespace: default
+spec:
+  dId: "retransmitter-handoff-appd-v1"
+  name: "retransmitter-handoff"
+  provider: "example.mec"
+  softVersion: "1.0.0"
+  dVersion: "1.0.0"
+  infoName: "Retransmitter with handoff"
+  description: "Retransmits packet then triggers an EdgeApplicationHandoff to a target replica"
+  service:
+    freezeEnabled: true
+    nodeSelector:
+      rsu-id: "rsu-b"
+    container:
+      image: ghcr.io/pmacoutinho/retransmitter-handoff:latest
+      env:
+        - name: FORWARD_URL
+          value: "http://http-sink.default.svc.cluster.local"
+        - name: HOP_NAME
+          value: "retransmitter-handoff"
+        - name: HANDOFF_EA_NAME
+          value: "retransmitter-handoff"
+        - name: HANDOFF_TARGET_REPLICA
+          value: "rsu-a"
+        - name: HANDOFF_NAMESPACE
+          value: "default"
+        - name: HANDOFF_CLEANUP_ON_DELETE
+          value: "true"
+        # Optional: override node placement for the target replica.
+        # If empty, the operator defaults to mec.atnog.org/rsu=<targetReplicaName>.
+        # Example for worker-1: '{"vm-id":"worker-1"}'
+        - name: HANDOFF_NODE_SELECTOR
+          value: ""
+      securityContext:
+        runAsUser: 0
+    serviceAccountName: retransmitter-handoff-sa
+    triggerFilters:
+      - type: its.cam
