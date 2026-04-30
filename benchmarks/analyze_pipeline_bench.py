@@ -99,6 +99,8 @@ def main() -> int:
                     help="filter outliers using Tukey's IQR fences (forwarded to analyze_bench.py)")
     ap.add_argument("--plot", nargs="?", const="auto", default=None,
                     help="generate box plot (forwarded to analyze_bench.py)")
+    ap.add_argument("--plot-ci", nargs="?", const="auto", default=None,
+                    help="generate bar chart with 95%% CI error bars (forwarded to analyze_bench.py)")
     args = ap.parse_args()
 
     if args.list_runs:
@@ -128,6 +130,8 @@ def main() -> int:
         cmd += ["--iqr"]
     if args.plot is not None:
         cmd += ["--plot"] if args.plot == "auto" else ["--plot", args.plot]
+    if args.plot_ci is not None:
+        cmd += ["--plot-ci"] if args.plot_ci == "auto" else ["--plot-ci", args.plot_ci]
 
     try:
         rc = subprocess.call(cmd)

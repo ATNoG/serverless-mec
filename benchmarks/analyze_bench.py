@@ -317,16 +317,9 @@ def _table(title: str, rows: List[Tuple[str, Stats]]) -> str:
     return "\n".join(lines)
 
 
-def _generate_plot(metric_data: List[tuple], output: str, use_iqr: bool) -> None:
-    """Generate seaborn box plots for pipeline timing metrics.
-
-    metric_data: list of (label, values_in_ns) tuples.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
+def _build_plot_df(metric_data: List[tuple], use_iqr: bool):
+    """Build a DataFrame from metric_data for plotting."""
     import pandas as pd
-    import matplotlib.pyplot as plt
-    import seaborn as sns
 
     records = []
     for label, vals_ns in metric_data:
@@ -335,12 +328,20 @@ def _generate_plot(metric_data: List[tuple], output: str, use_iqr: bool) -> None
             vals_ms = iqr_filter(vals_ms)
         for v in vals_ms:
             records.append({"Phase": label, "Time (ms)": v})
+    return pd.DataFrame(records)
 
-    if not records:
+
+def _generate_plot(metric_data: List[tuple], output: str, use_iqr: bool) -> None:
+    """Generate seaborn box plots for pipeline timing metrics."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    df = _build_plot_df(metric_data, use_iqr)
+    if df.empty:
         print("  No data for plot", file=sys.stderr)
         return
-
-    df = pd.DataFrame(records)
 
     sns.set_theme(style="whitegrid")
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -358,6 +359,33 @@ def _generate_plot(metric_data: List[tuple], output: str, use_iqr: bool) -> None
     print(f"  Plot saved to {output}")
 
 
+def _generate_ci_plot(metric_data: List[tuple], output: str, use_iqr: bool) -> None:
+    """Generate bar chart with 95% CI error bars for pipeline timing metrics."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    df = _build_plot_df(metric_data, use_iqr)
+    if df.empty:
+        print("  No data for CI plot", file=sys.stderr)
+        return
+
+    sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(12, 6))
+    sns.barplot(
+        data=df, x="Phase", y="Time (ms)",
+        color="#2196F3", errorbar=("ci", 95), capsize=0.1,
+        ax=ax,
+    )
+    ax.set_title("Pipeline Timing Breakdown — Mean (95% CI)")
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+    fig.savefig(output)
+    plt.close(fig)
+    print(f"  CI plot saved to {output}")
+
+
 def main() -> int:
     # Parse CLI arguments.
     ap = argparse.ArgumentParser()
@@ -368,6 +396,8 @@ def main() -> int:
                     help="filter outliers using Tukey's IQR fences before computing stats")
     ap.add_argument("--plot", nargs="?", const="auto", default=None,
                     help="generate box plot (optionally specify output path, default: auto)")
+    ap.add_argument("--plot-ci", nargs="?", const="auto", default=None,
+                    help="generate bar chart with 95%% CI error bars")
     args = ap.parse_args()
 
     # Load both input files.
@@ -675,19 +705,21 @@ def main() -> int:
         print(f"Wrote CSV: {args.csv}")
         print()
 
+    metric_data = [
+        ("capture → ce_built", sn_cap_to_built),
+        ("ce_built → enqueue", sn_built_to_enqueue),
+        ("enqueue → send_start", sn_enqueue_to_send_start),
+        ("send_start → send_end", sn_send_start_to_end),
+        ("capture → send_end", sn_cap_to_send_end),
+        ("capture → retrans recv", e2e_cap_to_rt_recv),
+        ("retrans recv → fwd_end", rt_recv_to_fwd_end),
+        ("capture → fwd_end", e2e_cap_to_fwd_end),
+    ]
+
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     if args.plot is not None:
-        metric_data = [
-            ("capture → ce_built", sn_cap_to_built),
-            ("ce_built → enqueue", sn_built_to_enqueue),
-            ("enqueue → send_start", sn_enqueue_to_send_start),
-            ("send_start → send_end", sn_send_start_to_end),
-            ("capture → send_end", sn_cap_to_send_end),
-            ("capture → retrans recv", e2e_cap_to_rt_recv),
-            ("retrans recv → fwd_end", rt_recv_to_fwd_end),
-            ("capture → fwd_end", e2e_cap_to_fwd_end),
-        ]
-        from datetime import datetime
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         if args.plot == "auto":
             base = os.path.splitext(args.sniffer)[0]
             plot_path = f"{base}_boxplot_{ts}.svg"
@@ -696,6 +728,16 @@ def main() -> int:
         else:
             plot_path = args.plot
         _generate_plot(metric_data, plot_path, use_iqr=args.iqr)
+
+    if args.plot_ci is not None:
+        if args.plot_ci == "auto":
+            base = os.path.splitext(args.sniffer)[0]
+            ci_path = f"{base}_ci_{ts}.svg"
+        elif os.path.isdir(args.plot_ci):
+            ci_path = os.path.join(args.plot_ci, f"pipeline_ci_{ts}.svg")
+        else:
+            ci_path = args.plot_ci
+        _generate_ci_plot(metric_data, ci_path, use_iqr=args.iqr)
 
     return 0
 

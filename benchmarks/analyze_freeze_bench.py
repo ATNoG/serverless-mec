@@ -160,13 +160,9 @@ def _http_codes(rows: List[dict], mode: str) -> Dict[str, int]:
     return out
 
 
-def _generate_plot(rows: List[dict], output: str, use_iqr: bool) -> None:
-    """Generate seaborn box plots comparing CRIU thaw vs Cold start."""
-    import matplotlib
-    matplotlib.use("Agg")
+def _plot_phases(rows: List[dict], use_iqr: bool) -> Tuple:
+    """Build phase data shared by both plot types."""
     import pandas as pd
-    import matplotlib.pyplot as plt
-    import seaborn as sns
 
     phases: List[Tuple[str, str]] = [
         ("DNS", "t_dns_s"),
@@ -174,6 +170,7 @@ def _generate_plot(rows: List[dict], output: str, use_iqr: bool) -> None:
         ("TTFB", "t_ttfb_s"),
         ("Total", "t_total_s"),
     ]
+    palette = {"CRIU Thaw": "#2196F3", "Cold Start": "#4CAF50"}
 
     records = []
     for label, key in phases:
@@ -184,17 +181,26 @@ def _generate_plot(rows: List[dict], output: str, use_iqr: bool) -> None:
             for v in vals:
                 records.append({"Phase": label, "Scenario": mode_label, "Time (ms)": v})
 
-    if not records:
+    return pd.DataFrame(records), palette
+
+
+def _generate_plot(rows: List[dict], output: str, use_iqr: bool) -> None:
+    """Generate seaborn box plots comparing CRIU thaw vs Cold start."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    df, palette = _plot_phases(rows, use_iqr)
+    if df.empty:
         print("  No data for plot", file=sys.stderr)
         return
-
-    df = pd.DataFrame(records)
 
     sns.set_theme(style="whitegrid")
     fig, ax = plt.subplots(figsize=(10, 6))
     sns.boxplot(
         data=df, x="Phase", y="Time (ms)", hue="Scenario",
-        palette={"CRIU Thaw": "#2196F3", "Cold Start": "#4CAF50"},
+        palette=palette,
         showfliers=True, flierprops=dict(marker="o", markersize=4, alpha=0.5),
         ax=ax,
     )
@@ -207,6 +213,34 @@ def _generate_plot(rows: List[dict], output: str, use_iqr: bool) -> None:
     print(f"  Plot saved to {output}")
 
 
+def _generate_ci_plot(rows: List[dict], output: str, use_iqr: bool) -> None:
+    """Generate bar chart with 95% CI error bars comparing CRIU thaw vs Cold start."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    df, palette = _plot_phases(rows, use_iqr)
+    if df.empty:
+        print("  No data for CI plot", file=sys.stderr)
+        return
+
+    sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.barplot(
+        data=df, x="Phase", y="Time (ms)", hue="Scenario",
+        palette=palette, errorbar=("ci", 95), capsize=0.1,
+        ax=ax,
+    )
+    ax.set_title("CRIU Thaw vs Cold Start — Mean Response Time (95% CI)")
+    ax.legend(loc="upper left")
+    plt.xticks(rotation=20, ha="right")
+    plt.tight_layout()
+    fig.savefig(output)
+    plt.close(fig)
+    print(f"  CI plot saved to {output}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("inputs", nargs="+", help="freeze_vs_coldstart NDJSON file(s)")
@@ -216,6 +250,8 @@ def main() -> int:
                     help="filter outliers using Tukey's IQR fences before computing stats")
     ap.add_argument("--plot", nargs="?", const="auto", default=None,
                     help="generate box plot (optionally specify output path, default: auto)")
+    ap.add_argument("--plot-ci", nargs="?", const="auto", default=None,
+                    help="generate bar chart with 95%% CI error bars")
     args = ap.parse_args()
 
     rows = _read(args.inputs)
@@ -316,9 +352,10 @@ def main() -> int:
         print(f"  (per-iteration table suppressed; pass --per-iter to show all {max(len(criu), len(cold))} rows)")
         print()
 
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     if args.plot is not None:
-        from datetime import datetime
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         if args.plot == "auto":
             base = os.path.splitext(args.inputs[0])[0]
             plot_path = f"{base}_boxplot_{ts}.svg"
@@ -327,6 +364,16 @@ def main() -> int:
         else:
             plot_path = args.plot
         _generate_plot(rows, plot_path, use_iqr=args.iqr)
+
+    if args.plot_ci is not None:
+        if args.plot_ci == "auto":
+            base = os.path.splitext(args.inputs[0])[0]
+            ci_path = f"{base}_ci_{ts}.svg"
+        elif os.path.isdir(args.plot_ci):
+            ci_path = os.path.join(args.plot_ci, f"freeze_vs_coldstart_ci_{ts}.svg")
+        else:
+            ci_path = args.plot_ci
+        _generate_ci_plot(rows, ci_path, use_iqr=args.iqr)
 
     return 0
 
