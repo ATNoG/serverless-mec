@@ -150,12 +150,16 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 	ho.Status.TargetKService = fmt.Sprintf("%s/%s", app.Namespace, svcName)
 
 	// trigger exists only if app.spec.service.triggerFilters is non-empty
-	trigNs, trigName := "", ""
+	trigNs := ""
+	var triggerNames []string
 	if app.Spec.Service != nil && len(app.Spec.Service.TriggerFilters) > 0 {
-		trigNs, trigName = r.expectedTrigger(ctx, svcName)
+		trigNs = r.expectedTriggerNamespace(ctx)
+		for i := range app.Spec.Service.TriggerFilters {
+			triggerNames = append(triggerNames, fmt.Sprintf("%s-trigger-%d", svcName, i))
+		}
 	}
-	if trigNs != "" && trigName != "" {
-		ho.Status.TargetTrigger = fmt.Sprintf("%s/%s", trigNs, trigName)
+	if len(triggerNames) > 0 {
+		ho.Status.TargetTrigger = fmt.Sprintf("%s/%s", trigNs, triggerNames[0])
 	} else {
 		ho.Status.TargetTrigger = ""
 	}
@@ -164,8 +168,11 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 	svcReady := r.isKServiceReady(ctx, app.Namespace, svcName)
 
 	trigReady := true
-	if trigNs != "" && trigName != "" {
-		trigReady = r.isTriggerReady(ctx, trigNs, trigName)
+	for _, tn := range triggerNames {
+		if !r.isTriggerReady(ctx, trigNs, tn) {
+			trigReady = false
+			break
+		}
 	}
 
 	if svcReady && trigReady {
@@ -285,9 +292,9 @@ func (r *EdgeApplicationHandoffReconciler) cleanupTargetReplica(ctx context.Cont
 	return r.Patch(ctx, &app, client.MergeFrom(orig))
 }
 
-// Determine expected trigger name/namespace.
+// Determine the namespace where triggers are created.
 // Uses mec-operator-config (same as EdgeApplication controller).
-func (r *EdgeApplicationHandoffReconciler) expectedTrigger(ctx context.Context, svcName string) (trigNs string, trigName string) {
+func (r *EdgeApplicationHandoffReconciler) expectedTriggerNamespace(ctx context.Context) string {
 	cfgNs := r.ConfigNamespace
 	if cfgNs == "" {
 		cfgNs = defaultConfigNs
@@ -295,16 +302,16 @@ func (r *EdgeApplicationHandoffReconciler) expectedTrigger(ctx context.Context, 
 
 	var cfg corev1.ConfigMap
 	if err := r.Get(ctx, types.NamespacedName{Name: defaultConfigMapName, Namespace: cfgNs}, &cfg); err != nil {
-		return "", ""
+		return ""
 	}
 
 	brokerNamespace := cfg.Data["default-broker-namespace"]
 	brokerName := cfg.Data["default-broker-name"]
 	if brokerNamespace == "" || brokerName == "" {
-		return "", ""
+		return ""
 	}
 
-	return brokerNamespace, svcName + "-trigger"
+	return brokerNamespace
 }
 
 // --- Readiness checks ---

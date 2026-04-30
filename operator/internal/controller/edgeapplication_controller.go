@@ -201,6 +201,14 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			svcName := fmt.Sprintf("%s-%s", app.Name, rep.Name)
 
 			repPod := basePodSpec
+			// Deep-copy the Containers slice so that appending env vars
+			// (e.g. HOST_IP) in reconcileKService does not mutate the
+			// shared backing array and cause duplicates.
+			repContainers := make([]corev1.Container, len(basePodSpec.Containers))
+			for ci := range basePodSpec.Containers {
+				repContainers[ci] = *basePodSpec.Containers[ci].DeepCopy()
+			}
+			repPod.Containers = repContainers
 			repPod.NodeSelector = nilIfEmptyMap(rep.NodeSelector)
 			repPod.Tolerations = nilIfEmptyTolerations(rep.Tolerations)
 			repPod.Affinity = rep.Affinity
