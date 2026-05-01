@@ -9,6 +9,7 @@ rules:
   resources:
   - configmaps
   - nodes
+  - pods
   verbs:
   - get
   - list

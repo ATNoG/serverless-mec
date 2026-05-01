@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"regexp"
 	"time"
 
@@ -45,6 +46,7 @@ import (
 const (
 	handoffFinalizer      = "mec.atnog.org/handoff-finalizer"
 	defaultRSULabelKeyHO  = "mec.atnog.org/rsu"
+	queueProxyPort        = 8012
 )
 
 // EdgeApplicationHandoffReconciler reconciles EdgeApplicationHandoff objects.
@@ -59,6 +61,7 @@ type EdgeApplicationHandoffReconciler struct {
 // +kubebuilder:rbac:groups=mec.atnog.org,resources=edgeapplicationhandoffs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=mec.atnog.org,resources=edgeapplications,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=serving.knative.dev,resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=eventing.knative.dev,resources=triggers,verbs=get;list;watch
 
@@ -162,6 +165,24 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 		ho.Status.TargetTrigger = fmt.Sprintf("%s/%s", trigNs, triggerNames[0])
 	} else {
 		ho.Status.TargetTrigger = ""
+	}
+
+	// If freeze is enabled, thaw the target pod BEFORE checking KService
+	// readiness. When frozen, the readiness probe triggers thaw/re-freeze
+	// cycles that cause the KService Ready condition to flap. We must thaw
+	// first so the pod stabilizes and the KService becomes truly Ready.
+	freezeEnabled := app.Spec.Service.FreezeEnabled != nil && *app.Spec.Service.FreezeEnabled
+	if freezeEnabled {
+		thawed, err := r.ensureTargetThawed(ctx, app.Namespace, svcName)
+		if err != nil {
+			logger.Error(err, "failed to thaw target pod")
+			r.setApplied(ctx, &ho, "ThawInProgress", fmt.Sprintf("thawing frozen target: %v", err))
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+		}
+		if !thawed {
+			r.setApplied(ctx, &ho, "ThawInProgress", "waiting for target pod to thaw")
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+		}
 	}
 
 	// Readiness checks (best-effort)
@@ -312,6 +333,68 @@ func (r *EdgeApplicationHandoffReconciler) expectedTriggerNamespace(ctx context.
 	}
 
 	return brokerNamespace
+}
+
+// --- Thaw logic ---
+
+// ensureTargetThawed checks whether the target KService's pod has a frozen
+// user-container (Terminated due to CRIU checkpoint) and, if so, sends an
+// HTTP request through the queue-proxy to trigger the freezer plugin's thaw.
+// Returns (true, nil) when the pod is confirmed running (not frozen).
+func (r *EdgeApplicationHandoffReconciler) ensureTargetThawed(ctx context.Context, ns, svcName string) (bool, error) {
+	logger := logf.FromContext(ctx)
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(ns),
+		client.MatchingLabels{"serving.knative.dev/service": svcName},
+	); err != nil {
+		return false, err
+	}
+
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
+			continue
+		}
+
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.Name != "user-container" {
+				continue
+			}
+			if cs.State.Terminated == nil {
+				// user-container is running — not frozen
+				return true, nil
+			}
+
+			// user-container is terminated (frozen by CRIU checkpoint).
+			// Send a request to the queue-proxy to trigger thaw.
+			logger.Info("Thawing frozen target pod", "pod", pod.Name, "podIP", pod.Status.PodIP)
+			thawURL := fmt.Sprintf("http://%s:%d", pod.Status.PodIP, queueProxyPort)
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, thawURL, nil)
+			if err != nil {
+				return false, err
+			}
+
+			httpClient := &http.Client{Timeout: 30 * time.Second}
+			resp, err := httpClient.Do(httpReq)
+			if err != nil {
+				return false, fmt.Errorf("thaw request to pod %s failed: %w", pod.Name, err)
+			}
+			resp.Body.Close()
+
+			logger.Info("Thaw request completed", "pod", pod.Name, "status", resp.StatusCode)
+			// Any HTTP response means queue-proxy processed the request,
+			// so the freezer plugin's ApproveRequest() already triggered
+			// the CRIU restore. The Kubernetes API may not update the
+			// container status from Terminated→Running after CRIU restore,
+			// so we trust the HTTP response and consider the pod thawed.
+			return true, nil
+		}
+	}
+
+	// No pods found with a terminated user-container — assume not frozen
+	return true, nil
 }
 
 // --- Readiness checks ---
