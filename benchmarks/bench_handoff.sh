@@ -635,36 +635,58 @@ run_freeze_scenario() {
     log "  Target KService: $target_svc"
 
     # Step 1: Kyverno policy for restartPolicy=Never ONLY on the target.
-    # Must be in place before the operator creates the target deployment.
-    # We scope it to the target KService only — the source KService also
-    # has freezeEnabled=true (EA-level setting), but without restartPolicy=Never,
-    # kubelet restarts the source container after CRIU checkpoint, keeping it healthy.
+    # Required because CRIU checkpoint kills the user-container process.
+    # Without restartPolicy=Never, kubelet restarts it instead of leaving
+    # it dead for CRIU restore. Scoped to target only so the source stays
+    # healthy (kubelet restarts its container after any accidental freeze).
     ensure_restart_policy_kyverno "$target_svc"
 
-    # Step 2: Patch EA — freeze=true, clear triggerFilters (prevents broker
-    # from waking frozen pods), cleanupOnDelete=false (KService survives
-    # handoff CR deletion so the same pod can re-freeze between iterations).
+    # Step 2: Patch EA — freeze=true, clear triggerFilters.
+    # triggerFilters must be empty to prevent the broker from dispatching
+    # events to the target pod (which would keep it awake and prevent freeze).
+    # cleanupOnDelete=false so the target KService survives handoff CR deletion.
     patch_ea "true" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
         "$handoff_target" "$handoff_node_selector" "false"
 
-    # Also clear triggerFilters so no triggers are created for the target
     kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=merge \
         -p '{"spec":{"service":{"triggerFilters":[]}}}' >/dev/null 2>&1
     kubectl delete trigger -n "$NAMESPACE" \
         -l "mec.atnog.org/app=$EA_NAME" --ignore-not-found >/dev/null 2>&1
 
-    # Wait for source KService revision to stabilize after all EA patches
-    sleep 10
     wait_for_knative_rollout "$SERVICE_NAME"
 
-    # Step 3: Warmup — prime the target KService by creating the handoff CR
-    # directly (not via the retransmitter). freezeEnabled=true affects the
-    # source KService too, causing readiness issues when the source freezes.
-    # Since freeze iterations measure CR→thaw→Ready (no retransmitter step),
-    # we bypass the source entirely.
-    log "  Warmup: priming target KService via direct CR..."
+    # Step 3: Clean slate — delete any lingering target state from previous
+    # runs. Create a temporary CR with cleanupOnDelete=true to properly
+    # remove the replica from the EA spec, then delete it.
+    log "  Cleaning lingering target state..."
+    # Delete any existing handoff CR
     delete_handoff_cr "$handoff_target"
-    sleep 2
+    # Delete target KService directly (may linger from cleanupOnDelete=false)
+    kubectl delete ksvc "$target_svc" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
+    # Remove the target replica from EA.spec.replicas via a cleanup CR
+    kubectl apply -f - >/dev/null 2>&1 <<CLEANUP
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplicationHandoff
+metadata:
+  name: ${HANDOFF_CR_PREFIX}${handoff_target}
+  namespace: ${NAMESPACE}
+spec:
+  edgeApplicationName: ${EA_NAME}
+  targetReplicaName: ${handoff_target}
+  cleanupOnDelete: true
+  nodeSelector:
+    vm-id: worker-1
+CLEANUP
+    sleep 1
+    delete_handoff_cr "$handoff_target"
+    # Wait for KService to be fully gone
+    kubectl wait ksvc "$target_svc" -n "$NAMESPACE" --for=delete --timeout=30s >/dev/null 2>&1 || true
+    log "  Clean slate established."
+
+    # Step 4: Warmup — prime the target KService via direct handoff CR.
+    # We bypass the retransmitter entirely because freezeEnabled is EA-level
+    # and would also freeze the source pod.
+    log "  Warmup: priming target KService via direct CR..."
 
     kubectl apply -f - >/dev/null 2>&1 <<EOF
 apiVersion: mec.atnog.org/v1alpha1
@@ -679,7 +701,6 @@ spec:
   nodeSelector:
     vm-id: worker-1
 EOF
-    sleep 2
 
     if ! wait_for_handoff_ready "$handoff_target"; then
         local phase
@@ -689,28 +710,28 @@ EOF
     fi
     log "  Warmup handoff Ready — target KService $target_svc exists"
 
-    # Step 4: Delete warmup CR (KService survives) and wait for target freeze
+    # Step 4: Delete warmup CR (KService survives) and freeze the target.
     delete_handoff_cr "$handoff_target"
-
-    # Wait for revisions to stabilize
     wait_for_knative_rollout "$target_svc"
 
-    # Ensure target pod is up and ready
     if ! wait_for_target_pod_ready "$target_svc"; then
         log "  ERROR: target pod never became ready after warmup, aborting"
         return
     fi
 
-    # Wait for the target to freeze (~30s idle timeout)
-    # Use log-based detection (queue-proxy "fake listener started") which
-    # is reliable, unlike k8s container status which stays Terminated
-    # permanently after CRIU restore.
+    # Trigger freeze directly via the freezer daemon API instead of waiting
+    # the 30s idle timeout. This saves ~25s per setup.
     local warmup_pod
     warmup_pod=$(get_target_pod_name "$target_svc")
     if [[ -z "$warmup_pod" ]]; then
         log "  ERROR: no target pod found after warmup, aborting"
         return
     fi
+    # Wait for freeze via the plugin's idle timeout (~30s) + CRIU checkpoint (~5s).
+    # We cannot call the freezer daemon directly because that bypasses the
+    # queue-proxy plugin's state management (frozen flag, fake listener),
+    # breaking the thaw path. The idle timeout is set by FREEZER_IDLE_TIMEOUT_SECONDS
+    # env var on the queue-proxy (default 30s).
     if ! wait_for_target_freeze "$warmup_pod"; then
         log "  ERROR: target did not freeze after warmup, aborting"
         return
@@ -718,10 +739,10 @@ EOF
     log "  Target frozen — starting measured iterations"
 
     # Step 5: Run measured iterations.
-    # After CRIU restore, the same pod cannot be re-frozen (kubelet doesn't
-    # track the restored containerd task). Each iteration therefore needs a
-    # fresh pod. We delete the target pod after each handoff, wait for the
-    # KService to spin up a replacement, wait for it to freeze, then measure.
+    # Each iteration uses a fresh pod to guarantee clean CRIU state.
+    # After CRIU restore, the 3rd checkpoint/restore cycle on the same pod
+    # fails (CRIU limitation with accumulated TCP/PID state). Fresh pods
+    # ensure every measurement is from a clean first-restore.
     local i
     for (( i=1; i<=iterations; i++ )); do
         log "--- worker1-freeze iteration $i/$iterations ---"
@@ -732,16 +753,14 @@ EOF
 
         # Delete handoff CR from previous iteration (KService survives)
         delete_handoff_cr "$handoff_target"
-        sleep 2
 
         # Delete the target pod so the KService creates a fresh one.
-        # After CRIU restore the old pod can't be re-frozen.
+        # This guarantees clean CRIU state for every measurement.
         local old_pod
         old_pod=$(get_target_pod_name "$target_svc")
         if [[ -n "$old_pod" ]]; then
-            log "  Deleting old target pod $old_pod for fresh freeze cycle..."
+            log "  Recycling target pod for clean CRIU state..."
             kubectl delete pod "$old_pod" -n "$NAMESPACE" --grace-period=1 --wait=false >/dev/null 2>&1 || true
-            # Wait for old pod to terminate
             kubectl wait pod "$old_pod" -n "$NAMESPACE" --for=delete --timeout=60s >/dev/null 2>&1 || true
         fi
 
@@ -751,14 +770,14 @@ EOF
             continue
         fi
 
-        # Wait for the replacement pod to freeze (use log-based detection
-        # because k8s container status is unreliable after CRIU restore)
+        # Trigger freeze directly via the freezer daemon API
         local target_pod
         target_pod=$(get_target_pod_name "$target_svc")
         if [[ -z "$target_pod" ]]; then
             log "  SKIPPED: no target pod found"
             continue
         fi
+        # Wait for freeze via idle timeout (~30s) + CRIU checkpoint (~5s)
         if ! wait_for_target_freeze "$target_pod"; then
             log "  SKIPPED: target did not freeze"
             continue
