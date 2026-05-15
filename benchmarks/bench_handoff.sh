@@ -33,6 +33,9 @@ CHECKPOINT_CLEANUP_INTERVAL=5
 
 QUEUE_PROXY_PORT=8012
 FREEZE_WAIT_TIMEOUT=300
+FREEZER_IDLE_TIMEOUT=5  # seconds — injected into queue-proxy via Kyverno
+
+QP_IMAGE_BACKUP=""
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_DIR="$SCRIPT_DIR/../knative-freezer-plugin"
@@ -92,6 +95,49 @@ print(json.dumps(r, separators=(',',':')))
 " "$scenario" "$iteration" "$t_dns" "$t_connect" "$t_ttfb" "$t_total" \
   "$http_code" "$ts_before" "$ts_after" "$handoff_phase" "$handoff_time_ms" \
   >> "$OUTFILE"
+}
+
+# ---- queue-proxy image pinning ----------------------------------------------
+# Pin the queue-proxy sidecar image to a fixed digest so imagePullPolicy
+# becomes IfNotPresent, eliminating registry checks from measurements.
+
+pin_queue_proxy_image() {
+    local current
+    current=$(kubectl get configmap config-deployment -n knative-serving \
+        -o jsonpath='{.data.queue-sidecar-image}' 2>/dev/null)
+    QP_IMAGE_BACKUP="$current"
+
+    # Already pinned to a digest — nothing to do
+    if [[ "$current" == *"@sha256:"* ]]; then
+        log "  Queue-proxy image already pinned: ${current##*@}"
+        return
+    fi
+
+    # Resolve the tag to a digest from a running pod
+    local digest
+    digest=$(kubectl get pods -n "$NAMESPACE" --field-selector=status.phase=Running \
+        -o jsonpath='{range .items[*]}{.status.containerStatuses[?(@.name=="queue-proxy")].imageID}{"\n"}{end}' 2>/dev/null \
+        | grep -o 'sha256:[a-f0-9]*' | head -1)
+
+    if [[ -z "$digest" ]]; then
+        log "  WARNING: could not resolve queue-proxy digest, skipping pin"
+        return
+    fi
+
+    local repo
+    repo="${current%:*}"
+    local pinned="${repo}@sha256:${digest#sha256:}"
+
+    kubectl patch configmap config-deployment -n knative-serving --type=merge \
+        -p "{\"data\":{\"queue-sidecar-image\":\"$pinned\"}}" >/dev/null 2>&1
+    log "  Pinned queue-proxy image to digest: sha256:${digest#sha256:}"
+}
+
+restore_queue_proxy_image() {
+    if [[ -n "$QP_IMAGE_BACKUP" ]]; then
+        kubectl patch configmap config-deployment -n knative-serving --type=merge \
+            -p "{\"data\":{\"queue-sidecar-image\":\"$QP_IMAGE_BACKUP\"}}" >/dev/null 2>&1
+    fi
 }
 
 # ---- curl pod --------------------------------------------------------------
@@ -370,6 +416,59 @@ spec:
 POLICY
 }
 
+ensure_freeze_idle_timeout_kyverno() {
+    # Inject FREEZER_IDLE_TIMEOUT_SECONDS into the queue-proxy container
+    # for all pods with freezeEnabled. This controls how long the plugin
+    # waits before triggering CRIU checkpoint after the last request.
+    kubectl delete clusterpolicy bench-freeze-idle-timeout --ignore-not-found >/dev/null 2>&1
+    log "  Applying kyverno policy: inject FREEZER_IDLE_TIMEOUT_SECONDS=${FREEZER_IDLE_TIMEOUT}s"
+    kubectl apply -f - >/dev/null 2>&1 <<POLICY
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: bench-freeze-idle-timeout
+  labels:
+    app.kubernetes.io/managed-by: bench-handoff
+spec:
+  rules:
+    - name: set-freeze-idle-timeout
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+              namespaces:
+                - "${NAMESPACE}"
+      mutate:
+        patchStrategicMerge:
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: queue-proxy
+                    env:
+                      - name: FREEZER_IDLE_TIMEOUT_SECONDS
+                        value: "${FREEZER_IDLE_TIMEOUT}"
+POLICY
+}
+
+wait_for_operator() {
+    local timeout=60 elapsed=0
+    while (( elapsed < timeout )); do
+        local ready
+        ready=$(kubectl get pods -n operator-system \
+            -l control-plane=controller-manager \
+            -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+        if [[ "$ready" == "True" ]]; then
+            return 0
+        fi
+        sleep 2
+        (( elapsed += 2 ))
+    done
+    log "  WARNING: operator not ready after ${timeout}s"
+    return 1
+}
+
 # ---- disk cleanup ----------------------------------------------------------
 
 BENCH_NODE_NAME=""
@@ -457,6 +556,8 @@ cleanup() {
     cleanup_node_disk
     kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
+    kubectl delete clusterpolicy bench-freeze-idle-timeout --ignore-not-found >/dev/null 2>&1 || true
+    restore_queue_proxy_image
 
     # Delete any leftover handoff CRs
     kubectl delete edgeapplicationhandoff --all -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
@@ -589,6 +690,12 @@ run_scenario() {
     for (( i=1; i<=iterations; i++ )); do
         log "--- $scenario iteration $i/$iterations ---"
 
+        # Pre-check: ensure operator is running before starting iteration
+        if ! wait_for_operator; then
+            log "  SKIPPED: operator not ready"
+            continue
+        fi
+
         if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
             cleanup_node_disk
         fi
@@ -640,6 +747,7 @@ run_freeze_scenario() {
     # it dead for CRIU restore. Scoped to target only so the source stays
     # healthy (kubelet restarts its container after any accidental freeze).
     ensure_restart_policy_kyverno "$target_svc"
+    ensure_freeze_idle_timeout_kyverno
 
     # Step 2: Patch EA — freeze=true, clear triggerFilters.
     # triggerFilters must be empty to prevent the broker from dispatching
@@ -747,6 +855,12 @@ EOF
     for (( i=1; i<=iterations; i++ )); do
         log "--- worker1-freeze iteration $i/$iterations ---"
 
+        # Pre-check: ensure operator is running before starting iteration
+        if ! wait_for_operator; then
+            log "  SKIPPED: operator not ready"
+            continue
+        fi
+
         if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
             cleanup_node_disk
         fi
@@ -851,6 +965,7 @@ main() {
     fi
 
     resolve_bench_node
+    pin_queue_proxy_image
     setup_curl_pod
 
     # Run selected scenarios
