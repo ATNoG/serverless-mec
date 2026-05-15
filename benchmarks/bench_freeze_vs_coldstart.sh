@@ -49,7 +49,7 @@ SERVICE_NAME="retransmitter"
 EA_NAME="retransmitter"
 # cgroup-v2 worker where CRIU checkpoint is supported
 BENCH_NODE_SELECTOR_KEY="vm-id"
-BENCH_NODE_SELECTOR_VAL="worker-1"
+BENCH_NODE_SELECTOR_VAL="${BENCH_NODE:-worker-1}"
 SERVICE_URL="http://retransmitter.default.svc.cluster.local"
 QUEUE_PROXY_PORT=8012
 # Hard ceiling on how long we wait for the freezer plugin to checkpoint
@@ -154,6 +154,7 @@ cleanup() {
     cleanup_node_disk
     kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
+    kubectl delete clusterpolicy bench-freeze-idle-timeout --ignore-not-found >/dev/null 2>&1 || true
     # Revert queue-proxy BEFORE restoring the EA so that the final revision
     # Knative creates uses the original queue-proxy image + original EA spec
     # (nodeSelector, triggers, etc.) in one shot, avoiding extra churn.
@@ -481,6 +482,45 @@ spec:
 POLICY
 }
 
+ensure_freeze_idle_timeout_kyverno() {
+    # Injects FREEZER_IDLE_TIMEOUT_SECONDS=5 into the queue-proxy container
+    # via a Kyverno mutating policy. This reduces the freeze wait from ~30s
+    # to ~5s per iteration — a benchmark optimization only.
+    if kubectl get clusterpolicy bench-freeze-idle-timeout >/dev/null 2>&1; then
+        return 0
+    fi
+    log "  Applying kyverno policy: inject FREEZER_IDLE_TIMEOUT_SECONDS=5 on queue-proxy"
+    kubectl apply -f - >/dev/null 2>&1 <<'POLICY'
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: bench-freeze-idle-timeout
+  labels:
+    app.kubernetes.io/managed-by: bench-freeze-vs-coldstart
+spec:
+  rules:
+    - name: set-freeze-idle-timeout
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+              selector:
+                matchLabels:
+                  serving.knative.dev/service: "*"
+      mutate:
+        patchStrategicMerge:
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: queue-proxy
+                    env:
+                      - name: FREEZER_IDLE_TIMEOUT_SECONDS
+                        value: "5"
+POLICY
+}
+
 # ---- result emission --------------------------------------------------------
 
 emit_result() {
@@ -595,6 +635,7 @@ preflight() {
     # Knative's field mask strips the per-container restartPolicy field,
     # so only an admission webhook can inject it persistently.
     ensure_restart_policy_kyverno
+    ensure_freeze_idle_timeout_kyverno
 
     log "Preflight: enabling freeze (operator will force minScale>=1 automatically)"
     # The operator auto-injects minScale=1 whenever freezeEnabled=true,
