@@ -447,10 +447,12 @@ delete_retransmitter_pod() {
 cleanup_node_disk() {
     # Cleans up disk space on the bench node to prevent disk-pressure taints:
     #  1) /tmp/ctrd-checkpoint* — CRIU checkpoint temp dirs (~49 MB each)
-    #  2) containerd content store blobs — the main disk hog; find -delete
-    #     is used instead of rm -rf glob to avoid shell expansion issues
-    #     in broken TTY/nsenter sessions
-    #  3) crictl rmi --prune    — unused container images
+    #  2) crictl rmi --prune    — unused container images
+    #  3) ctr content prune     — unreferenced content store blobs
+    #
+    # NOTE: Do NOT delete blobs directly from the containerd content store
+    # (io.containerd.content.v1.content/blobs). That nukes blobs for cached
+    # images and breaks all container creation on the node.
     #
     # Uses a privileged pod with hostPID + nsenter so it works even when
     # the node already has a disk-pressure taint (tolerates all taints).
@@ -460,8 +462,6 @@ cleanup_node_disk() {
     local pod_name="bench-disk-cleanup"
     kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     sleep 2
-
-    local blob_dir="/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content/blobs"
     kubectl run "$pod_name" -n "$NAMESPACE" --restart=Never --image=busybox \
         --overrides='{
           "spec": {
@@ -472,16 +472,15 @@ cleanup_node_disk() {
               "name": "cleanup",
               "image": "busybox",
               "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
-                "n=$(ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l); rm -rf /tmp/ctrd-checkpoint*; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; blob_before=$(du -sm '"$blob_dir"' 2>/dev/null | cut -f1); find '"$blob_dir"' -type f -delete 2>/dev/null; find '"$blob_dir"' -type d -empty -delete 2>/dev/null; blob_after=$(du -sm '"$blob_dir"' 2>/dev/null | cut -f1); echo checkpoints=$n blob_freed=$((${blob_before:-0} - ${blob_after:-0}))MB"],
+                "n=$(find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d 2>/dev/null | wc -l); find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d -exec rm -rf {} + 2>/dev/null; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; echo cleaned_checkpoints=$n"],
               "securityContext": {"privileged": true}
             }]
           }
         }' >/dev/null 2>&1
-    # Wait for it to finish (up to 120s — blob deletion can be slow on large dirs)
-    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s >/dev/null 2>&1; then
+    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s >/dev/null 2>&1; then
         local result
         result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
-        if [[ -n "$result" && "$result" != "checkpoints=0 blob_freed=0MB" ]]; then
+        if [[ -n "$result" && "$result" != "cleaned_checkpoints=0" ]]; then
             log "  Disk cleanup on $BENCH_NODE_NAME: $result"
         fi
     fi
