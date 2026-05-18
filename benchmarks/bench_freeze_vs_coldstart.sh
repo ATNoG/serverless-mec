@@ -56,14 +56,17 @@ QUEUE_PROXY_PORT=8012
 # the pod. The actual signal we wait for is the "fake listener started"
 # log line on the queue-proxy; this is just a safety net.
 FREEZE_WAIT_TIMEOUT=300
-# How often (in iterations) to purge leftover CRIU checkpoint dirs from
-# the bench node's /tmp.  Each checkpoint is ~49 MB; at 500 iterations
-# that is ~24 GB, enough to trigger disk-pressure taints.
-CHECKPOINT_CLEANUP_INTERVAL=10
+# How often (in iterations) to purge CRIU checkpoint dirs and containerd
+# content store blobs from the bench node.  Each checkpoint is ~49 MB and
+# containerd blobs grow unboundedly; at 500 iterations both sources can
+# trigger disk-pressure taints.
+CHECKPOINT_CLEANUP_INTERVAL=5
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_DIR="$SCRIPT_DIR/../knative-freezer-plugin"
 QP_PATCHED_BY_US=false
+QP_IMAGE_BACKUP=""
+BENCH_NODE_NAME=""
 
 OUTDIR="$SCRIPT_DIR/freeze_vs_coldstart_logs"
 mkdir -p "$OUTDIR"
@@ -104,6 +107,46 @@ for d in docs:
         out.append(clean(d))
 print(yaml.safe_dump_all(out))
 "
+}
+
+# ---- queue-proxy image pinning -----------------------------------------------
+# Pin the queue-proxy sidecar image to a fixed digest so imagePullPolicy
+# becomes IfNotPresent, eliminating registry checks from measurements.
+
+pin_queue_proxy_image() {
+    local current
+    current=$(kubectl get configmap config-deployment -n knative-serving \
+        -o jsonpath='{.data.queue-sidecar-image}' 2>/dev/null)
+    QP_IMAGE_BACKUP="$current"
+
+    if [[ "$current" == *"@sha256:"* ]]; then
+        log "  Queue-proxy image already pinned: ${current##*@}"
+        return
+    fi
+
+    local digest
+    digest=$(kubectl get pods -n "$NAMESPACE" --field-selector=status.phase=Running \
+        -o jsonpath='{range .items[*]}{.status.containerStatuses[?(@.name=="queue-proxy")].imageID}{"\n"}{end}' 2>/dev/null \
+        | grep -o 'sha256:[a-f0-9]*' | head -1)
+
+    if [[ -z "$digest" ]]; then
+        log "  WARNING: could not resolve queue-proxy digest, skipping pin"
+        return
+    fi
+
+    local repo="${current%:*}"
+    local pinned="${repo}@sha256:${digest#sha256:}"
+
+    kubectl patch configmap config-deployment -n knative-serving --type=merge \
+        -p "{\"data\":{\"queue-sidecar-image\":\"$pinned\"}}" >/dev/null 2>&1
+    log "  Pinned queue-proxy image to digest: sha256:${digest#sha256:}"
+}
+
+restore_queue_proxy_image() {
+    if [[ -n "$QP_IMAGE_BACKUP" ]]; then
+        kubectl patch configmap config-deployment -n knative-serving --type=merge \
+            -p "{\"data\":{\"queue-sidecar-image\":\"$QP_IMAGE_BACKUP\"}}" >/dev/null 2>&1
+    fi
 }
 
 # ---- state save/restore ------------------------------------------------------
@@ -155,6 +198,7 @@ cleanup() {
     kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
     kubectl delete clusterpolicy bench-freeze-idle-timeout --ignore-not-found >/dev/null 2>&1 || true
+    restore_queue_proxy_image
     # Revert queue-proxy BEFORE restoring the EA so that the final revision
     # Knative creates uses the original queue-proxy image + original EA spec
     # (nodeSelector, triggers, etc.) in one shot, avoiding extra churn.
@@ -403,8 +447,10 @@ delete_retransmitter_pod() {
 cleanup_node_disk() {
     # Cleans up disk space on the bench node to prevent disk-pressure taints:
     #  1) /tmp/ctrd-checkpoint* — CRIU checkpoint temp dirs (~49 MB each)
-    #  2) crictl rmi --prune    — unused container images
-    #  3) ctr content prune     — unreferenced content store blobs
+    #  2) containerd content store blobs — the main disk hog; find -delete
+    #     is used instead of rm -rf glob to avoid shell expansion issues
+    #     in broken TTY/nsenter sessions
+    #  3) crictl rmi --prune    — unused container images
     #
     # Uses a privileged pod with hostPID + nsenter so it works even when
     # the node already has a disk-pressure taint (tolerates all taints).
@@ -414,6 +460,8 @@ cleanup_node_disk() {
     local pod_name="bench-disk-cleanup"
     kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     sleep 2
+
+    local blob_dir="/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content/blobs"
     kubectl run "$pod_name" -n "$NAMESPACE" --restart=Never --image=busybox \
         --overrides='{
           "spec": {
@@ -424,17 +472,17 @@ cleanup_node_disk() {
               "name": "cleanup",
               "image": "busybox",
               "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
-                "n=$(ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l); rm -rf /tmp/ctrd-checkpoint*; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; echo $n"],
+                "n=$(ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l); rm -rf /tmp/ctrd-checkpoint*; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; blob_before=$(du -sm '"$blob_dir"' 2>/dev/null | cut -f1); find '"$blob_dir"' -type f -delete 2>/dev/null; find '"$blob_dir"' -type d -empty -delete 2>/dev/null; blob_after=$(du -sm '"$blob_dir"' 2>/dev/null | cut -f1); echo checkpoints=$n blob_freed=$((${blob_before:-0} - ${blob_after:-0}))MB"],
               "securityContext": {"privileged": true}
             }]
           }
         }' >/dev/null 2>&1
-    # Wait for it to finish (up to 60s — image prune can be slow)
-    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s >/dev/null 2>&1; then
-        local count
-        count=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
-        if [[ "${count:-0}" -gt 0 ]]; then
-            log "  Cleaned $count checkpoint dirs on $BENCH_NODE_NAME"
+    # Wait for it to finish (up to 120s — blob deletion can be slow on large dirs)
+    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s >/dev/null 2>&1; then
+        local result
+        result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
+        if [[ -n "$result" && "$result" != "checkpoints=0 blob_freed=0MB" ]]; then
+            log "  Disk cleanup on $BENCH_NODE_NAME: $result"
         fi
     fi
     kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -597,6 +645,24 @@ preflight() {
     BENCH_NODE_NAME=$(kubectl get nodes -l "$BENCH_NODE_SELECTOR_KEY=$BENCH_NODE_SELECTOR_VAL" \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
     log "Preflight: bench node resolved to $BENCH_NODE_NAME"
+
+    # Check for disk-pressure taint — if present, clean up before proceeding.
+    local disk_pressure
+    disk_pressure=$(kubectl get node "$BENCH_NODE_NAME" \
+        -o jsonpath='{.spec.taints[?(@.key=="node.kubernetes.io/disk-pressure")].effect}' 2>/dev/null)
+    if [[ -n "$disk_pressure" ]]; then
+        log "  WARNING: $BENCH_NODE_NAME has disk-pressure taint, running cleanup..."
+        cleanup_node_disk
+        sleep 10  # give kubelet time to re-evaluate
+        disk_pressure=$(kubectl get node "$BENCH_NODE_NAME" \
+            -o jsonpath='{.spec.taints[?(@.key=="node.kubernetes.io/disk-pressure")].effect}' 2>/dev/null)
+        if [[ -n "$disk_pressure" ]]; then
+            log "  ERROR: $BENCH_NODE_NAME still has disk-pressure taint after cleanup."
+            log "         SSH into the node and free disk manually, then retry."
+            exit 1
+        fi
+        log "  Disk-pressure taint cleared."
+    fi
 
     log "Preflight: pinning retransmitter to $BENCH_NODE_SELECTOR_KEY=$BENCH_NODE_SELECTOR_VAL (cgroup v2)"
     # Replace nodeSelector entirely; the original is saved in EA_BACKUP.
@@ -938,6 +1004,7 @@ main() {
     echo
 
     save_state
+    pin_queue_proxy_image
     preflight
     setup_curl_pod
 

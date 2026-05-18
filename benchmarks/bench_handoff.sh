@@ -479,10 +479,17 @@ resolve_bench_node() {
 }
 
 cleanup_node_disk() {
+    # Cleans up disk space on the bench node to prevent disk-pressure taints:
+    #  1) /tmp/ctrd-checkpoint* — CRIU checkpoint temp dirs (~49 MB each)
+    #  2) containerd content store blobs — the main disk hog; find -delete
+    #     is used instead of rm -rf glob to avoid shell expansion issues
+    #  3) crictl rmi --prune    — unused container images
     if [[ -z "$BENCH_NODE_NAME" ]]; then return; fi
     local pod_name="bench-disk-cleanup"
     kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     sleep 2
+
+    local blob_dir="/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content/blobs"
     kubectl run "$pod_name" -n "$NAMESPACE" --restart=Never --image=busybox \
         --overrides='{
           "spec": {
@@ -493,16 +500,16 @@ cleanup_node_disk() {
               "name": "cleanup",
               "image": "busybox",
               "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
-                "n=$(ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l); rm -rf /tmp/ctrd-checkpoint*; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; echo $n"],
+                "n=$(ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l); rm -rf /tmp/ctrd-checkpoint*; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; blob_before=$(du -sm '"$blob_dir"' 2>/dev/null | cut -f1); find '"$blob_dir"' -type f -delete 2>/dev/null; find '"$blob_dir"' -type d -empty -delete 2>/dev/null; blob_after=$(du -sm '"$blob_dir"' 2>/dev/null | cut -f1); echo checkpoints=$n blob_freed=$((${blob_before:-0} - ${blob_after:-0}))MB"],
               "securityContext": {"privileged": true}
             }]
           }
         }' >/dev/null 2>&1
-    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s >/dev/null 2>&1; then
-        local count
-        count=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
-        if [[ "${count:-0}" -gt 0 ]]; then
-            log "  Cleaned $count checkpoint dirs on $BENCH_NODE_NAME"
+    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s >/dev/null 2>&1; then
+        local result
+        result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
+        if [[ -n "$result" && "$result" != "checkpoints=0 blob_freed=0MB" ]]; then
+            log "  Disk cleanup on $BENCH_NODE_NAME: $result"
         fi
     fi
     kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -965,6 +972,25 @@ main() {
     fi
 
     resolve_bench_node
+
+    # Check for disk-pressure taint — clean up before proceeding
+    local disk_pressure
+    disk_pressure=$(kubectl get node "$BENCH_NODE_NAME" \
+        -o jsonpath='{.spec.taints[?(@.key=="node.kubernetes.io/disk-pressure")].effect}' 2>/dev/null)
+    if [[ -n "$disk_pressure" ]]; then
+        log "WARNING: $BENCH_NODE_NAME has disk-pressure taint, running cleanup..."
+        cleanup_node_disk
+        sleep 10
+        disk_pressure=$(kubectl get node "$BENCH_NODE_NAME" \
+            -o jsonpath='{.spec.taints[?(@.key=="node.kubernetes.io/disk-pressure")].effect}' 2>/dev/null)
+        if [[ -n "$disk_pressure" ]]; then
+            log "ERROR: $BENCH_NODE_NAME still has disk-pressure taint after cleanup."
+            log "       SSH into the node and free disk manually, then retry."
+            exit 1
+        fi
+        log "  Disk-pressure taint cleared."
+    fi
+
     pin_queue_proxy_image
     setup_curl_pod
 
