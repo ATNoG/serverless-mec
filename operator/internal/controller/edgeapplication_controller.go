@@ -64,12 +64,13 @@ type EdgeApplicationReconciler struct {
 // +kubebuilder:rbac:groups=eventing.knative.dev,resources=triggers,verbs=get;list;watch;create;update;patch;delete
 
 type desiredService struct {
-	Name          string
-	Namespace     string
-	PodSpec       corev1.PodSpec
-	MinScale      *int32
-	FreezeEnabled bool
-	CreateTrigger bool
+	Name              string
+	Namespace         string
+	PodSpec           corev1.PodSpec
+	MinScale          *int32
+	FreezeEnabled     bool
+	FreezeIdleTimeout *int32
+	CreateTrigger     bool
 
 	TriggerNs      string
 	TriggerBroker  string
@@ -158,6 +159,7 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	baseMinScale := app.Spec.Service.MinScale
 	baseFreezeEnabled := app.Spec.Service.FreezeEnabled != nil && *app.Spec.Service.FreezeEnabled
+	baseFreezeIdleTimeout := app.Spec.Service.FreezeIdleTimeout
 	baseFilters := app.Spec.Service.TriggerFilters
 
 	createTriggers := len(baseFilters) > 0
@@ -186,15 +188,16 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if !daemonMode {
 		baseSvcName := app.Name
 		desired[baseSvcName] = desiredService{
-			Name:           baseSvcName,
-			Namespace:      app.Namespace,
-			PodSpec:        basePodSpec,
-			MinScale:       baseMinScale,
-			FreezeEnabled:  baseFreezeEnabled,
-			CreateTrigger:  createTriggers,
-			TriggerNs:      brokerNamespace,
-			TriggerBroker:  brokerName,
-			TriggerFilters: baseFilters,
+			Name:              baseSvcName,
+			Namespace:         app.Namespace,
+			PodSpec:           basePodSpec,
+			MinScale:          baseMinScale,
+			FreezeEnabled:     baseFreezeEnabled,
+			FreezeIdleTimeout: baseFreezeIdleTimeout,
+			CreateTrigger:     createTriggers,
+			TriggerNs:         brokerNamespace,
+			TriggerBroker:     brokerName,
+			TriggerFilters:    baseFilters,
 		}
 
 		for _, rep := range app.Spec.Replicas {
@@ -214,15 +217,16 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			repPod.Affinity = rep.Affinity
 
 			desired[svcName] = desiredService{
-				Name:           svcName,
-				Namespace:      app.Namespace,
-				PodSpec:        repPod,
-				MinScale:       baseMinScale,
-				FreezeEnabled:  baseFreezeEnabled,
-				CreateTrigger:  createTriggers,
-				TriggerNs:      brokerNamespace,
-				TriggerBroker:  brokerName,
-				TriggerFilters: baseFilters,
+				Name:              svcName,
+				Namespace:         app.Namespace,
+				PodSpec:           repPod,
+				MinScale:          baseMinScale,
+				FreezeEnabled:     baseFreezeEnabled,
+				FreezeIdleTimeout: baseFreezeIdleTimeout,
+				CreateTrigger:     createTriggers,
+				TriggerNs:         brokerNamespace,
+				TriggerBroker:     brokerName,
+				TriggerFilters:    baseFilters,
 			}
 		}
 	}
@@ -255,15 +259,16 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				repPod.NodeSelector = mergeNodeSelector(basePodSpec.NodeSelector, map[string]string{pinKey: pinVal})
 
 				desired[svcName] = desiredService{
-					Name:           svcName,
-					Namespace:      app.Namespace,
-					PodSpec:        repPod,
-					MinScale:       baseMinScale,
-					FreezeEnabled:  baseFreezeEnabled,
-					CreateTrigger:  createTriggers,
-					TriggerNs:      brokerNamespace,
-					TriggerBroker:  brokerName,
-					TriggerFilters: baseFilters,
+					Name:              svcName,
+					Namespace:         app.Namespace,
+					PodSpec:           repPod,
+					MinScale:          baseMinScale,
+					FreezeEnabled:     baseFreezeEnabled,
+					FreezeIdleTimeout: baseFreezeIdleTimeout,
+					CreateTrigger:     createTriggers,
+					TriggerNs:         brokerNamespace,
+					TriggerBroker:     brokerName,
+					TriggerFilters:    baseFilters,
 				}
 			}
 		}
@@ -330,6 +335,9 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	}
 	if d.FreezeEnabled {
 		templateAnnotations["qpoption.knative.dev/freezer-activate"] = "enable"
+		if d.FreezeIdleTimeout != nil {
+			templateAnnotations["qpoption.knative.dev/freezer-idle-timeout"] = strconv.FormatInt(int64(*d.FreezeIdleTimeout), 10)
+		}
 	}
 	if len(templateAnnotations) > 0 {
 		templateMeta.Annotations = templateAnnotations
@@ -428,8 +436,14 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	}
 	if d.FreezeEnabled {
 		updated.Spec.ConfigurationSpec.Template.Annotations["qpoption.knative.dev/freezer-activate"] = "enable"
+		if d.FreezeIdleTimeout != nil {
+			updated.Spec.ConfigurationSpec.Template.Annotations["qpoption.knative.dev/freezer-idle-timeout"] = strconv.FormatInt(int64(*d.FreezeIdleTimeout), 10)
+		} else {
+			delete(updated.Spec.ConfigurationSpec.Template.Annotations, "qpoption.knative.dev/freezer-idle-timeout")
+		}
 	} else {
 		delete(updated.Spec.ConfigurationSpec.Template.Annotations, "qpoption.knative.dev/freezer-activate")
+		delete(updated.Spec.ConfigurationSpec.Template.Annotations, "qpoption.knative.dev/freezer-idle-timeout")
 	}
 	if len(updated.Spec.ConfigurationSpec.Template.Annotations) == 0 {
 		updated.Spec.ConfigurationSpec.Template.Annotations = nil

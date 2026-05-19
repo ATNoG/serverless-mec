@@ -529,44 +529,6 @@ spec:
 POLICY
 }
 
-ensure_freeze_idle_timeout_kyverno() {
-    # Injects FREEZER_IDLE_TIMEOUT_SECONDS=5 into the queue-proxy container
-    # via a Kyverno mutating policy. This reduces the freeze wait from ~30s
-    # to ~5s per iteration — a benchmark optimization only.
-    if kubectl get clusterpolicy bench-freeze-idle-timeout >/dev/null 2>&1; then
-        return 0
-    fi
-    log "  Applying kyverno policy: inject FREEZER_IDLE_TIMEOUT_SECONDS=5 on queue-proxy"
-    kubectl apply -f - >/dev/null 2>&1 <<'POLICY'
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
-metadata:
-  name: bench-freeze-idle-timeout
-  labels:
-    app.kubernetes.io/managed-by: bench-freeze-vs-coldstart
-spec:
-  rules:
-    - name: set-freeze-idle-timeout
-      match:
-        any:
-          - resources:
-              kinds:
-                - Deployment
-              selector:
-                matchLabels:
-                  serving.knative.dev/service: "*"
-      mutate:
-        patchStrategicMerge:
-          spec:
-            template:
-              spec:
-                containers:
-                  - name: queue-proxy
-                    env:
-                      - name: FREEZER_IDLE_TIMEOUT_SECONDS
-                        value: "5"
-POLICY
-}
 
 # ---- result emission --------------------------------------------------------
 
@@ -700,7 +662,6 @@ preflight() {
     # Knative's field mask strips the per-container restartPolicy field,
     # so only an admission webhook can inject it persistently.
     ensure_restart_policy_kyverno
-    ensure_freeze_idle_timeout_kyverno
 
     log "Preflight: enabling freeze (operator will force minScale>=1 automatically)"
     # The operator auto-injects minScale=1 whenever freezeEnabled=true,
@@ -728,10 +689,16 @@ preflight() {
     log "Preflight: waiting for revision rollout to stabilize..."
     wait_for_knative_rollout
 
-    # Now that revisions are stable, delete any leftover pod and wait
-    # for a fresh one from the final revision to be 2/2 Ready. This
-    # frees hostPorts/resources on the target node.
-    delete_retransmitter_pod
+    # Force-delete ALL retransmitter pods and their ReplicaSets so the
+    # next pod is created through the Kyverno webhook (which injects
+    # restartPolicy=Never and FREEZER_IDLE_TIMEOUT_SECONDS). Pods from
+    # old ReplicaSets created before the Kyverno policies won't have
+    # these mutations.
+    log "Preflight: recycling all retransmitter pods (force Kyverno mutation)..."
+    kubectl delete pods -n "$NAMESPACE" \
+        -l "serving.knative.dev/service=$SERVICE_NAME" \
+        --grace-period=1 --wait=false >/dev/null 2>&1 || true
+    sleep 5
     if ! wait_for_pod_ready; then
         log "  WARNING: warmup pod did not become ready, proceeding anyway"
     fi

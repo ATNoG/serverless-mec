@@ -13,6 +13,7 @@ spec:
   description: "Retransmits packet then triggers an EdgeApplicationHandoff to a target replica"
   service:
     freezeEnabled: true
+    freezeIdleTimeout: 5
     nodeSelector:
       rsu-id: "rsu-b"
     container:

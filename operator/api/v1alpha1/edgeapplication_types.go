@@ -142,6 +142,15 @@ type KnativeServiceSpec struct {
 	// and injects the HOST_IP environment variable via the Downward API.
 	// +optional
 	FreezeEnabled *bool `json:"freezeEnabled,omitempty"`
+
+	// freezeIdleTimeout is the number of seconds a container must be idle
+	// before the freezer plugin checkpoints it. Propagated to the pod via
+	// the qpoption.knative.dev/freezer-idle-timeout annotation, which the
+	// plugin reads from the Downward API volume at /etc/podinfo/annotations.
+	// Defaults to 30 if unset.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	FreezeIdleTimeout *int32 `json:"freezeIdleTimeout,omitempty"`
 }
 
 // KnativeServiceReplicaSpec describes an additional Knative Service instance derived

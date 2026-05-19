@@ -33,7 +33,7 @@ CHECKPOINT_CLEANUP_INTERVAL=5
 
 QUEUE_PROXY_PORT=8012
 FREEZE_WAIT_TIMEOUT=300
-FREEZER_IDLE_TIMEOUT=5  # seconds — injected into queue-proxy via Kyverno
+FREEZER_IDLE_TIMEOUT=5  # seconds — configured via EdgeApplication CRD (freezeIdleTimeout)
 
 QP_IMAGE_BACKUP=""
 
@@ -416,41 +416,6 @@ spec:
 POLICY
 }
 
-ensure_freeze_idle_timeout_kyverno() {
-    # Inject FREEZER_IDLE_TIMEOUT_SECONDS into the queue-proxy container
-    # for all pods with freezeEnabled. This controls how long the plugin
-    # waits before triggering CRIU checkpoint after the last request.
-    kubectl delete clusterpolicy bench-freeze-idle-timeout --ignore-not-found >/dev/null 2>&1
-    log "  Applying kyverno policy: inject FREEZER_IDLE_TIMEOUT_SECONDS=${FREEZER_IDLE_TIMEOUT}s"
-    kubectl apply -f - >/dev/null 2>&1 <<POLICY
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
-metadata:
-  name: bench-freeze-idle-timeout
-  labels:
-    app.kubernetes.io/managed-by: bench-handoff
-spec:
-  rules:
-    - name: set-freeze-idle-timeout
-      match:
-        any:
-          - resources:
-              kinds:
-                - Deployment
-              namespaces:
-                - "${NAMESPACE}"
-      mutate:
-        patchStrategicMerge:
-          spec:
-            template:
-              spec:
-                containers:
-                  - name: queue-proxy
-                    env:
-                      - name: FREEZER_IDLE_TIMEOUT_SECONDS
-                        value: "${FREEZER_IDLE_TIMEOUT}"
-POLICY
-}
 
 wait_for_operator() {
     local timeout=60 elapsed=0
@@ -754,7 +719,6 @@ run_freeze_scenario() {
     # it dead for CRIU restore. Scoped to target only so the source stays
     # healthy (kubelet restarts its container after any accidental freeze).
     ensure_restart_policy_kyverno "$target_svc"
-    ensure_freeze_idle_timeout_kyverno
 
     # Step 2: Patch EA — freeze=true, clear triggerFilters.
     # triggerFilters must be empty to prevent the broker from dispatching
@@ -845,8 +809,8 @@ EOF
     # Wait for freeze via the plugin's idle timeout (~30s) + CRIU checkpoint (~5s).
     # We cannot call the freezer daemon directly because that bypasses the
     # queue-proxy plugin's state management (frozen flag, fake listener),
-    # breaking the thaw path. The idle timeout is set by FREEZER_IDLE_TIMEOUT_SECONDS
-    # env var on the queue-proxy (default 30s).
+    # breaking the thaw path. The idle timeout is set by the CRD's
+    # freezeIdleTimeout field (propagated via Downward API annotation).
     if ! wait_for_target_freeze "$warmup_pod"; then
         log "  ERROR: target did not freeze after warmup, aborting"
         return
