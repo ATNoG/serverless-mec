@@ -72,9 +72,15 @@ print('---\n'.join(yaml.dump(d) for d in out))
 
 emit_result() {
     local scenario="$1" iteration="$2" timings="$3" ts_before="$4" ts_after="$5"
-    local handoff_phase="$6" handoff_time_ms="$7"
+    local handoff_phase="$6" handoff_target="$7"
 
     IFS=',' read -r t_dns t_connect t_ttfb t_total http_code <<< "$timings"
+
+    # Collect raw timestamps from Kubernetes objects for pipeline breakdown.
+    local pipeline_json="{}"
+    if [[ "$handoff_phase" == "Ready" || "$handoff_phase" == "Applied" || "$handoff_phase" == "Failed" ]]; then
+        pipeline_json=$(collect_pipeline_timestamps "$handoff_target")
+    fi
 
     python3 -c "
 import json, sys
@@ -89,12 +95,66 @@ r = {
     'ts_before': sys.argv[8],
     'ts_after': sys.argv[9],
     'handoff_phase': sys.argv[10],
-    'handoff_time_ms': float(sys.argv[11]) if sys.argv[11] != '' else None,
+    'pipeline': json.loads(sys.argv[11]),
 }
 print(json.dumps(r, separators=(',',':')))
 " "$scenario" "$iteration" "$t_dns" "$t_connect" "$t_ttfb" "$t_total" \
-  "$http_code" "$ts_before" "$ts_after" "$handoff_phase" "$handoff_time_ms" \
+  "$http_code" "$ts_before" "$ts_after" "$handoff_phase" "$pipeline_json" \
   >> "$OUTFILE"
+}
+
+collect_pipeline_timestamps() {
+    # Extracts raw timestamps from the handoff CR, target KService, and target
+    # pod. The analysis script computes phase durations from these.
+    local target="$1"
+    local cr_name="${HANDOFF_CR_PREFIX}${target}"
+    local target_svc="${EA_NAME}-${target}"
+
+    python3 -c "
+import json, subprocess, sys
+
+def kubectl_json(args):
+    r = subprocess.run(['kubectl'] + args, capture_output=True, text=True, timeout=10)
+    return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+
+cr_name, ns, target_svc = sys.argv[1], sys.argv[2], sys.argv[3]
+out = {}
+
+# Handoff CR timestamps
+cr = kubectl_json(['get', 'edgeapplicationhandoff', cr_name, '-n', ns, '-o', 'json'])
+if cr:
+    out['cr_created'] = cr.get('metadata', {}).get('creationTimestamp', '')
+    for c in cr.get('status', {}).get('conditions', []):
+        t = c.get('type', '')
+        out[f'cr_cond_{t.lower()}_ts'] = c.get('lastTransitionTime', '')
+        out[f'cr_cond_{t.lower()}_reason'] = c.get('reason', '')
+
+# Target KService timestamps
+svc = kubectl_json(['get', 'ksvc', target_svc, '-n', ns, '-o', 'json'])
+if svc:
+    out['ksvc_created'] = svc.get('metadata', {}).get('creationTimestamp', '')
+    out['ksvc_latest_ready_rev'] = svc.get('status', {}).get('latestReadyRevisionName', '')
+
+# Target pod timestamps and image pull detection
+pods = kubectl_json(['get', 'pods', '-n', ns,
+    '-l', f'serving.knative.dev/service={target_svc}',
+    '--sort-by=.metadata.creationTimestamp', '-o', 'json'])
+if pods and pods.get('items'):
+    pod = pods['items'][-1]  # latest pod
+    out['pod_name'] = pod.get('metadata', {}).get('name', '')
+    out['pod_created'] = pod.get('metadata', {}).get('creationTimestamp', '')
+    for c in pod.get('status', {}).get('conditions', []):
+        t = c.get('type', '')
+        out[f'pod_cond_{t.lower()}_ts'] = c.get('lastTransitionTime', '')
+    # Container started timestamps
+    for cs in pod.get('status', {}).get('containerStatuses', []):
+        name = cs.get('name', '')
+        running = cs.get('state', {}).get('running', {})
+        if running:
+            out[f'container_{name}_started'] = running.get('startedAt', '')
+
+print(json.dumps(out, separators=(',',':')))
+" "$cr_name" "$NAMESPACE" "$target_svc" 2>/dev/null || echo "{}"
 }
 
 # ---- queue-proxy image pinning ----------------------------------------------
@@ -262,10 +322,16 @@ get_handoff_phase() {
 
 get_target_pod_name() {
     local target_svc="$1"
-    kubectl get pods -n "$NAMESPACE" -l "serving.knative.dev/service=$target_svc" \
+    local latest_rev
+    latest_rev=$(kubectl get ksvc "$target_svc" -n "$NAMESPACE" \
+        -o jsonpath='{.status.latestReadyRevisionName}' 2>/dev/null)
+    if [[ -z "$latest_rev" ]]; then
+        return
+    fi
+    kubectl get pods -n "$NAMESPACE" \
+        -l "serving.knative.dev/revision=$latest_rev" \
         --field-selector=status.phase=Running \
-        -o jsonpath='{range .items[?(@.metadata.annotations.qpoption\.knative\.dev/freezer-activate=="enable")]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
-        | head -1
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
 }
 
 get_pod_ip() {
@@ -448,13 +514,29 @@ cleanup_node_disk() {
     #  1) /tmp/ctrd-checkpoint* — CRIU checkpoint temp dirs (~49 MB each)
     #  2) crictl rmi --prune    — unused container images
     #  3) ctr content prune     — unreferenced content store blobs
-    #
-    # NOTE: Do NOT delete blobs directly from the containerd content store.
-    # That nukes blobs for cached images and breaks container creation.
+    #  4) re-pull app + queue-proxy images so they're cached for next iteration
     if [[ -z "$BENCH_NODE_NAME" ]]; then return; fi
+
+    # Resolve images to re-pull after pruning
+    local app_image qp_image
+    app_image=$(kubectl get edgeapplication "$EA_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.service.container.image}' 2>/dev/null)
+    qp_image=$(kubectl get configmap config-deployment -n knative-serving \
+        -o jsonpath='{.data.queue-sidecar-image}' 2>/dev/null)
+
     local pod_name="bench-disk-cleanup"
     kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     sleep 2
+
+    # Build the re-pull commands — only for images we actually resolved
+    local pull_cmds=""
+    if [[ -n "$app_image" ]]; then
+        pull_cmds="k3s crictl pull '$app_image' >/dev/null 2>&1;"
+    fi
+    if [[ -n "$qp_image" ]]; then
+        pull_cmds="${pull_cmds} k3s crictl pull '$qp_image' >/dev/null 2>&1;"
+    fi
+
     kubectl run "$pod_name" -n "$NAMESPACE" --restart=Never --image=busybox \
         --overrides='{
           "spec": {
@@ -465,12 +547,12 @@ cleanup_node_disk() {
               "name": "cleanup",
               "image": "busybox",
               "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
-                "n=$(find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d 2>/dev/null | wc -l); find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d -exec rm -rf {} + 2>/dev/null; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; echo cleaned_checkpoints=$n"],
+                "n=$(find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d 2>/dev/null | wc -l); find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d -exec rm -rf {} + 2>/dev/null; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; '"$pull_cmds"' echo cleaned_checkpoints=$n"],
               "securityContext": {"privileged": true}
             }]
           }
         }' >/dev/null 2>&1
-    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s >/dev/null 2>&1; then
+    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s >/dev/null 2>&1; then
         local result
         result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
         if [[ -n "$result" && "$result" != "cleaned_checkpoints=0" ]]; then
@@ -593,30 +675,23 @@ run_handoff_iteration() {
 
     if [[ "$http_code" != "422" ]]; then
         log "  SKIPPED: unexpected HTTP $http_code (expected 422)"
-        emit_result "$scenario" "$iteration" "$timings" "$ts_before" "$ts_after" "Skipped" ""
+        emit_result "$scenario" "$iteration" "$timings" "$ts_before" "$ts_after" "Skipped" "$handoff_target"
         return
     fi
 
     log "  Retransmission done in ${t_total}s (HTTP $http_code)"
 
-    # Now poll the handoff CR until it becomes Ready
-    local handoff_start handoff_end handoff_time_ms
-    handoff_start=$(date +%s%N)
-
+    # Poll the handoff CR until it becomes Ready
     if wait_for_handoff_ready "$handoff_target"; then
-        handoff_end=$(date +%s%N)
-        handoff_time_ms=$(( (handoff_end - handoff_start) / 1000000 ))
         local phase
         phase=$(get_handoff_phase "$handoff_target")
-        log "  Handoff $phase in ${handoff_time_ms}ms"
-        emit_result "$scenario" "$iteration" "$timings" "$ts_before" "$ts_after" "$phase" "$handoff_time_ms"
+        log "  Handoff $phase"
+        emit_result "$scenario" "$iteration" "$timings" "$ts_before" "$ts_after" "$phase" "$handoff_target"
     else
-        handoff_end=$(date +%s%N)
-        handoff_time_ms=$(( (handoff_end - handoff_start) / 1000000 ))
         local phase
         phase=$(get_handoff_phase "$handoff_target")
-        log "  Handoff $phase after ${handoff_time_ms}ms"
-        emit_result "$scenario" "$iteration" "$timings" "$ts_before" "$ts_after" "$phase" "$handoff_time_ms"
+        log "  Handoff $phase (timeout)"
+        emit_result "$scenario" "$iteration" "$timings" "$ts_before" "$ts_after" "$phase" "$handoff_target"
     fi
 
     # Cleanup handoff CR so next iteration starts fresh
@@ -895,7 +970,7 @@ EOF
             ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
             phase=$(get_handoff_phase "$handoff_target")
             log "  Handoff $phase in ${handoff_time_ms}ms (includes CRIU thaw)"
-            emit_result "worker1-freeze" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_time_ms"
+            emit_result "worker1-freeze" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target"
         else
             local handoff_end handoff_time_ms phase ts_after
             handoff_end=$(date +%s%N)
@@ -903,7 +978,7 @@ EOF
             ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
             phase=$(get_handoff_phase "$handoff_target")
             log "  Handoff $phase after ${handoff_time_ms}ms"
-            emit_result "worker1-freeze" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_time_ms"
+            emit_result "worker1-freeze" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target"
         fi
     done
 }

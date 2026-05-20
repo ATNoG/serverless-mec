@@ -268,13 +268,19 @@ send_event_internal() {
 # ---- pod helpers ------------------------------------------------------------
 
 get_pod_name() {
-    # Return the name of a Running pod whose template has the freezer
-    # annotation. During preflight/patch cycles there can be leftover pods
-    # from an older revision without the plugin; we must ignore those.
-    kubectl get pods -n "$NAMESPACE" -l "serving.knative.dev/service=$SERVICE_NAME" \
+    # Return the name of a Running pod from the LATEST revision.
+    # Old revisions accumulate during preflight patches; their pods
+    # get killed by Knative during rollout, causing false failures.
+    local latest_rev
+    latest_rev=$(kubectl get ksvc "$SERVICE_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.status.latestReadyRevisionName}' 2>/dev/null)
+    if [[ -z "$latest_rev" ]]; then
+        return
+    fi
+    kubectl get pods -n "$NAMESPACE" \
+        -l "serving.knative.dev/revision=$latest_rev" \
         --field-selector=status.phase=Running \
-        -o jsonpath='{range .items[?(@.metadata.annotations.qpoption\.knative\.dev/freezer-activate=="enable")]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
-        | head -1
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
 }
 
 get_pod_ip() {
@@ -449,19 +455,34 @@ cleanup_node_disk() {
     #  1) /tmp/ctrd-checkpoint* — CRIU checkpoint temp dirs (~49 MB each)
     #  2) crictl rmi --prune    — unused container images
     #  3) ctr content prune     — unreferenced content store blobs
-    #
-    # NOTE: Do NOT delete blobs directly from the containerd content store
-    # (io.containerd.content.v1.content/blobs). That nukes blobs for cached
-    # images and breaks all container creation on the node.
+    #  4) re-pull app + queue-proxy images so they're cached for next iteration
     #
     # Uses a privileged pod with hostPID + nsenter so it works even when
     # the node already has a disk-pressure taint (tolerates all taints).
     if [[ -z "$BENCH_NODE_NAME" ]]; then
         return
     fi
+
+    # Resolve images to re-pull after pruning
+    local app_image qp_image
+    app_image=$(kubectl get edgeapplication "$EA_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.service.container.image}' 2>/dev/null)
+    qp_image=$(kubectl get configmap config-deployment -n knative-serving \
+        -o jsonpath='{.data.queue-sidecar-image}' 2>/dev/null)
+
     local pod_name="bench-disk-cleanup"
     kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     sleep 2
+
+    # Build the re-pull commands — only for images we actually resolved
+    local pull_cmds=""
+    if [[ -n "$app_image" ]]; then
+        pull_cmds="k3s crictl pull '$app_image' >/dev/null 2>&1;"
+    fi
+    if [[ -n "$qp_image" ]]; then
+        pull_cmds="${pull_cmds} k3s crictl pull '$qp_image' >/dev/null 2>&1;"
+    fi
+
     kubectl run "$pod_name" -n "$NAMESPACE" --restart=Never --image=busybox \
         --overrides='{
           "spec": {
@@ -472,12 +493,12 @@ cleanup_node_disk() {
               "name": "cleanup",
               "image": "busybox",
               "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
-                "n=$(find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d 2>/dev/null | wc -l); find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d -exec rm -rf {} + 2>/dev/null; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; echo cleaned_checkpoints=$n"],
+                "n=$(find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d 2>/dev/null | wc -l); find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d -exec rm -rf {} + 2>/dev/null; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; '"$pull_cmds"' echo cleaned_checkpoints=$n"],
               "securityContext": {"privileged": true}
             }]
           }
         }' >/dev/null 2>&1
-    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s >/dev/null 2>&1; then
+    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s >/dev/null 2>&1; then
         local result
         result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
         if [[ -n "$result" && "$result" != "cleaned_checkpoints=0" ]]; then
