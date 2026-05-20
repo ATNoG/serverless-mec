@@ -4,11 +4,8 @@ analyze_handoff_bench.py
 
 Standalone analyzer for NDJSON results produced by `bench_handoff.sh`.
 
-Each row:
-  {"scenario":"rsu-a-coldstart","iteration":1,"t_dns_s":...,"t_connect_s":...,
-   "t_ttfb_s":...,"t_total_s":...,"http_code":"422",
-   "ts_before":"...","ts_after":"...",
-   "handoff_phase":"Ready","handoff_time_ms":1234.0}
+Each row contains raw timestamps in the `pipeline` object. This script
+computes all derived phase durations from those raw timestamps.
 
 Scenarios: rsu-a-coldstart, worker1-coldstart, worker1-freeze
 """
@@ -21,7 +18,8 @@ import math
 import os
 import statistics
 import sys
-from typing import Dict, List, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
 
 def _read(paths: List[str]) -> List[dict]:
@@ -41,10 +39,88 @@ def _read(paths: List[str]) -> List[dict]:
     return rows
 
 
+def _parse_ts(s: Optional[str]) -> Optional[float]:
+    """Parse a Kubernetes RFC3339 timestamp to epoch seconds."""
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _phase_duration_ms(pipeline: dict, start_key: str, end_key: str) -> Optional[float]:
+    """Compute duration in ms between two pipeline timestamp keys."""
+    t0 = _parse_ts(pipeline.get(start_key))
+    t1 = _parse_ts(pipeline.get(end_key))
+    if t0 is not None and t1 is not None and t1 >= t0:
+        return (t1 - t0) * 1000.0
+    return None
+
+
+def _compute_phases(row: dict) -> dict:
+    """Compute derived phase durations from raw pipeline timestamps."""
+    p = row.get("pipeline", {})
+    phases = {}
+
+    # Total handoff time: ts_before -> ts_after (wall clock from bench script)
+    t_before = _parse_ts(row.get("ts_before"))
+    t_after = _parse_ts(row.get("ts_after"))
+    if t_before and t_after:
+        phases["total_wall_ms"] = (t_after - t_before) * 1000.0
+
+    # CR creation -> CR Applied condition
+    d = _phase_duration_ms(p, "cr_created", "cr_cond_applied_ts")
+    if d is not None:
+        phases["cr_to_applied_ms"] = d
+
+    # CR creation -> CR Ready condition (full handoff)
+    d = _phase_duration_ms(p, "cr_created", "cr_cond_ready_ts")
+    if d is not None:
+        phases["cr_to_ready_ms"] = d
+
+    # KService creation -> pod creation (scheduling overhead)
+    d = _phase_duration_ms(p, "ksvc_created", "pod_created")
+    if d is not None:
+        phases["ksvc_to_pod_ms"] = d
+
+    # Pod creation -> PodScheduled
+    d = _phase_duration_ms(p, "pod_created", "pod_cond_podscheduled_ts")
+    if d is not None:
+        phases["pod_scheduling_ms"] = d
+
+    # PodScheduled -> ContainersReady
+    d = _phase_duration_ms(p, "pod_cond_podscheduled_ts", "pod_cond_containersready_ts")
+    if d is not None:
+        phases["container_startup_ms"] = d
+
+    # ContainersReady -> Pod Ready
+    d = _phase_duration_ms(p, "pod_cond_containersready_ts", "pod_cond_ready_ts")
+    if d is not None:
+        phases["readiness_probe_ms"] = d
+
+    # Pod creation -> Pod Ready (total pod startup)
+    d = _phase_duration_ms(p, "pod_created", "pod_cond_ready_ts")
+    if d is not None:
+        phases["pod_total_startup_ms"] = d
+
+    # CR Applied -> CR Ready (thaw phase for freeze scenario)
+    d = _phase_duration_ms(p, "cr_cond_applied_ts", "cr_cond_ready_ts")
+    if d is not None:
+        phases["applied_to_ready_ms"] = d
+
+    return phases
+
+
 def _t_inv(p: float, df: int) -> float:
     """Approximate inverse of Student's t CDF (two-tailed)."""
-    import math as _m
-    t_ = _m.sqrt(-2.0 * _m.log(1.0 - p))
+    t_ = math.sqrt(-2.0 * math.log(1.0 - p))
     xp = t_ - (2.515517 + 0.802853 * t_ + 0.010328 * t_ ** 2) / \
               (1.0 + 1.432788 * t_ + 0.189269 * t_ ** 2 + 0.001308 * t_ ** 3)
     g1 = (xp ** 3 + xp) / (4 * df)
@@ -90,24 +166,7 @@ def _fmt_ms(x: float) -> str:
     return "n/a" if isinstance(x, float) and math.isnan(x) else f"{x:.1f} ms"
 
 
-def _print_block(label: str, st: Dict[str, float]) -> None:
-    print(f"  {label}:")
-    for k in ("n", "mean", "median", "stdev", "ci95", "p95", "p99", "min", "max"):
-        if k == "ci95":
-            lo, hi = st["ci95_lo"], st["ci95_hi"]
-            if math.isnan(lo):
-                val = "n/a"
-            else:
-                val = f"[{lo:.1f}, {hi:.1f}] ms"
-            print(f"    {k:<7} = {val}")
-        else:
-            v = st[k]
-            val = str(v) if k == "n" else _fmt_ms(v)
-            print(f"    {k:<7} = {val}")
-
-
 def _iqr_filter(vals: List[float]) -> List[float]:
-    """Remove outliers using Tukey's fences: keep values in [Q1-1.5*IQR, Q3+1.5*IQR]."""
     if len(vals) < 4:
         return vals
     s = sorted(vals)
@@ -132,28 +191,30 @@ SCENARIO_COLORS = {
     "Worker-1 CRIU Thaw": "#2196F3",
 }
 
+# Pipeline phases to report (key in computed phases -> display label)
+PIPELINE_PHASES = [
+    ("cr_to_applied_ms", "CR -> Applied"),
+    ("ksvc_to_pod_ms", "KSvc -> Pod Created"),
+    ("pod_scheduling_ms", "Pod Scheduling"),
+    ("container_startup_ms", "Container Startup"),
+    ("readiness_probe_ms", "Readiness Probe"),
+    ("pod_total_startup_ms", "Pod Total Startup"),
+    ("applied_to_ready_ms", "Applied -> Ready (thaw)"),
+    ("cr_to_ready_ms", "CR -> Ready (total)"),
+]
 
-def _get_values(rows: List[dict], scenario: str, key: str, scale: float = 1.0) -> List[float]:
+
+def _get_phase_values(rows: List[dict], scenario: str, phase_key: str,
+                      computed: Dict[int, dict]) -> List[float]:
     out: List[float] = []
-    for r in rows:
-        if r.get("scenario") != scenario:
-            continue
-        v = r.get(key)
-        if isinstance(v, (int, float)) and v > 0:
-            out.append(v * scale)
-    return out
-
-
-def _handoff_values(rows: List[dict], scenario: str) -> List[float]:
-    """Get handoff_time_ms for successful handoffs."""
-    out: List[float] = []
-    for r in rows:
+    for idx, r in enumerate(rows):
         if r.get("scenario") != scenario:
             continue
         if r.get("handoff_phase") != "Ready":
             continue
-        v = r.get("handoff_time_ms")
-        if isinstance(v, (int, float)) and v > 0:
+        phases = computed.get(idx, {})
+        v = phases.get(phase_key)
+        if isinstance(v, (int, float)) and v >= 0:
             out.append(v)
     return out
 
@@ -178,53 +239,85 @@ def _handoff_phases(rows: List[dict], scenario: str) -> Dict[str, int]:
     return out
 
 
-def _build_plot_df(rows: List[dict], use_iqr: bool):
+def _print_stats_block(label: str, st: Dict[str, float]) -> None:
+    print(f"  {label}:")
+    for k in ("n", "mean", "median", "stdev", "ci95", "p95", "p99", "min", "max"):
+        if k == "ci95":
+            lo, hi = st["ci95_lo"], st["ci95_hi"]
+            if math.isnan(lo):
+                val = "n/a"
+            else:
+                val = f"[{lo:.1f}, {hi:.1f}] ms"
+            print(f"    {k:<7} = {val}")
+        else:
+            v = st[k]
+            val = str(v) if k == "n" else _fmt_ms(v)
+            print(f"    {k:<7} = {val}")
+
+
+def _ci_str(vals: List[float]) -> str:
+    lo, hi = _ci95(vals)
+    if math.isnan(lo):
+        return "n/a"
+    return f"[{lo:.1f}, {hi:.1f}]"
+
+
+def _build_plot_df(rows: List[dict], computed: Dict[int, dict], use_iqr: bool):
     import pandas as pd
 
-    metrics: List[Tuple[str, str, float]] = [
-        ("DNS", "t_dns_s", 1000.0),
-        ("TCP Connect", "t_connect_s", 1000.0),
-        ("TTFB", "t_ttfb_s", 1000.0),
-        ("Retransmission (total)", "t_total_s", 1000.0),
-        ("Handoff", "handoff_time_ms", 1.0),
+    # Plot the pipeline phases that matter most
+    plot_phases = [
+        ("CR -> Applied", "cr_to_applied_ms"),
+        ("Pod Total Startup", "pod_total_startup_ms"),
+        ("Applied -> Ready", "applied_to_ready_ms"),
+        ("CR -> Ready (total)", "cr_to_ready_ms"),
+        ("Retransmission", None),  # from t_total_s
     ]
 
     records = []
-    for label, key, scale in metrics:
+    for label, phase_key in plot_phases:
         for scenario in SCENARIOS:
             sl = SCENARIO_LABELS.get(scenario, scenario)
-            if key == "handoff_time_ms":
-                vals = _handoff_values(rows, scenario)
+            if phase_key is None:
+                # Retransmission from curl timing
+                vals = []
+                for idx, r in enumerate(rows):
+                    if r.get("scenario") != scenario:
+                        continue
+                    v = r.get("t_total_s")
+                    if isinstance(v, (int, float)) and v > 0:
+                        vals.append(v * 1000.0)
             else:
-                vals = _get_values(rows, scenario, key, scale)
+                vals = _get_phase_values(rows, scenario, phase_key, computed)
             if use_iqr:
                 vals = _iqr_filter(vals)
             for v in vals:
-                records.append({"Metric": label, "Scenario": sl, "Time (ms)": v})
+                records.append({"Phase": label, "Scenario": sl, "Time (ms)": v})
 
     return pd.DataFrame(records), SCENARIO_COLORS
 
 
-def _generate_plot(rows: List[dict], output: str, use_iqr: bool) -> None:
+def _generate_plot(rows: List[dict], computed: Dict[int, dict],
+                   output: str, use_iqr: bool) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import seaborn as sns
 
-    df, palette = _build_plot_df(rows, use_iqr)
+    df, palette = _build_plot_df(rows, computed, use_iqr)
     if df.empty:
         print("  No data for plot", file=sys.stderr)
         return
 
     sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(14, 7))
     sns.boxplot(
-        data=df, x="Metric", y="Time (ms)", hue="Scenario",
+        data=df, x="Phase", y="Time (ms)", hue="Scenario",
         palette=palette,
         showfliers=True, flierprops=dict(marker="o", markersize=4, alpha=0.5),
         ax=ax,
     )
-    ax.set_title("Handoff Benchmark — Response Time Breakdown")
+    ax.set_title("Handoff Benchmark — Pipeline Phase Breakdown")
     ax.legend(loc="upper left")
     plt.xticks(rotation=20, ha="right")
     plt.tight_layout()
@@ -233,25 +326,26 @@ def _generate_plot(rows: List[dict], output: str, use_iqr: bool) -> None:
     print(f"  Plot saved to {output}")
 
 
-def _generate_ci_plot(rows: List[dict], output: str, use_iqr: bool) -> None:
+def _generate_ci_plot(rows: List[dict], computed: Dict[int, dict],
+                      output: str, use_iqr: bool) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import seaborn as sns
 
-    df, palette = _build_plot_df(rows, use_iqr)
+    df, palette = _build_plot_df(rows, computed, use_iqr)
     if df.empty:
         print("  No data for CI plot", file=sys.stderr)
         return
 
     sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(14, 7))
     sns.barplot(
-        data=df, x="Metric", y="Time (ms)", hue="Scenario",
+        data=df, x="Phase", y="Time (ms)", hue="Scenario",
         palette=palette, errorbar=("ci", 95), capsize=0.1,
         ax=ax,
     )
-    ax.set_title("Handoff Benchmark — Mean Response Time (95% CI)")
+    ax.set_title("Handoff Benchmark — Mean Pipeline Phase Duration (95% CI)")
     ax.legend(loc="upper left")
     plt.xticks(rotation=20, ha="right")
     plt.tight_layout()
@@ -278,6 +372,11 @@ def main() -> int:
         print("no rows found", file=sys.stderr)
         return 1
 
+    # Compute derived phase durations for every row
+    computed: Dict[int, dict] = {}
+    for idx, row in enumerate(rows):
+        computed[idx] = _compute_phases(row)
+
     # Determine which scenarios have data
     present = [s for s in SCENARIOS if any(r.get("scenario") == s for r in rows)]
 
@@ -292,49 +391,36 @@ def main() -> int:
     for scenario in present:
         label = SCENARIO_LABELS.get(scenario, scenario)
 
-        # Retransmission (t_total_s)
-        retrans_raw = _get_values(rows, scenario, "t_total_s", 1000.0)
-        retrans = _iqr_filter(retrans_raw) if args.iqr else retrans_raw
-
-        # Handoff time
-        handoff_raw = _handoff_values(rows, scenario)
-        handoff = _iqr_filter(handoff_raw) if args.iqr else handoff_raw
-
         print("-" * 70)
         print(f"  {label}")
         print("-" * 70)
-        if args.iqr:
-            print(f"  IQR filtering: retrans {len(retrans_raw)}->{len(retrans)}, "
-                  f"handoff {len(handoff_raw)}->{len(handoff)}")
 
-        print()
-        _print_block("Retransmission (total curl time)", _stats(retrans))
-        print()
-        _print_block("Handoff time (CR create -> Ready)", _stats(handoff))
-        print()
+        # Retransmission (curl total)
+        retrans_raw = []
+        for r in rows:
+            if r.get("scenario") != scenario:
+                continue
+            v = r.get("t_total_s")
+            if isinstance(v, (int, float)) and v > 0:
+                retrans_raw.append(v * 1000.0)
+        retrans = _iqr_filter(retrans_raw) if args.iqr else retrans_raw
 
-        # Phase breakdown (curl phases)
-        phases: List[Tuple[str, str]] = [
-            ("DNS", "t_dns_s"),
-            ("TCP Connect", "t_connect_s"),
-            ("TTFB", "t_ttfb_s"),
-            ("Total", "t_total_s"),
-        ]
+        if retrans:
+            _print_stats_block("Retransmission (curl total)", _stats(retrans))
+            print()
 
-        def _ci_str(vals: List[float]) -> str:
-            lo, hi = _ci95(vals)
-            if math.isnan(lo):
-                return "n/a"
-            return f"[{lo:.1f}, {hi:.1f}]"
-
-        print(f"  {'phase':<20}  {'mean':>10}  {'95% CI':>22}")
-        print(f"  {'-'*20}  {'-'*10}  {'-'*22}")
-        for plabel, key in phases:
-            vals = _get_values(rows, scenario, key, 1000.0)
+        # Pipeline phase breakdown
+        print(f"  {'Phase':<30}  {'n':>4}  {'mean':>10}  {'median':>10}  {'95% CI':>22}")
+        print(f"  {'-'*30}  {'-'*4}  {'-'*10}  {'-'*10}  {'-'*22}")
+        for phase_key, phase_label in PIPELINE_PHASES:
+            vals = _get_phase_values(rows, scenario, phase_key, computed)
             if args.iqr:
                 vals = _iqr_filter(vals)
-            mean = statistics.fmean(vals) if vals else float("nan")
-            print(f"  {plabel:<20}  {_fmt_ms(mean):>10}  {_ci_str(vals):>22}")
+            if not vals:
+                continue
+            st = _stats(vals)
+            print(f"  {phase_label:<30}  {st['n']:>4}  {_fmt_ms(st['mean']):>10}  "
+                  f"{_fmt_ms(st['median']):>10}  {_ci_str(vals):>22}")
         print()
 
         # HTTP codes & handoff phase distribution
@@ -345,11 +431,11 @@ def main() -> int:
     # Cross-scenario comparison
     if len(present) > 1:
         print("=" * 70)
-        print("  Cross-Scenario Comparison (Handoff Time)")
+        print("  Cross-Scenario Comparison (CR -> Ready)")
         print("=" * 70)
         for scenario in present:
             label = SCENARIO_LABELS.get(scenario, scenario)
-            vals = _handoff_values(rows, scenario)
+            vals = _get_phase_values(rows, scenario, "cr_to_ready_ms", computed)
             if args.iqr:
                 vals = _iqr_filter(vals)
             st = _stats(vals)
@@ -360,9 +446,9 @@ def main() -> int:
 
         # Pairwise speedups
         for i, s1 in enumerate(present):
-            for s2 in present[i+1:]:
-                v1 = _handoff_values(rows, s1)
-                v2 = _handoff_values(rows, s2)
+            for s2 in present[i + 1:]:
+                v1 = _get_phase_values(rows, s1, "cr_to_ready_ms", computed)
+                v2 = _get_phase_values(rows, s2, "cr_to_ready_ms", computed)
                 if args.iqr:
                     v1, v2 = _iqr_filter(v1), _iqr_filter(v2)
                 if v1 and v2:
@@ -371,36 +457,43 @@ def main() -> int:
                         l1 = SCENARIO_LABELS.get(s1, s1)
                         l2 = SCENARIO_LABELS.get(s2, s2)
                         if m1 > m2:
-                            print(f"  {l2} is {m1/m2:.1f}x faster than {l1} (by mean)")
+                            print(f"  {l2} is {m1 / m2:.1f}x faster than {l1} (by mean)")
                         else:
-                            print(f"  {l1} is {m2/m1:.1f}x faster than {l2} (by mean)")
+                            print(f"  {l1} is {m2 / m1:.1f}x faster than {l2} (by mean)")
         print()
 
     # Per-iteration table
     for scenario in present:
         label = SCENARIO_LABELS.get(scenario, scenario)
-        s_rows = [r for r in rows if r.get("scenario") == scenario]
+        s_rows = [(idx, r) for idx, r in enumerate(rows) if r.get("scenario") == scenario]
         show = args.per_iter or len(s_rows) <= 50
         if show:
             print("-" * 70)
             print(f"  Per-Iteration: {label}")
             print("-" * 70)
-            print(f"  {'#':>3}  {'retrans_ms':>12}  {'handoff_ms':>12}  {'phase':>10}")
-            print(f"  {'':>3}  {'-'*12}  {'-'*12}  {'-'*10}")
-            for r in s_rows:
+            print(f"  {'#':>3}  {'retrans':>10}  {'CR->Rdy':>10}  {'pod_start':>10}  "
+                  f"{'thaw':>10}  {'phase':>10}")
+            print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  {'-' * 10}  "
+                  f"{'-' * 10}  {'-' * 10}")
+            for row_idx, r in s_rows:
                 it = r.get("iteration", "?")
                 t = r.get("t_total_s")
-                t_str = f"{t*1000:.1f}" if isinstance(t, (int, float)) and t > 0 else "-"
-                h = r.get("handoff_time_ms")
-                h_str = f"{h:.0f}" if isinstance(h, (int, float)) and h > 0 else "-"
+                t_str = f"{t * 1000:.1f}" if isinstance(t, (int, float)) and t > 0 else "-"
+                phases = computed.get(row_idx, {})
+                cr_rdy = phases.get("cr_to_ready_ms")
+                cr_str = f"{cr_rdy:.0f}" if cr_rdy is not None else "-"
+                pod_s = phases.get("pod_total_startup_ms")
+                pod_str = f"{pod_s:.0f}" if pod_s is not None else "-"
+                thaw = phases.get("applied_to_ready_ms")
+                thaw_str = f"{thaw:.0f}" if thaw is not None else "-"
                 phase = r.get("handoff_phase", "?")
-                print(f"  {it:>3}  {t_str:>12}  {h_str:>12}  {phase:>10}")
+                print(f"  {it:>3}  {t_str:>10}  {cr_str:>10}  {pod_str:>10}  "
+                      f"{thaw_str:>10}  {phase:>10}")
             print()
         else:
             print(f"  (per-iteration table for {label} suppressed; pass --per-iter to show)")
             print()
 
-    from datetime import datetime
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if args.plot is not None:
@@ -411,7 +504,7 @@ def main() -> int:
             plot_path = os.path.join(args.plot, f"handoff_bench_boxplot_{ts}.svg")
         else:
             plot_path = args.plot
-        _generate_plot(rows, plot_path, use_iqr=args.iqr)
+        _generate_plot(rows, computed, plot_path, use_iqr=args.iqr)
 
     if args.plot_ci is not None:
         if args.plot_ci == "auto":
@@ -421,7 +514,7 @@ def main() -> int:
             ci_path = os.path.join(args.plot_ci, f"handoff_bench_ci_{ts}.svg")
         else:
             ci_path = args.plot_ci
-        _generate_ci_plot(rows, ci_path, use_iqr=args.iqr)
+        _generate_ci_plot(rows, computed, ci_path, use_iqr=args.iqr)
 
     return 0
 
