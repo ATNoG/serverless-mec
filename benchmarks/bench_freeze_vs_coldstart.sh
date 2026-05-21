@@ -515,11 +515,10 @@ ensure_restart_policy_kyverno() {
     # restartPolicy: Never on every Deployment CREATE/UPDATE, which survives
     # Knative reconciliation.
     #
-    # The script applies the policy itself so it does not depend on the policy
-    # being pre-installed — only on kyverno being present in the cluster.
-    if kubectl get clusterpolicy bench-restart-policy-never >/dev/null 2>&1; then
-        return 0  # already exists from a previous run or manual apply
-    fi
+    # Always recreate the policy — bench_handoff.sh uses the same policy name
+    # but with a service-specific selector. If that policy is left over, the
+    # wildcard selector we need here would never be applied.
+    kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1
     log "  Applying kyverno policy: inject restartPolicy=Never on user-container"
     kubectl apply -f - >/dev/null 2>&1 <<'POLICY'
 apiVersion: kyverno.io/v1
