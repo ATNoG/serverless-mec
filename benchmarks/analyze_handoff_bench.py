@@ -69,14 +69,13 @@ def _compute_phases(row: dict) -> dict:
     p = row.get("pipeline", {})
     phases = {}
 
-    # Total handoff time: ts_before -> ts_after (wall clock from bench script)
-    t_before = _parse_ts(row.get("ts_before"))
-    t_after = _parse_ts(row.get("ts_after"))
-    if t_before and t_after:
-        phases["total_wall_ms"] = (t_after - t_before) * 1000.0
+    # Handoff wall-clock time with ms precision (measured by bench script)
+    hw = row.get("handoff_wall_ms")
+    if isinstance(hw, (int, float)) and hw > 0:
+        phases["handoff_wall_ms"] = hw
 
-    # CR creation -> CR Applied condition
-    d = _phase_duration_ms(p, "cr_created", "cr_cond_applied_ts")
+    # CR creation -> CR Progressing (reason=Applied) condition
+    d = _phase_duration_ms(p, "cr_created", "cr_cond_progressing_ts")
     if d is not None:
         phases["cr_to_applied_ms"] = d
 
@@ -110,8 +109,8 @@ def _compute_phases(row: dict) -> dict:
     if d is not None:
         phases["pod_total_startup_ms"] = d
 
-    # CR Applied -> CR Ready (thaw phase for freeze scenario)
-    d = _phase_duration_ms(p, "cr_cond_applied_ts", "cr_cond_ready_ts")
+    # CR Progressing -> CR Ready (service startup after operator applies)
+    d = _phase_duration_ms(p, "cr_cond_progressing_ts", "cr_cond_ready_ts")
     if d is not None:
         phases["applied_to_ready_ms"] = d
 
@@ -179,16 +178,24 @@ def _iqr_filter(vals: List[float]) -> List[float]:
     return [v for v in vals if lo <= v <= hi]
 
 
-SCENARIOS = ["rsu-a-coldstart", "worker1-coldstart", "worker1-freeze"]
+SCENARIOS = [
+    "rsu-a-coldstart",
+    "worker1-coldstart", "worker1-freeze",
+    "worker2-coldstart", "worker2-freeze",
+]
 SCENARIO_LABELS = {
     "rsu-a-coldstart": "RSU-A Cold Start",
     "worker1-coldstart": "Worker-1 Cold Start",
     "worker1-freeze": "Worker-1 CRIU Thaw",
+    "worker2-coldstart": "Worker-2 Cold Start",
+    "worker2-freeze": "Worker-2 CRIU Thaw",
 }
 SCENARIO_COLORS = {
     "RSU-A Cold Start": "#FF9800",
     "Worker-1 Cold Start": "#4CAF50",
     "Worker-1 CRIU Thaw": "#2196F3",
+    "Worker-2 Cold Start": "#9C27B0",
+    "Worker-2 CRIU Thaw": "#E91E63",
 }
 
 # Pipeline phases to report (key in computed phases -> display label)
@@ -199,8 +206,9 @@ PIPELINE_PHASES = [
     ("container_startup_ms", "Container Startup"),
     ("readiness_probe_ms", "Readiness Probe"),
     ("pod_total_startup_ms", "Pod Total Startup"),
-    ("applied_to_ready_ms", "Applied -> Ready (thaw)"),
-    ("cr_to_ready_ms", "CR -> Ready (total)"),
+    ("applied_to_ready_ms", "Applied -> Ready"),
+    ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
+    ("handoff_wall_ms", "Handoff Wall Clock (ms)"),
 ]
 
 
@@ -270,7 +278,7 @@ def _build_plot_df(rows: List[dict], computed: Dict[int, dict], use_iqr: bool):
         ("CR -> Applied", "cr_to_applied_ms"),
         ("Pod Total Startup", "pod_total_startup_ms"),
         ("Applied -> Ready", "applied_to_ready_ms"),
-        ("CR -> Ready (total)", "cr_to_ready_ms"),
+        ("Handoff Wall Clock", "handoff_wall_ms"),
         ("Retransmission", None),  # from t_total_s
     ]
 
@@ -281,7 +289,7 @@ def _build_plot_df(rows: List[dict], computed: Dict[int, dict], use_iqr: bool):
             if phase_key is None:
                 # Retransmission from curl timing
                 vals = []
-                for idx, r in enumerate(rows):
+                for r in rows:
                     if r.get("scenario") != scenario:
                         continue
                     v = r.get("t_total_s")
@@ -431,11 +439,11 @@ def main() -> int:
     # Cross-scenario comparison
     if len(present) > 1:
         print("=" * 70)
-        print("  Cross-Scenario Comparison (CR -> Ready)")
+        print("  Cross-Scenario Comparison (Handoff Wall Clock)")
         print("=" * 70)
         for scenario in present:
             label = SCENARIO_LABELS.get(scenario, scenario)
-            vals = _get_phase_values(rows, scenario, "cr_to_ready_ms", computed)
+            vals = _get_phase_values(rows, scenario, "handoff_wall_ms", computed)
             if args.iqr:
                 vals = _iqr_filter(vals)
             st = _stats(vals)
@@ -447,8 +455,8 @@ def main() -> int:
         # Pairwise speedups
         for i, s1 in enumerate(present):
             for s2 in present[i + 1:]:
-                v1 = _get_phase_values(rows, s1, "cr_to_ready_ms", computed)
-                v2 = _get_phase_values(rows, s2, "cr_to_ready_ms", computed)
+                v1 = _get_phase_values(rows, s1, "handoff_wall_ms", computed)
+                v2 = _get_phase_values(rows, s2, "handoff_wall_ms", computed)
                 if args.iqr:
                     v1, v2 = _iqr_filter(v1), _iqr_filter(v2)
                 if v1 and v2:
@@ -471,15 +479,17 @@ def main() -> int:
             print("-" * 70)
             print(f"  Per-Iteration: {label}")
             print("-" * 70)
-            print(f"  {'#':>3}  {'retrans':>10}  {'CR->Rdy':>10}  {'pod_start':>10}  "
-                  f"{'thaw':>10}  {'phase':>10}")
+            print(f"  {'#':>3}  {'retrans':>10}  {'wall_ms':>10}  {'CR->Rdy':>10}  "
+                  f"{'pod_start':>10}  {'thaw':>10}  {'phase':>10}")
             print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  {'-' * 10}  "
-                  f"{'-' * 10}  {'-' * 10}")
+                  f"{'-' * 10}  {'-' * 10}  {'-' * 10}")
             for row_idx, r in s_rows:
                 it = r.get("iteration", "?")
                 t = r.get("t_total_s")
                 t_str = f"{t * 1000:.1f}" if isinstance(t, (int, float)) and t > 0 else "-"
                 phases = computed.get(row_idx, {})
+                wall = phases.get("handoff_wall_ms")
+                wall_str = f"{wall:.0f}" if wall is not None else "-"
                 cr_rdy = phases.get("cr_to_ready_ms")
                 cr_str = f"{cr_rdy:.0f}" if cr_rdy is not None else "-"
                 pod_s = phases.get("pod_total_startup_ms")
@@ -487,8 +497,8 @@ def main() -> int:
                 thaw = phases.get("applied_to_ready_ms")
                 thaw_str = f"{thaw:.0f}" if thaw is not None else "-"
                 phase = r.get("handoff_phase", "?")
-                print(f"  {it:>3}  {t_str:>10}  {cr_str:>10}  {pod_str:>10}  "
-                      f"{thaw_str:>10}  {phase:>10}")
+                print(f"  {it:>3}  {t_str:>10}  {wall_str:>10}  {cr_str:>10}  "
+                      f"{pod_str:>10}  {thaw_str:>10}  {phase:>10}")
             print()
         else:
             print(f"  (per-iteration table for {label} suppressed; pass --per-iter to show)")
