@@ -232,10 +232,11 @@ ensure_curl_pod() {
     fi
 }
 
+DEFAULT_EVENT_PAYLOAD='{"frame_raw_hex":"0011223344556677","frame_number":1}'
 send_event() {
     local url="$1"
     local host_header="${2:-}"
-    local payload="${3:-{"frame_raw_hex":"0011223344556677","frame_number":1}}"
+    local payload="${3:-$DEFAULT_EVENT_PAYLOAD}"
     local out
     local -a extra_args=()
     if [[ -n "$host_header" ]]; then
@@ -583,22 +584,13 @@ cleanup_node_disk() {
 patch_ea() {
     local freeze="$1" node_key="$2" node_val="$3" target_replica="$4" node_selector_json="$5"
     local cleanup_on_delete="${6:-true}"
+    local clear_triggers="${7:-false}"
 
-    # Patch freezeEnabled + nodeSelector
-    kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=merge \
-        -p '{"spec":{"service":{"freezeEnabled":'"$freeze"'}}}' >/dev/null 2>&1
-
-    # Remove + re-add nodeSelector (avoids merge issues)
-    kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=json \
-        -p "[{\"op\":\"remove\",\"path\":\"/spec/service/nodeSelector\"}]" \
-        >/dev/null 2>&1 || true
-    kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=json \
-        -p "[{\"op\":\"add\",\"path\":\"/spec/service/nodeSelector\",\"value\":{\"$node_key\":\"$node_val\"}}]" \
-        >/dev/null 2>&1
-
-    # Patch env vars for handoff target
-    local env_patch
-    env_patch=$(python3 -c "
+    # Single atomic JSON patch to avoid multiple reconciliation cycles.
+    # Multiple sequential patches cause the operator to create a new Knative
+    # revision for each change, leading to reconciliation storms.
+    local json_ops
+    json_ops=$(python3 -c "
 import json
 envs = [
     {'name':'FORWARD_URL','value':'http://http-sink.default.svc.cluster.local'},
@@ -609,10 +601,17 @@ envs = [
     {'name':'HANDOFF_CLEANUP_ON_DELETE','value':'$cleanup_on_delete'},
     {'name':'HANDOFF_NODE_SELECTOR','value':json.dumps(json.loads('$node_selector_json')) if '$node_selector_json' else ''},
 ]
-print(json.dumps({'spec':{'service':{'container':{'env':envs}}}}))
+ops = [
+    {'op': 'replace', 'path': '/spec/service/nodeSelector', 'value': {'$node_key': '$node_val'}},
+    {'op': 'replace', 'path': '/spec/service/freezeEnabled', 'value': '$freeze' == 'true'},
+    {'op': 'replace', 'path': '/spec/service/container/env', 'value': envs},
+]
+if '$clear_triggers' == 'true':
+    ops.append({'op': 'replace', 'path': '/spec/service/triggerFilters', 'value': []})
+print(json.dumps(ops))
 ")
-    kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=merge \
-        -p "$env_patch" >/dev/null 2>&1
+    kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=json \
+        -p "$json_ops" >/dev/null 2>&1
 
     sleep 5
 }
@@ -732,8 +731,8 @@ run_scenario() {
 
     patch_ea "$freeze" "$node_key" "$node_val" "$handoff_target" "$handoff_node_selector"
 
-    # Wait for new revision to roll out
-    sleep 10
+    # Wait for the new revision to stabilize before proceeding
+    wait_for_knative_rollout "$SERVICE_NAME"
 
     # Force-delete old pods and do a warmup iteration
     kubectl delete pods -n "$NAMESPACE" \
@@ -813,10 +812,8 @@ run_freeze_scenario() {
     # events to the target pod (which would keep it awake and prevent freeze).
     # cleanupOnDelete=false so the target KService survives handoff CR deletion.
     patch_ea "true" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
-        "$handoff_target" "$handoff_node_selector" "false"
+        "$handoff_target" "$handoff_node_selector" "false" "true"
 
-    kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=merge \
-        -p '{"spec":{"service":{"triggerFilters":[]}}}' >/dev/null 2>&1
     kubectl delete trigger -n "$NAMESPACE" \
         -l "mec.atnog.org/app=$EA_NAME" --ignore-not-found >/dev/null 2>&1
 
