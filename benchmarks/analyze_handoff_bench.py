@@ -186,16 +186,16 @@ SCENARIOS = [
 SCENARIO_LABELS = {
     "rsu-a-coldstart": "RSU-A Cold Start",
     "worker1-coldstart": "Worker-1 Cold Start",
-    "worker1-freeze": "Worker-1 CRIU Thaw",
+    "worker1-freeze": "Worker-1 Freeze Handoff",
     "worker2-coldstart": "Worker-2 Cold Start",
-    "worker2-freeze": "Worker-2 CRIU Thaw",
+    "worker2-freeze": "Worker-2 Freeze Handoff",
 }
 SCENARIO_COLORS = {
     "RSU-A Cold Start": "#FF9800",
     "Worker-1 Cold Start": "#4CAF50",
-    "Worker-1 CRIU Thaw": "#2196F3",
+    "Worker-1 Freeze Handoff": "#2196F3",
     "Worker-2 Cold Start": "#9C27B0",
-    "Worker-2 CRIU Thaw": "#E91E63",
+    "Worker-2 Freeze Handoff": "#E91E63",
 }
 
 # Pipeline phases to report (key in computed phases -> display label)
@@ -479,10 +479,20 @@ def main() -> int:
             print("-" * 70)
             print(f"  Per-Iteration: {label}")
             print("-" * 70)
-            print(f"  {'#':>3}  {'retrans':>10}  {'wall_ms':>10}  {'CR->Rdy':>10}  "
-                  f"{'pod_start':>10}  {'thaw':>10}  {'phase':>10}")
-            print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  {'-' * 10}  "
-                  f"{'-' * 10}  {'-' * 10}  {'-' * 10}")
+            is_freeze = "freeze" in scenario
+            if is_freeze:
+                # The handoff_wall_ms includes both operator reconciliation
+                # and CRIU thaw — the operator triggers the restore as part
+                # of the handoff, so the pod is already live when CR=Ready.
+                print(f"  {'#':>3}  {'wall_ms':>10}  {'CR->Rdy':>10}  "
+                      f"{'pod_start':>10}  {'phase':>10}")
+                print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  "
+                      f"{'-' * 10}  {'-' * 10}")
+            else:
+                print(f"  {'#':>3}  {'retrans':>10}  {'wall_ms':>10}  {'CR->Rdy':>10}  "
+                      f"{'pod_start':>10}  {'applied->rdy':>12}  {'phase':>10}")
+                print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  {'-' * 10}  "
+                      f"{'-' * 10}  {'-' * 12}  {'-' * 10}")
             for row_idx, r in s_rows:
                 it = r.get("iteration", "?")
                 t = r.get("t_total_s")
@@ -497,8 +507,12 @@ def main() -> int:
                 thaw = phases.get("applied_to_ready_ms")
                 thaw_str = f"{thaw:.0f}" if thaw is not None else "-"
                 phase = r.get("handoff_phase", "?")
-                print(f"  {it:>3}  {t_str:>10}  {wall_str:>10}  {cr_str:>10}  "
-                      f"{pod_str:>10}  {thaw_str:>10}  {phase:>10}")
+                if is_freeze:
+                    print(f"  {it:>3}  {wall_str:>10}  {cr_str:>10}  "
+                          f"{pod_str:>10}  {phase:>10}")
+                else:
+                    print(f"  {it:>3}  {t_str:>10}  {wall_str:>10}  {cr_str:>10}  "
+                          f"{pod_str:>10}  {thaw_str:>12}  {phase:>10}")
             print()
         else:
             print(f"  (per-iteration table for {label} suppressed; pass --per-iter to show)")
