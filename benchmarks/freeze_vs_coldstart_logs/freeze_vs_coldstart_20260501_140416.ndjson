@@ -1,0 +1,10 @@
+{"mode":"criu_thaw","iteration":1,"t_dns_s":0.000103,"t_connect_s":0.000729,"t_ttfb_s":0.918497,"t_total_s":0.918599,"http_code":422,"ts_before":"2026-05-01T13:07:41.404Z","ts_after":"2026-05-01T13:07:42.967Z"}
+{"mode":"criu_thaw","iteration":2,"t_dns_s":0.000176,"t_connect_s":0.001105,"t_ttfb_s":0.840104,"t_total_s":0.840216,"http_code":422,"ts_before":"2026-05-01T13:08:22.350Z","ts_after":"2026-05-01T13:08:24.235Z"}
+{"mode":"criu_thaw","iteration":3,"t_dns_s":0.000179,"t_connect_s":0.001214,"t_ttfb_s":0.923455,"t_total_s":0.923559,"http_code":422,"ts_before":"2026-05-01T13:09:01.284Z","ts_after":"2026-05-01T13:09:02.948Z"}
+{"mode":"criu_thaw","iteration":4,"t_dns_s":0.000143,"t_connect_s":0.000701,"t_ttfb_s":1.029203,"t_total_s":1.029321,"http_code":422,"ts_before":"2026-05-01T13:09:41.959Z","ts_after":"2026-05-01T13:09:43.702Z"}
+{"mode":"criu_thaw","iteration":5,"t_dns_s":0.000099,"t_connect_s":0.000978,"t_ttfb_s":0.822623,"t_total_s":0.822731,"http_code":422,"ts_before":"2026-05-01T13:10:23.518Z","ts_after":"2026-05-01T13:10:25.076Z"}
+{"mode":"cold_start","iteration":1,"t_dns_s":0.008200,"t_connect_s":0.009551,"t_ttfb_s":5.275267,"t_total_s":5.275408,"http_code":422,"ts_before":"2026-05-01T13:13:45.366Z","ts_after":"2026-05-01T13:13:51.274Z"}
+{"mode":"cold_start","iteration":2,"t_dns_s":0.008726,"t_connect_s":0.009917,"t_ttfb_s":4.824935,"t_total_s":4.825048,"http_code":422,"ts_before":"2026-05-01T13:14:48.053Z","ts_after":"2026-05-01T13:14:53.771Z"}
+{"mode":"cold_start","iteration":3,"t_dns_s":0.008322,"t_connect_s":0.009647,"t_ttfb_s":7.200764,"t_total_s":7.200879,"http_code":422,"ts_before":"2026-05-01T13:15:44.646Z","ts_after":"2026-05-01T13:15:52.408Z"}
+{"mode":"cold_start","iteration":4,"t_dns_s":0.009509,"t_connect_s":0.010753,"t_ttfb_s":5.087917,"t_total_s":5.088026,"http_code":422,"ts_before":"2026-05-01T13:16:46.978Z","ts_after":"2026-05-01T13:16:52.615Z"}
+{"mode":"cold_start","iteration":5,"t_dns_s":0.006915,"t_connect_s":0.008079,"t_ttfb_s":4.816145,"t_total_s":4.816298,"http_code":422,"ts_before":"2026-05-01T13:17:46.998Z","ts_after":"2026-05-01T13:17:52.382Z"}
