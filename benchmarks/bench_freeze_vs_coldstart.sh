@@ -455,11 +455,13 @@ cleanup_node_disk() {
     #  1) /tmp/ctrd-checkpoint* — CRIU checkpoint temp dirs (~49 MB each)
     #  2) /var/lib/kubelet/checkpoints/* — kubelet checkpoint archives
     #  3) crictl rmi --prune — unused container images
-    #  4) Remove ALL containerd content — CRIU checkpoint blobs stay referenced
-    #     in containerd's metadata DB and are never collected by
-    #     'ctr content prune references'. Each checkpoint adds ~13 MB that
-    #     accumulates indefinitely. Wiping the content store and re-pulling
-    #     the two needed images is the only reliable cleanup.
+    #  4) Remove checkpoint images + snapshots from containerd — CRIU checkpoint
+    #     blobs stay referenced in containerd's metadata DB and are never
+    #     collected by 'ctr content prune references'. Checkpoint images are
+    #     named 'containerd.io/checkpoint/{hash}:{timestamp}'. Stale snapshots
+    #     named '*-parent-view' block future checkpoints. Removing both lets
+    #     content prune reclaim ~13 MB per checkpoint without destroying other
+    #     pods' image blobs.
     #  5) Re-pull app + queue-proxy images so they're cached for next iteration
     #
     # Uses a privileged pod with hostPID + nsenter so it works even when
@@ -498,7 +500,7 @@ cleanup_node_disk() {
               "name": "cleanup",
               "image": "busybox",
               "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
-                "n=$(find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d 2>/dev/null | wc -l); find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d -exec rm -rf {} + 2>/dev/null; rm -rf /var/lib/kubelet/checkpoints/* 2>/dev/null; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content ls -q 2>/dev/null | xargs k3s ctr content rm >/dev/null 2>&1; '"$pull_cmds"' echo cleaned_checkpoints=$n"],
+                "n=$(find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d 2>/dev/null | wc -l); find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d -exec rm -rf {} + 2>/dev/null; rm -rf /var/lib/kubelet/checkpoints/* 2>/dev/null; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr -n k8s.io images ls -q 2>/dev/null | grep '^containerd.io/checkpoint/' | xargs -r k3s ctr -n k8s.io images rm >/dev/null 2>&1; k3s ctr -n k8s.io content prune references >/dev/null 2>&1; k3s ctr -n k8s.io snapshots ls 2>/dev/null | grep parent-view | sed \"s/ .*//\" | xargs -r -n1 k3s ctr -n k8s.io snapshots rm >/dev/null 2>&1; '"$pull_cmds"' echo cleaned_checkpoints=$n"],
               "securityContext": {"privileged": true}
             }]
           }
