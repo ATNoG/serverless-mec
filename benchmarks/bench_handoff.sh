@@ -527,7 +527,7 @@ resolve_bench_node() {
 }
 
 cleanup_node_disk() {
-    # Cleans up disk space on the bench node to prevent disk-pressure taints:
+    # Cleans up disk space on a node to prevent disk-pressure taints:
     #  1) /tmp/ctrd-checkpoint* — CRIU checkpoint temp dirs (~49 MB each)
     #  2) /var/lib/kubelet/checkpoints/* — kubelet checkpoint archives
     #  3) crictl rmi --prune — unused container images
@@ -537,7 +537,11 @@ cleanup_node_disk() {
     #     accumulates indefinitely. Wiping the content store and re-pulling
     #     the two needed images is the only reliable cleanup.
     #  5) Re-pull app + queue-proxy images so they're cached for next iteration
-    if [[ -z "$BENCH_NODE_NAME" ]]; then return; fi
+    #
+    # Usage: cleanup_node_disk [node_name]
+    #   If node_name is omitted, defaults to BENCH_NODE_NAME.
+    local node_name="${1:-$BENCH_NODE_NAME}"
+    if [[ -z "$node_name" ]]; then return; fi
 
     # Resolve images to re-pull after pruning
     local app_image qp_image
@@ -546,7 +550,7 @@ cleanup_node_disk() {
     qp_image=$(kubectl get configmap config-deployment -n knative-serving \
         -o jsonpath='{.data.queue-sidecar-image}' 2>/dev/null)
 
-    local pod_name="bench-disk-cleanup"
+    local pod_name="bench-disk-cleanup-$(echo "$node_name" | cut -d- -f1)"
     kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     sleep 2
 
@@ -562,7 +566,7 @@ cleanup_node_disk() {
     kubectl run "$pod_name" -n "$NAMESPACE" --restart=Never --image=busybox \
         --overrides='{
           "spec": {
-            "nodeName": "'"$BENCH_NODE_NAME"'",
+            "nodeName": "'"$node_name"'",
             "hostPID": true,
             "tolerations": [{"operator": "Exists"}],
             "containers": [{
@@ -578,7 +582,7 @@ cleanup_node_disk() {
         local result
         result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
         if [[ -n "$result" && "$result" != "cleaned_checkpoints=0" ]]; then
-            log "  Disk cleanup on $BENCH_NODE_NAME: $result"
+            log "  Disk cleanup on $node_name: $result"
         fi
     fi
     kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -627,7 +631,15 @@ EA_BACKUP=""
 TRIGGERS_BACKUP=""
 cleanup() {
     log "Cleanup..."
-    cleanup_node_disk
+    # Clean all worker nodes that may have accumulated CRIU checkpoint blobs.
+    # Different scenarios target different nodes; clean them all.
+    cleanup_node_disk "$BENCH_NODE_NAME"
+    local w2_node
+    w2_node=$(kubectl get nodes -l vm-id=worker-2 \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -n "$w2_node" && "$w2_node" != "$BENCH_NODE_NAME" ]]; then
+        cleanup_node_disk "$w2_node"
+    fi
     kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
     kubectl delete clusterpolicy bench-freeze-idle-timeout --ignore-not-found >/dev/null 2>&1 || true
@@ -808,9 +820,14 @@ run_freeze_scenario() {
     local handoff_node_selector="$4" target_node_key="$5" target_node_val="$6"
     local target_svc="${EA_NAME}-${handoff_target}"
 
+    # Resolve the target node name for disk cleanup during iterations
+    local target_node_name
+    target_node_name=$(kubectl get nodes -l "$target_node_key=$target_node_val" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
     log "=== SCENARIO: $scenario_name ($iterations iterations) ==="
     log "  Measures full handoff latency with CRIU-frozen target"
-    log "  Target KService: $target_svc"
+    log "  Target KService: $target_svc (node: $target_node_name)"
 
     # Step 1: Patch EA — freeze=true, clear triggerFilters.
     # triggerFilters must be empty to prevent the broker from dispatching
@@ -932,7 +949,7 @@ EOF
         fi
 
         if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
-            cleanup_node_disk
+            cleanup_node_disk "$target_node_name"
         fi
 
         # Delete handoff CR from previous iteration (KService survives)
