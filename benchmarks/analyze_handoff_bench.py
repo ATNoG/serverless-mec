@@ -208,7 +208,7 @@ PIPELINE_PHASES = [
     ("pod_total_startup_ms", "Pod Total Startup"),
     ("applied_to_ready_ms", "Applied -> Ready"),
     ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
-    ("handoff_wall_ms", "Handoff Wall Clock (ms)"),
+    ("handoff_wall_ms", "Handoff Wall Clock"),
 ]
 
 
@@ -481,9 +481,6 @@ def main() -> int:
             print("-" * 70)
             is_freeze = "freeze" in scenario
             if is_freeze:
-                # The handoff_wall_ms includes both operator reconciliation
-                # and CRIU thaw — the operator triggers the restore as part
-                # of the handoff, so the pod is already live when CR=Ready.
                 print(f"  {'#':>3}  {'wall_ms':>10}  {'CR->Rdy':>10}  "
                       f"{'pod_start':>10}  {'phase':>10}")
                 print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  "
@@ -504,15 +501,15 @@ def main() -> int:
                 cr_str = f"{cr_rdy:.0f}" if cr_rdy is not None else "-"
                 pod_s = phases.get("pod_total_startup_ms")
                 pod_str = f"{pod_s:.0f}" if pod_s is not None else "-"
-                thaw = phases.get("applied_to_ready_ms")
-                thaw_str = f"{thaw:.0f}" if thaw is not None else "-"
+                a2r = phases.get("applied_to_ready_ms")
+                a2r_str = f"{a2r:.0f}" if a2r is not None else "-"
                 phase = r.get("handoff_phase", "?")
                 if is_freeze:
                     print(f"  {it:>3}  {wall_str:>10}  {cr_str:>10}  "
                           f"{pod_str:>10}  {phase:>10}")
                 else:
                     print(f"  {it:>3}  {t_str:>10}  {wall_str:>10}  {cr_str:>10}  "
-                          f"{pod_str:>10}  {thaw_str:>12}  {phase:>10}")
+                          f"{pod_str:>10}  {a2r_str:>12}  {phase:>10}")
             print()
         else:
             print(f"  (per-iteration table for {label} suppressed; pass --per-iter to show)")

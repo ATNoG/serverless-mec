@@ -529,9 +529,14 @@ resolve_bench_node() {
 cleanup_node_disk() {
     # Cleans up disk space on the bench node to prevent disk-pressure taints:
     #  1) /tmp/ctrd-checkpoint* — CRIU checkpoint temp dirs (~49 MB each)
-    #  2) crictl rmi --prune    — unused container images
-    #  3) ctr content prune     — unreferenced content store blobs
-    #  4) re-pull app + queue-proxy images so they're cached for next iteration
+    #  2) /var/lib/kubelet/checkpoints/* — kubelet checkpoint archives
+    #  3) crictl rmi --prune — unused container images
+    #  4) Remove ALL containerd content — CRIU checkpoint blobs stay referenced
+    #     in containerd's metadata DB and are never collected by
+    #     'ctr content prune references'. Each checkpoint adds ~13 MB that
+    #     accumulates indefinitely. Wiping the content store and re-pulling
+    #     the two needed images is the only reliable cleanup.
+    #  5) Re-pull app + queue-proxy images so they're cached for next iteration
     if [[ -z "$BENCH_NODE_NAME" ]]; then return; fi
 
     # Resolve images to re-pull after pruning
@@ -564,12 +569,12 @@ cleanup_node_disk() {
               "name": "cleanup",
               "image": "busybox",
               "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
-                "n=$(find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d 2>/dev/null | wc -l); find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d -exec rm -rf {} + 2>/dev/null; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content prune references >/dev/null 2>&1; '"$pull_cmds"' echo cleaned_checkpoints=$n"],
+                "n=$(find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d 2>/dev/null | wc -l); find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d -exec rm -rf {} + 2>/dev/null; rm -rf /var/lib/kubelet/checkpoints/* 2>/dev/null; k3s crictl rmi --prune >/dev/null 2>&1; k3s ctr content ls -q 2>/dev/null | xargs k3s ctr content rm >/dev/null 2>&1; '"$pull_cmds"' echo cleaned_checkpoints=$n"],
               "securityContext": {"privileged": true}
             }]
           }
         }' >/dev/null 2>&1
-    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s >/dev/null 2>&1; then
+    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=180s >/dev/null 2>&1; then
         local result
         result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
         if [[ -n "$result" && "$result" != "cleaned_checkpoints=0" ]]; then
@@ -963,7 +968,9 @@ EOF
         fi
         log "  Target confirmed frozen."
 
-        # Create the handoff CR and measure time to Ready
+        # Create the handoff CR and measure time to Ready.
+        # handoff_wall_ms captures the full lifecycle: CR creation →
+        # operator detection → CRIU thaw → CR Ready.
         local ts_before handoff_start
         ts_before=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
         handoff_start=$(date +%s%N)
@@ -993,11 +1000,6 @@ EOF
             ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
             phase=$(get_handoff_phase "$handoff_target")
             log "  Handoff $phase in ${handoff_wall_ms}ms"
-
-            # The operator's handoff reconciliation already triggers the
-            # CRIU thaw — the target pod is live by the time the CR
-            # reaches Ready. The handoff_wall_ms therefore includes both
-            # operator overhead and CRIU restore time.
             emit_result "$scenario_name" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
         else
             local handoff_end handoff_wall_ms phase ts_after
