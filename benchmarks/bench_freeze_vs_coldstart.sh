@@ -780,6 +780,14 @@ run_criu_thaw_benchmark() {
 
 run_cold_start_benchmark() {
     log "=== PHASE 2: COLD START ($ITERATIONS iterations) ==="
+
+    # Remove the Kyverno restartPolicy=Never policy BEFORE patching the EA.
+    # Without this, new cold-start revision pods inherit restartPolicy=Never,
+    # and old freeze-revision deployments keep recreating CrashLoopBackOff
+    # pods that prevent scale-to-zero.
+    log "  Removing kyverno restartPolicy=Never policy for cold-start phase"
+    kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
+
     log "Patching EdgeApplication: freezeEnabled=false, minScale=0"
     kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=merge \
         -p '{"spec":{"service":{"freezeEnabled":false,"minScale":0}}}' >/dev/null 2>&1
@@ -795,6 +803,30 @@ run_cold_start_benchmark() {
         -l "serving.knative.dev/service=$SERVICE_NAME" \
         --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
     sleep 3
+
+    # Wait for the new cold-start revision to roll out, then delete old
+    # freeze revisions whose deployments keep recreating crashed pods.
+    wait_for_knative_rollout || true
+    local latest_rev
+    latest_rev=$(kubectl get ksvc "$SERVICE_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.status.latestReadyRevisionName}' 2>/dev/null)
+    if [[ -n "$latest_rev" ]]; then
+        log "  Cleaning up old revisions (keeping $latest_rev)..."
+        kubectl get revisions -n "$NAMESPACE" \
+            -l "serving.knative.dev/service=$SERVICE_NAME" \
+            -o jsonpath='{.items[*].metadata.name}' 2>/dev/null \
+        | tr ' ' '\n' \
+        | while read -r rev; do
+            [[ "$rev" == "$latest_rev" ]] && continue
+            kubectl delete revision "$rev" -n "$NAMESPACE" --wait=false >/dev/null 2>&1 || true
+            log "    Deleted old revision: $rev"
+        done
+        sleep 5
+        # Force-delete any leftover pods from deleted revisions
+        kubectl delete pods -n "$NAMESPACE" \
+            -l "serving.knative.dev/service=$SERVICE_NAME" \
+            --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
+    fi
 
     # Warmup: do one throwaway cold-start cycle so the new revision's image
     # is pulled and the ksvc routing is settled before real measurements.
