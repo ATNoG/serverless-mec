@@ -61,7 +61,13 @@ spec:
       - command:
         - /manager
         args:
-          - --leader-elect
+          # Leader election is only needed with multiple replicas (HA).
+          # With a single replica it causes unnecessary crashes: the
+          # lease renewal PUT to the API server occasionally times out
+          # under load, the operator exits with "leader election lost",
+          # and kubelet restarts it (~every 1-2 hours).
+          # Uncomment --leader-elect if you scale to 2+ replicas.
+          # - --leader-elect
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
