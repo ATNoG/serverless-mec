@@ -1,2 +1,0 @@
-{"scenario":"rsu-a-coldstart","iteration":1,"t_dns_s":0.009292,"t_connect_s":0.010556,"t_ttfb_s":300.020259,"t_total_s":300.020434,"http_code":"504","ts_before":"2026-04-29T16:32:36.576Z","ts_after":"2026-04-29T16:37:37.188Z","handoff_phase":"Skipped","handoff_time_ms":null}
-{"scenario":"rsu-a-coldstart","iteration":2,"t_dns_s":0.010033,"t_connect_s":0.011279,"t_ttfb_s":300.019619,"t_total_s":300.019941,"http_code":"504","ts_before":"2026-04-29T16:37:42.072Z","ts_after":"2026-04-29T16:42:43.112Z","handoff_phase":"Skipped","handoff_time_ms":null}
