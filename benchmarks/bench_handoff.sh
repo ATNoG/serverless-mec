@@ -50,6 +50,27 @@ BENCH_NODE_SELECTOR_VAL="worker-1"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
+# ---- retry helper ----------------------------------------------------------
+
+kubectl_retry() {
+    # Retries a kubectl command up to N times with exponential backoff.
+    # Usage: kubectl_retry [max_attempts] kubectl <args...>
+    local max_attempts="${1:-3}"; shift
+    local attempt delay=2
+    for (( attempt=1; attempt<=max_attempts; attempt++ )); do
+        if "$@" ; then
+            return 0
+        fi
+        if (( attempt < max_attempts )); then
+            log "  WARNING: command failed (attempt $attempt/$max_attempts), retrying in ${delay}s..."
+            sleep "$delay"
+            delay=$(( delay * 2 ))
+        fi
+    done
+    log "  ERROR: command failed after $max_attempts attempts: $*"
+    return 1
+}
+
 # ---- helpers ---------------------------------------------------------------
 
 strip_server_fields() {
@@ -466,9 +487,9 @@ ensure_restart_policy_kyverno() {
         return 1
     fi
     # Delete any stale policy first (match selector may have changed)
-    kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1
+    kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
     log "  Applying kyverno policy: inject restartPolicy=Never on $target_svc"
-    kubectl apply -f - >/dev/null 2>&1 <<POLICY
+    kubectl_retry 3 kubectl apply -f - >/dev/null 2>&1 <<POLICY
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -620,7 +641,7 @@ if '$clear_triggers' == 'true':
     ops.append({'op': 'replace', 'path': '/spec/service/triggerFilters', 'value': []})
 print(json.dumps(ops))
 ")
-    kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=json \
+    kubectl_retry 3 kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=json \
         -p "$json_ops" >/dev/null 2>&1
 
     sleep 5
@@ -747,10 +768,17 @@ run_scenario() {
     log "=== SCENARIO: $scenario ($iterations iterations) ==="
     log "  freeze=$freeze, source=$node_key=$node_val, target=$handoff_target"
 
-    patch_ea "$freeze" "$node_key" "$node_val" "$handoff_target" "$handoff_node_selector"
+    if ! patch_ea "$freeze" "$node_key" "$node_val" "$handoff_target" "$handoff_node_selector"; then
+        log "  ERROR: patch_ea failed, retrying once..."
+        sleep 5
+        patch_ea "$freeze" "$node_key" "$node_val" "$handoff_target" "$handoff_node_selector" || {
+            log "  ERROR: patch_ea failed twice, aborting scenario $scenario"
+            return 1
+        }
+    fi
 
     # Wait for the new revision to stabilize before proceeding
-    wait_for_knative_rollout "$SERVICE_NAME"
+    wait_for_knative_rollout "$SERVICE_NAME" || log "  WARNING: rollout did not stabilize, proceeding anyway"
 
     # Force-delete old pods and do a warmup iteration
     kubectl delete pods -n "$NAMESPACE" \
@@ -834,13 +862,21 @@ run_freeze_scenario() {
     # triggerFilters must be empty to prevent the broker from dispatching
     # events to the target pod (which would keep it awake and prevent freeze).
     # cleanupOnDelete=false so the target KService survives handoff CR deletion.
-    patch_ea "true" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
-        "$handoff_target" "$handoff_node_selector" "false" "true"
+    if ! patch_ea "true" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
+        "$handoff_target" "$handoff_node_selector" "false" "true"; then
+        log "  ERROR: patch_ea failed, retrying once..."
+        sleep 5
+        patch_ea "true" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
+            "$handoff_target" "$handoff_node_selector" "false" "true" || {
+            log "  ERROR: patch_ea failed twice, aborting scenario $scenario_name"
+            return 1
+        }
+    fi
 
     kubectl delete trigger -n "$NAMESPACE" \
         -l "mec.atnog.org/app=$EA_NAME" --ignore-not-found >/dev/null 2>&1
 
-    wait_for_knative_rollout "$SERVICE_NAME"
+    wait_for_knative_rollout "$SERVICE_NAME" || log "  WARNING: rollout did not stabilize, proceeding anyway"
 
     # Step 2: Apply Kyverno policy BEFORE the target KService exists.
     # This ensures the first pod created gets restartPolicy=Never via the
@@ -854,8 +890,8 @@ run_freeze_scenario() {
     # remove the replica from the EA spec, then delete it.
     log "  Cleaning lingering target state..."
     delete_handoff_cr "$handoff_target"
-    kubectl delete ksvc "$target_svc" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
-    kubectl apply -f - >/dev/null 2>&1 <<CLEANUP
+    kubectl delete ksvc "$target_svc" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl apply -f - >/dev/null 2>&1 <<CLEANUP || true
 apiVersion: mec.atnog.org/v1alpha1
 kind: EdgeApplicationHandoff
 metadata:
@@ -906,7 +942,7 @@ EOF
     log "  Warmup handoff Ready — target KService $target_svc exists"
 
     delete_handoff_cr "$handoff_target"
-    wait_for_knative_rollout "$target_svc"
+    wait_for_knative_rollout "$target_svc" || log "  WARNING: target rollout did not stabilize, proceeding anyway"
 
     # Wait for a stable target pod and freeze. With restartPolicy=Never and
     # 5s idle timeout, the pod freezes shortly after starting. We poll for
@@ -993,7 +1029,8 @@ EOF
         ts_before=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
         handoff_start=$(date +%s%N)
 
-        if ! kubectl apply -f - >/dev/null 2>&1 <<EOF
+        local _cr_yaml
+        _cr_yaml=$(cat <<EOF
 apiVersion: mec.atnog.org/v1alpha1
 kind: EdgeApplicationHandoff
 metadata:
@@ -1006,8 +1043,9 @@ spec:
   nodeSelector:
     ${target_node_key}: ${target_node_val}
 EOF
-        then
-            log "  SKIPPED: failed to apply handoff CR"
+        )
+        if ! kubectl_retry 3 kubectl apply -f - <<< "$_cr_yaml" >/dev/null 2>&1; then
+            log "  SKIPPED: failed to apply handoff CR after retries"
             continue
         fi
 
@@ -1090,29 +1128,39 @@ main() {
     pin_queue_proxy_image
     setup_curl_pod
 
-    # Run selected scenarios
+    # Run selected scenarios — each is isolated so one failure doesn't abort the rest.
+    local _scenario_failed=0
     case "$SCENARIO" in
         rsu-a|all)
             run_scenario "rsu-a-coldstart" "false" "rsu-id" "rsu-b" \
-                "rsu-a" "" "$ITERATIONS"
+                "rsu-a" "" "$ITERATIONS" \
+                || { log "ERROR: rsu-a-coldstart scenario failed, continuing..."; _scenario_failed=1; }
             ;;&
         worker1-cold|all)
             run_scenario "worker1-coldstart" "false" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
-                "worker1-target" '{"vm-id":"worker-1"}' "$ITERATIONS"
+                "worker1-target" '{"vm-id":"worker-1"}' "$ITERATIONS" \
+                || { log "ERROR: worker1-coldstart scenario failed, continuing..."; _scenario_failed=1; }
             ;;&
         worker1-freeze|all)
             run_freeze_scenario "worker1-freeze" "$ITERATIONS" \
-                "worker1-target" '{"vm-id":"worker-1"}' "vm-id" "worker-1"
+                "worker1-target" '{"vm-id":"worker-1"}' "vm-id" "worker-1" \
+                || { log "ERROR: worker1-freeze scenario failed, continuing..."; _scenario_failed=1; }
             ;;&
         worker2-cold|all)
             run_scenario "worker2-coldstart" "false" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
-                "worker2-target" '{"vm-id":"worker-2"}' "$ITERATIONS"
+                "worker2-target" '{"vm-id":"worker-2"}' "$ITERATIONS" \
+                || { log "ERROR: worker2-coldstart scenario failed, continuing..."; _scenario_failed=1; }
             ;;&
         worker2-freeze|all)
             run_freeze_scenario "worker2-freeze" "$ITERATIONS" \
-                "worker2-target" '{"vm-id":"worker-2"}' "vm-id" "worker-2"
+                "worker2-target" '{"vm-id":"worker-2"}' "vm-id" "worker-2" \
+                || { log "ERROR: worker2-freeze scenario failed, continuing..."; _scenario_failed=1; }
             ;;
     esac
+
+    if (( _scenario_failed )); then
+        log "WARNING: one or more scenarios failed — check logs above"
+    fi
 
     if [[ -f "$OUTFILE" ]]; then
         log "Analyzing results..."
