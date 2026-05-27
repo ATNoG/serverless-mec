@@ -490,8 +490,8 @@ def main() -> int:
                       f"{'pod_start':>10}  {'applied->rdy':>12}  {'phase':>10}")
                 print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  {'-' * 10}  "
                       f"{'-' * 10}  {'-' * 12}  {'-' * 10}")
-            for row_idx, r in s_rows:
-                it = r.get("iteration", "?")
+            for seq, (row_idx, r) in enumerate(s_rows, 1):
+                it = seq
                 t = r.get("t_total_s")
                 t_str = f"{t * 1000:.1f}" if isinstance(t, (int, float)) and t > 0 else "-"
                 phases = computed.get(row_idx, {})
