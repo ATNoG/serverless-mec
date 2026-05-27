@@ -55,6 +55,9 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 kubectl_retry() {
     # Retries a kubectl command up to N times with exponential backoff.
     # Usage: kubectl_retry [max_attempts] kubectl <args...>
+    # WARNING: do NOT use with stdin-based commands (kubectl apply -f -).
+    # Stdin is consumed on the first attempt; retries get empty input.
+    # Use kubectl_apply_retry for those.
     local max_attempts="${1:-3}"; shift
     local attempt delay=2
     for (( attempt=1; attempt<=max_attempts; attempt++ )); do
@@ -69,6 +72,53 @@ kubectl_retry() {
     done
     log "  ERROR: command failed after $max_attempts attempts: $*"
     return 1
+}
+
+kubectl_apply_retry() {
+    # Retries kubectl apply with YAML from a variable (stdin-safe).
+    # Each attempt gets a fresh copy of the YAML via printf pipe.
+    # Usage: kubectl_apply_retry <yaml_string> [max_attempts]
+    local yaml="$1" max_attempts="${2:-3}"
+    local attempt delay=2
+    for (( attempt=1; attempt<=max_attempts; attempt++ )); do
+        if printf '%s' "$yaml" | kubectl apply -f - >/dev/null 2>&1; then
+            return 0
+        fi
+        if (( attempt < max_attempts )); then
+            log "  WARNING: kubectl apply failed (attempt $attempt/$max_attempts), retrying in ${delay}s..."
+            sleep "$delay"
+            delay=$(( delay * 2 ))
+        fi
+    done
+    log "  ERROR: kubectl apply failed after $max_attempts attempts"
+    return 1
+}
+
+# ---- CR builder ------------------------------------------------------------
+
+_build_handoff_cr() {
+    # Build EdgeApplicationHandoff CR YAML with optional nodeSelector.
+    # Usage: _build_handoff_cr <target> <cleanupOnDelete> [node_selector_json]
+    local target="$1" cleanup="$2" ns_json="${3:-}"
+    cat <<EOF
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplicationHandoff
+metadata:
+  name: ${HANDOFF_CR_PREFIX}${target}
+  namespace: ${NAMESPACE}
+spec:
+  edgeApplicationName: ${EA_NAME}
+  targetReplicaName: ${target}
+  cleanupOnDelete: ${cleanup}
+EOF
+    if [[ -n "$ns_json" ]]; then
+        echo "  nodeSelector:"
+        python3 -c "
+import json, sys
+for k, v in json.loads(sys.argv[1]).items():
+    print(f'    {k}: {v}')
+" "$ns_json"
+    fi
 }
 
 # ---- helpers ---------------------------------------------------------------
@@ -489,7 +539,8 @@ ensure_restart_policy_kyverno() {
     # Delete any stale policy first (match selector may have changed)
     kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
     log "  Applying kyverno policy: inject restartPolicy=Never on $target_svc"
-    kubectl_retry 3 kubectl apply -f - >/dev/null 2>&1 <<POLICY
+    local _policy_yaml
+    _policy_yaml=$(cat <<POLICY
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -516,6 +567,8 @@ spec:
                   - name: user-container
                     restartPolicy: Never
 POLICY
+    )
+    kubectl_apply_retry "$_policy_yaml"
 
 }
 
@@ -699,58 +752,52 @@ cleanup() {
 trap cleanup EXIT
 
 # ---- single iteration (cold start handoff) ---------------------------------
+#
+# Applies the handoff CR directly (no retransmission event) so cold-start
+# and freeze iterations measure the same pipeline: CR apply → operator
+# reconciles → target KService created → pod ready → CR Ready.
 
 run_handoff_iteration() {
     local scenario="$1" iteration="$2" handoff_target="$3"
-
-    ensure_curl_pod
-
-    # Force-delete any running pods
-    kubectl delete pods -n "$NAMESPACE" \
-        -l "serving.knative.dev/service=$SERVICE_NAME" \
-        --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
+    local handoff_node_selector="$4"
 
     # Delete any existing handoff CR from previous iteration
     delete_handoff_cr "$handoff_target"
 
-    if ! wait_for_scale_to_zero; then
-        log "  SKIPPED: pods still running"
-        return
-    fi
+    # Wait for target KService cleanup (operator deletes it via cleanupOnDelete)
+    local target_svc="${EA_NAME}-${handoff_target}"
+    kubectl wait ksvc "$target_svc" -n "$NAMESPACE" --for=delete --timeout=60s >/dev/null 2>&1 || true
     sleep 1
 
-    # Send event — this triggers retransmission + handoff inside the container
-    local ts_before ts_after timings handoff_start handoff_end handoff_wall_ms
+    # Build and apply handoff CR — measure from CR apply to CR Ready
+    local _cr_yaml
+    _cr_yaml=$(_build_handoff_cr "$handoff_target" "true" "$handoff_node_selector")
+
+    local ts_before handoff_start
     ts_before=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
-    timings=$(send_event "$SERVICE_URL")
-    ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+    handoff_start=$(date +%s%N)
 
-    IFS=',' read -r _ _ _ t_total http_code <<< "$timings"
-
-    if [[ "$http_code" != "422" ]]; then
-        log "  SKIPPED: unexpected HTTP $http_code (expected 422)"
-        emit_result "$scenario" "$iteration" "$timings" "$ts_before" "$ts_after" "Skipped" "$handoff_target" "0"
+    if ! kubectl_apply_retry "$_cr_yaml"; then
+        log "  SKIPPED: failed to apply handoff CR after retries"
         return
     fi
 
-    log "  Retransmission done in ${t_total}s (HTTP $http_code)"
-
-    # Poll the handoff CR until it becomes Ready — measure with ms precision
-    handoff_start=$(date +%s%N)
     if wait_for_handoff_ready "$handoff_target"; then
+        local handoff_end handoff_wall_ms phase ts_after
         handoff_end=$(date +%s%N)
         handoff_wall_ms=$(( (handoff_end - handoff_start) / 1000000 ))
-        local phase
+        ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
         phase=$(get_handoff_phase "$handoff_target")
         log "  Handoff $phase in ${handoff_wall_ms}ms"
-        emit_result "$scenario" "$iteration" "$timings" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
+        emit_result "$scenario" "$iteration" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
     else
+        local handoff_end handoff_wall_ms phase ts_after
         handoff_end=$(date +%s%N)
         handoff_wall_ms=$(( (handoff_end - handoff_start) / 1000000 ))
-        local phase
+        ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
         phase=$(get_handoff_phase "$handoff_target")
         log "  Handoff $phase after ${handoff_wall_ms}ms (timeout)"
-        emit_result "$scenario" "$iteration" "$timings" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
+        emit_result "$scenario" "$iteration" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
     fi
 
     # Cleanup handoff CR so next iteration starts fresh
@@ -786,17 +833,17 @@ run_scenario() {
         --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
     sleep 2
 
-    log "  Warmup iteration..."
+    log "  Warmup iteration (direct CR apply)..."
     delete_handoff_cr "$handoff_target"
-    wait_for_scale_to_zero || true
-    send_event "$SERVICE_URL" >/dev/null 2>&1 || true
+    local _warmup_cr
+    _warmup_cr=$(_build_handoff_cr "$handoff_target" "true" "$handoff_node_selector")
+    kubectl_apply_retry "$_warmup_cr" || true
     sleep 2
-    # Wait for handoff to complete or timeout, then clean up
     wait_for_handoff_ready "$handoff_target" || true
     delete_handoff_cr "$handoff_target"
-    kubectl delete pods -n "$NAMESPACE" \
-        -l "serving.knative.dev/service=$SERVICE_NAME" \
-        --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
+    # Wait for target KService cleanup before first measured iteration
+    local target_svc="${EA_NAME}-${handoff_target}"
+    kubectl wait ksvc "$target_svc" -n "$NAMESPACE" --for=delete --timeout=60s >/dev/null 2>&1 || true
     sleep 2
 
     local i
@@ -813,7 +860,7 @@ run_scenario() {
             cleanup_node_disk
         fi
 
-        run_handoff_iteration "$scenario" "$i" "$handoff_target"
+        run_handoff_iteration "$scenario" "$i" "$handoff_target" "$handoff_node_selector"
     done
 }
 
@@ -1044,7 +1091,7 @@ spec:
     ${target_node_key}: ${target_node_val}
 EOF
         )
-        if ! kubectl_retry 3 kubectl apply -f - <<< "$_cr_yaml" >/dev/null 2>&1; then
+        if ! kubectl_apply_retry "$_cr_yaml"; then
             log "  SKIPPED: failed to apply handoff CR after retries"
             continue
         fi
@@ -1126,7 +1173,6 @@ main() {
         --ignore-not-found >/dev/null 2>&1 || true
 
     pin_queue_proxy_image
-    setup_curl_pod
 
     # Run selected scenarios — each is isolated so one failure doesn't abort the rest.
     local _scenario_failed=0

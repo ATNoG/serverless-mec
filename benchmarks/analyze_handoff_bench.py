@@ -199,7 +199,10 @@ SCENARIO_COLORS = {
 }
 
 # Pipeline phases to report (key in computed phases -> display label)
-PIPELINE_PHASES = [
+# Cold-start phases include the full KService creation pipeline.
+# Freeze phases only include CR lifecycle (KSvc/pod timestamps are from
+# pre-freeze warmup, not the measured handoff, so they're meaningless).
+PIPELINE_PHASES_COLDSTART = [
     ("cr_to_applied_ms", "CR -> Applied"),
     ("ksvc_to_pod_ms", "KSvc -> Pod Created"),
     ("pod_scheduling_ms", "Pod Scheduling"),
@@ -207,6 +210,10 @@ PIPELINE_PHASES = [
     ("readiness_probe_ms", "Readiness Probe"),
     ("pod_total_startup_ms", "Pod Total Startup"),
     ("applied_to_ready_ms", "Applied -> Ready"),
+    ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
+    ("handoff_wall_ms", "Handoff Wall Clock"),
+]
+PIPELINE_PHASES_FREEZE = [
     ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
     ("handoff_wall_ms", "Handoff Wall Clock"),
 ]
@@ -417,10 +424,12 @@ def main() -> int:
             _print_stats_block("Retransmission (curl total)", _stats(retrans))
             print()
 
-        # Pipeline phase breakdown
+        # Pipeline phase breakdown (freeze scenarios only show CR lifecycle)
+        is_freeze = "freeze" in scenario
+        phases_to_show = PIPELINE_PHASES_FREEZE if is_freeze else PIPELINE_PHASES_COLDSTART
         print(f"  {'Phase':<30}  {'n':>4}  {'mean':>10}  {'median':>10}  {'95% CI':>22}")
         print(f"  {'-'*30}  {'-'*4}  {'-'*10}  {'-'*10}  {'-'*22}")
-        for phase_key, phase_label in PIPELINE_PHASES:
+        for phase_key, phase_label in phases_to_show:
             vals = _get_phase_values(rows, scenario, phase_key, computed)
             if args.iqr:
                 vals = _iqr_filter(vals)
@@ -480,15 +489,23 @@ def main() -> int:
             print(f"  Per-Iteration: {label}")
             print("-" * 70)
             is_freeze = "freeze" in scenario
+            # Check if any row has retransmission data (old-format NDJSON files)
+            has_retrans = any(
+                isinstance(r.get("t_total_s"), (int, float)) and r.get("t_total_s", 0) > 0
+                for _, r in s_rows
+            )
             if is_freeze:
-                print(f"  {'#':>3}  {'wall_ms':>10}  {'CR->Rdy':>10}  "
-                      f"{'pod_start':>10}  {'phase':>10}")
-                print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  "
-                      f"{'-' * 10}  {'-' * 10}")
-            else:
+                print(f"  {'#':>3}  {'wall_ms':>10}  {'CR->Rdy':>10}  {'phase':>10}")
+                print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  {'-' * 10}")
+            elif has_retrans:
                 print(f"  {'#':>3}  {'retrans':>10}  {'wall_ms':>10}  {'CR->Rdy':>10}  "
                       f"{'pod_start':>10}  {'applied->rdy':>12}  {'phase':>10}")
                 print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  {'-' * 10}  "
+                      f"{'-' * 10}  {'-' * 12}  {'-' * 10}")
+            else:
+                print(f"  {'#':>3}  {'wall_ms':>10}  {'CR->Rdy':>10}  "
+                      f"{'pod_start':>10}  {'applied->rdy':>12}  {'phase':>10}")
+                print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  "
                       f"{'-' * 10}  {'-' * 12}  {'-' * 10}")
             for seq, (row_idx, r) in enumerate(s_rows, 1):
                 it = seq
@@ -505,10 +522,12 @@ def main() -> int:
                 a2r_str = f"{a2r:.0f}" if a2r is not None else "-"
                 phase = r.get("handoff_phase", "?")
                 if is_freeze:
-                    print(f"  {it:>3}  {wall_str:>10}  {cr_str:>10}  "
-                          f"{pod_str:>10}  {phase:>10}")
-                else:
+                    print(f"  {it:>3}  {wall_str:>10}  {cr_str:>10}  {phase:>10}")
+                elif has_retrans:
                     print(f"  {it:>3}  {t_str:>10}  {wall_str:>10}  {cr_str:>10}  "
+                          f"{pod_str:>10}  {a2r_str:>12}  {phase:>10}")
+                else:
+                    print(f"  {it:>3}  {wall_str:>10}  {cr_str:>10}  "
                           f"{pod_str:>10}  {a2r_str:>12}  {phase:>10}")
             print()
         else:
