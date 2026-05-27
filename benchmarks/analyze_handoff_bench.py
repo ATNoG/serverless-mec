@@ -372,8 +372,6 @@ def _generate_ci_plot(rows: List[dict], computed: Dict[int, dict],
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("inputs", nargs="+", help="handoff bench NDJSON file(s)")
-    ap.add_argument("--per-iter", action="store_true",
-                    help="print per-iteration table (default: skip if >50 samples)")
     ap.add_argument("--iqr", action="store_true",
                     help="filter outliers using Tukey's IQR fences before computing stats")
     ap.add_argument("--plot", nargs="?", const="auto", default=None,
@@ -427,8 +425,8 @@ def main() -> int:
         # Pipeline phase breakdown (freeze scenarios only show CR lifecycle)
         is_freeze = "freeze" in scenario
         phases_to_show = PIPELINE_PHASES_FREEZE if is_freeze else PIPELINE_PHASES_COLDSTART
-        print(f"  {'Phase':<30}  {'n':>4}  {'mean':>10}  {'median':>10}  {'95% CI':>22}")
-        print(f"  {'-'*30}  {'-'*4}  {'-'*10}  {'-'*10}  {'-'*22}")
+        print(f"  {'Phase':<30}  {'n':>4}  {'mean':>10}  {'median':>10}  {'stdev':>10}  {'95% CI':>22}")
+        print(f"  {'-'*30}  {'-'*4}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*22}")
         for phase_key, phase_label in phases_to_show:
             vals = _get_phase_values(rows, scenario, phase_key, computed)
             if args.iqr:
@@ -437,7 +435,7 @@ def main() -> int:
                 continue
             st = _stats(vals)
             print(f"  {phase_label:<30}  {st['n']:>4}  {_fmt_ms(st['mean']):>10}  "
-                  f"{_fmt_ms(st['median']):>10}  {_ci_str(vals):>22}")
+                  f"{_fmt_ms(st['median']):>10}  {_fmt_ms(st['stdev']):>10}  {_ci_str(vals):>22}")
         print()
 
         # HTTP codes & handoff phase distribution
@@ -458,6 +456,7 @@ def main() -> int:
             st = _stats(vals)
             print(f"  {label:<25}  mean={_fmt_ms(st['mean']):>10}  "
                   f"median={_fmt_ms(st['median']):>10}  "
+                  f"stdev={_fmt_ms(st['stdev']):>10}  "
                   f"p95={_fmt_ms(st['p95']):>10}")
         print()
 
@@ -478,61 +477,6 @@ def main() -> int:
                         else:
                             print(f"  {l1} is {m2 / m1:.1f}x faster than {l2} (by mean)")
         print()
-
-    # Per-iteration table
-    for scenario in present:
-        label = SCENARIO_LABELS.get(scenario, scenario)
-        s_rows = [(idx, r) for idx, r in enumerate(rows) if r.get("scenario") == scenario]
-        show = args.per_iter or len(s_rows) <= 50
-        if show:
-            print("-" * 70)
-            print(f"  Per-Iteration: {label}")
-            print("-" * 70)
-            is_freeze = "freeze" in scenario
-            # Check if any row has retransmission data (old-format NDJSON files)
-            has_retrans = any(
-                isinstance(r.get("t_total_s"), (int, float)) and r.get("t_total_s", 0) > 0
-                for _, r in s_rows
-            )
-            if is_freeze:
-                print(f"  {'#':>3}  {'wall_ms':>10}  {'CR->Rdy':>10}  {'phase':>10}")
-                print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  {'-' * 10}")
-            elif has_retrans:
-                print(f"  {'#':>3}  {'retrans':>10}  {'wall_ms':>10}  {'CR->Rdy':>10}  "
-                      f"{'pod_start':>10}  {'applied->rdy':>12}  {'phase':>10}")
-                print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  {'-' * 10}  "
-                      f"{'-' * 10}  {'-' * 12}  {'-' * 10}")
-            else:
-                print(f"  {'#':>3}  {'wall_ms':>10}  {'CR->Rdy':>10}  "
-                      f"{'pod_start':>10}  {'applied->rdy':>12}  {'phase':>10}")
-                print(f"  {'':>3}  {'-' * 10}  {'-' * 10}  "
-                      f"{'-' * 10}  {'-' * 12}  {'-' * 10}")
-            for seq, (row_idx, r) in enumerate(s_rows, 1):
-                it = seq
-                t = r.get("t_total_s")
-                t_str = f"{t * 1000:.1f}" if isinstance(t, (int, float)) and t > 0 else "-"
-                phases = computed.get(row_idx, {})
-                wall = phases.get("handoff_wall_ms")
-                wall_str = f"{wall:.0f}" if wall is not None else "-"
-                cr_rdy = phases.get("cr_to_ready_ms")
-                cr_str = f"{cr_rdy:.0f}" if cr_rdy is not None else "-"
-                pod_s = phases.get("pod_total_startup_ms")
-                pod_str = f"{pod_s:.0f}" if pod_s is not None else "-"
-                a2r = phases.get("applied_to_ready_ms")
-                a2r_str = f"{a2r:.0f}" if a2r is not None else "-"
-                phase = r.get("handoff_phase", "?")
-                if is_freeze:
-                    print(f"  {it:>3}  {wall_str:>10}  {cr_str:>10}  {phase:>10}")
-                elif has_retrans:
-                    print(f"  {it:>3}  {t_str:>10}  {wall_str:>10}  {cr_str:>10}  "
-                          f"{pod_str:>10}  {a2r_str:>12}  {phase:>10}")
-                else:
-                    print(f"  {it:>3}  {wall_str:>10}  {cr_str:>10}  "
-                          f"{pod_str:>10}  {a2r_str:>12}  {phase:>10}")
-            print()
-        else:
-            print(f"  (per-iteration table for {label} suppressed; pass --per-iter to show)")
-            print()
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
