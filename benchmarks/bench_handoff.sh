@@ -205,7 +205,7 @@ if cr:
     # Microsecond-precision timestamps from operator
     ts = cr.get('status', {}).get('timestamps', {})
     if ts:
-        for k in ('reconcileStart', 'replicaApplied', 'thawStarted', 'thawCompleted', 'ready'):
+        for k in ('reconcileStart', 'replicaApplied', 'thawStarted', 'thawCompleted', 'podRunning', 'podReady', 'kserviceReady', 'triggerReady', 'ready'):
             if ts.get(k):
                 out[f'micro_{k}'] = ts[k]
 

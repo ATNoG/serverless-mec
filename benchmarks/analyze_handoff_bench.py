@@ -115,10 +115,33 @@ def _compute_phases(row: dict) -> dict:
         phases["applied_to_ready_ms"] = d
 
     # --- Microsecond-precision phases from operator status.timestamps ---
-    # These override the second-precision k8s condition timestamps when available.
     d = _phase_duration_ms(p, "micro_reconcileStart", "micro_replicaApplied")
     if d is not None:
         phases["micro_reconcile_to_applied_ms"] = d
+
+    d = _phase_duration_ms(p, "micro_replicaApplied", "micro_podRunning")
+    if d is not None:
+        phases["micro_applied_to_pod_running_ms"] = d
+
+    d = _phase_duration_ms(p, "micro_podRunning", "micro_podReady")
+    if d is not None:
+        phases["micro_pod_running_to_ready_ms"] = d
+
+    d = _phase_duration_ms(p, "micro_replicaApplied", "micro_podReady")
+    if d is not None:
+        phases["micro_applied_to_pod_ready_ms"] = d
+
+    d = _phase_duration_ms(p, "micro_podReady", "micro_kserviceReady")
+    if d is not None:
+        phases["micro_pod_to_ksvc_ready_ms"] = d
+
+    d = _phase_duration_ms(p, "micro_kserviceReady", "micro_ready")
+    if d is not None:
+        phases["micro_ksvc_to_ready_ms"] = d
+
+    d = _phase_duration_ms(p, "micro_replicaApplied", "micro_kserviceReady")
+    if d is not None:
+        phases["micro_applied_to_ksvc_ready_ms"] = d
 
     d = _phase_duration_ms(p, "micro_reconcileStart", "micro_ready")
     if d is not None:
@@ -128,6 +151,7 @@ def _compute_phases(row: dict) -> dict:
     if d is not None:
         phases["micro_applied_to_ready_ms"] = d
 
+    # Freeze-specific phases
     d = _phase_duration_ms(p, "micro_thawStarted", "micro_thawCompleted")
     if d is not None:
         phases["micro_thaw_duration_ms"] = d
@@ -225,26 +249,30 @@ SCENARIO_COLORS = {
 # Freeze phases only include CR lifecycle (KSvc/pod timestamps are from
 # pre-freeze warmup, not the measured handoff, so they're meaningless).
 PIPELINE_PHASES_COLDSTART = [
-    ("cr_to_applied_ms", "CR -> Applied"),
-    ("ksvc_to_pod_ms", "KSvc -> Pod Created"),
-    ("pod_scheduling_ms", "Pod Scheduling"),
-    ("container_startup_ms", "Container Startup"),
-    ("readiness_probe_ms", "Readiness Probe"),
-    ("pod_total_startup_ms", "Pod Total Startup"),
-    ("applied_to_ready_ms", "Applied -> Ready"),
-    ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
     ("micro_reconcile_to_applied_ms", "Reconcile -> Applied (µs)"),
+    ("micro_applied_to_pod_running_ms", "Applied -> Pod Running (µs)"),
+    ("micro_pod_running_to_ready_ms", "Pod Running -> Pod Ready (µs)"),
+    ("micro_applied_to_pod_ready_ms", "Applied -> Pod Ready (µs)"),
+    ("micro_pod_to_ksvc_ready_ms", "Pod Ready -> KSvc Ready (µs)"),
+    ("micro_applied_to_ksvc_ready_ms", "Applied -> KSvc Ready (µs)"),
+    ("micro_ksvc_to_ready_ms", "KSvc Ready -> Ready (µs)"),
     ("micro_applied_to_ready_ms", "Applied -> Ready (µs)"),
     ("micro_reconcile_to_ready_ms", "Reconcile -> Ready (µs)"),
     ("handoff_wall_ms", "Handoff Wall Clock"),
+    ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
+    ("ksvc_to_pod_ms", "KSvc -> Pod Created (k8s ts)"),
+    ("container_startup_ms", "Container Startup (k8s ts)"),
+    ("pod_total_startup_ms", "Pod Total Startup (k8s ts)"),
 ]
 PIPELINE_PHASES_FREEZE = [
-    ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
     ("micro_reconcile_to_applied_ms", "Reconcile -> Applied (µs)"),
     ("micro_thaw_duration_ms", "Thaw Duration (µs)"),
     ("micro_thaw_to_ready_ms", "Thaw -> Ready (µs)"),
+    ("micro_applied_to_ksvc_ready_ms", "Applied -> KSvc Ready (µs)"),
+    ("micro_ksvc_to_ready_ms", "KSvc Ready -> Ready (µs)"),
     ("micro_reconcile_to_ready_ms", "Reconcile -> Ready (µs)"),
     ("handoff_wall_ms", "Handoff Wall Clock"),
+    ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
 ]
 
 
