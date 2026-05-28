@@ -201,8 +201,14 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 		}
 	}
 
+	// Track pod lifecycle (best-effort, does not block readiness)
+	r.observePodTimestamps(ctx, &ho, app.Namespace, svcName)
+
 	// Readiness checks (best-effort)
 	svcReady := r.isKServiceReady(ctx, app.Namespace, svcName)
+	if svcReady && ho.Status.Timestamps.KServiceReady == nil {
+		ho.Status.Timestamps.KServiceReady = microNow()
+	}
 
 	trigReady := true
 	for _, tn := range triggerNames {
@@ -210,6 +216,9 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 			trigReady = false
 			break
 		}
+	}
+	if trigReady && len(triggerNames) > 0 && ho.Status.Timestamps.TriggerReady == nil {
+		ho.Status.Timestamps.TriggerReady = microNow()
 	}
 
 	if svcReady && trigReady {
@@ -221,7 +230,7 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 	}
 
 	r.setApplied(ctx, &ho, "Applied", "target replica applied; waiting for readiness")
-	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: 500 * time.Millisecond}, nil
 }
 
 func (r *EdgeApplicationHandoffReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -422,6 +431,44 @@ func (r *EdgeApplicationHandoffReconciler) ensureTargetThawed(ctx context.Contex
 
 	// No pods found with a terminated user-container — assume not frozen
 	return true, nil
+}
+
+// --- Pod lifecycle observation ---
+
+// observePodTimestamps records when the operator first sees a Running pod and
+// a fully Ready pod for the target KService. These are limited by the reconcile
+// interval but still provide µs-precision upper bounds.
+func (r *EdgeApplicationHandoffReconciler) observePodTimestamps(ctx context.Context, ho *mecv1alpha1.EdgeApplicationHandoff, ns, svcName string) {
+	if ho.Status.Timestamps.PodRunning != nil && ho.Status.Timestamps.PodReady != nil {
+		return // already recorded both
+	}
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(ns),
+		client.MatchingLabels{"serving.knative.dev/service": svcName},
+	); err != nil {
+		return
+	}
+
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase == corev1.PodRunning && ho.Status.Timestamps.PodRunning == nil {
+			ho.Status.Timestamps.PodRunning = microNow()
+		}
+		if isPodReady(pod) && ho.Status.Timestamps.PodReady == nil {
+			ho.Status.Timestamps.PodReady = microNow()
+		}
+	}
+}
+
+func isPodReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Readiness checks ---

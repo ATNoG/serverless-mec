@@ -1084,8 +1084,23 @@ spec:
               timestamps:
                 description: Microsecond-precision timestamps for each handoff phase.
                 properties:
+                  kserviceReady:
+                    description: When the target KService became Ready.
+                    format: date-time
+                    type: string
+                  podReady:
+                    description: When the operator first observed the target pod with
+                      all containers Ready.
+                    format: date-time
+                    type: string
+                  podRunning:
+                    description: When the operator first observed a Running target
+                      pod.
+                    format: date-time
+                    type: string
                   ready:
-                    description: When the target KService and Trigger became Ready.
+                    description: When both KService and Trigger are Ready (final handoff
+                      completion).
                     format: date-time
                     type: string
                   reconcileStart:
@@ -1104,6 +1119,10 @@ spec:
                   thawStarted:
                     description: When the thaw HTTP request was sent to the queue-proxy
                       (freeze only).
+                    format: date-time
+                    type: string
+                  triggerReady:
+                    description: When the target Trigger became Ready (if applicable).
                     format: date-time
                     type: string
                 type: object

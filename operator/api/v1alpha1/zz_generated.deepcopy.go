@@ -335,6 +335,22 @@ func (in *HandoffTimestamps) DeepCopyInto(out *HandoffTimestamps) {
 		in, out := &in.ThawCompleted, &out.ThawCompleted
 		*out = (*in).DeepCopy()
 	}
+	if in.PodRunning != nil {
+		in, out := &in.PodRunning, &out.PodRunning
+		*out = (*in).DeepCopy()
+	}
+	if in.PodReady != nil {
+		in, out := &in.PodReady, &out.PodReady
+		*out = (*in).DeepCopy()
+	}
+	if in.KServiceReady != nil {
+		in, out := &in.KServiceReady, &out.KServiceReady
+		*out = (*in).DeepCopy()
+	}
+	if in.TriggerReady != nil {
+		in, out := &in.TriggerReady, &out.TriggerReady
+		*out = (*in).DeepCopy()
+	}
 	if in.Ready != nil {
 		in, out := &in.Ready, &out.Ready
 		*out = (*in).DeepCopy()

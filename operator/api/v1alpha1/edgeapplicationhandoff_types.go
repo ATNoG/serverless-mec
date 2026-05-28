@@ -44,7 +44,19 @@ type HandoffTimestamps struct {
 	// When the thaw HTTP response was received (freeze only).
 	// +optional
 	ThawCompleted *metav1.MicroTime `json:"thawCompleted,omitempty"`
-	// When the target KService and Trigger became Ready.
+	// When the operator first observed a Running target pod.
+	// +optional
+	PodRunning *metav1.MicroTime `json:"podRunning,omitempty"`
+	// When the operator first observed the target pod with all containers Ready.
+	// +optional
+	PodReady *metav1.MicroTime `json:"podReady,omitempty"`
+	// When the target KService became Ready.
+	// +optional
+	KServiceReady *metav1.MicroTime `json:"kserviceReady,omitempty"`
+	// When the target Trigger became Ready (if applicable).
+	// +optional
+	TriggerReady *metav1.MicroTime `json:"triggerReady,omitempty"`
+	// When both KService and Trigger are Ready (final handoff completion).
 	// +optional
 	Ready *metav1.MicroTime `json:"ready,omitempty"`
 }
