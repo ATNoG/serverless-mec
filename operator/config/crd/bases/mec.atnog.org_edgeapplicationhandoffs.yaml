@@ -1081,6 +1081,32 @@ spec:
                 type: string
               targetTrigger:
                 type: string
+              timestamps:
+                description: Microsecond-precision timestamps for each handoff phase.
+                properties:
+                  ready:
+                    description: When the target KService and Trigger became Ready.
+                    format: date-time
+                    type: string
+                  reconcileStart:
+                    description: When the reconciler first observed this CR.
+                    format: date-time
+                    type: string
+                  replicaApplied:
+                    description: When the replica was upserted into EdgeApplication.spec.replicas.
+                    format: date-time
+                    type: string
+                  thawCompleted:
+                    description: When the thaw HTTP response was received (freeze
+                      only).
+                    format: date-time
+                    type: string
+                  thawStarted:
+                    description: When the thaw HTTP request was sent to the queue-proxy
+                      (freeze only).
+                    format: date-time
+                    type: string
+                type: object
             type: object
         type: object
     served: true

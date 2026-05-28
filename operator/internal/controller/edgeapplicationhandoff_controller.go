@@ -65,6 +65,11 @@ type EdgeApplicationHandoffReconciler struct {
 // +kubebuilder:rbac:groups=serving.knative.dev,resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=eventing.knative.dev,resources=triggers,verbs=get;list;watch
 
+func microNow() *metav1.MicroTime {
+	t := metav1.NewMicroTime(time.Now())
+	return &t
+}
+
 func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
 
@@ -100,6 +105,14 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
+	}
+
+	// Initialize timestamps on first reconcile
+	if ho.Status.Timestamps == nil {
+		ho.Status.Timestamps = &mecv1alpha1.HandoffTimestamps{}
+	}
+	if ho.Status.Timestamps.ReconcileStart == nil {
+		ho.Status.Timestamps.ReconcileStart = microNow()
 	}
 
 	// Validate fields
@@ -146,6 +159,9 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 		if err := r.Patch(ctx, &app, client.MergeFrom(orig)); err != nil {
 			return ctrl.Result{}, err
 		}
+		if ho.Status.Timestamps.ReplicaApplied == nil {
+			ho.Status.Timestamps.ReplicaApplied = microNow()
+		}
 	}
 
 	// Status references (expected names)
@@ -173,7 +189,7 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 	// first so the pod stabilizes and the KService becomes truly Ready.
 	freezeEnabled := app.Spec.Service.FreezeEnabled != nil && *app.Spec.Service.FreezeEnabled
 	if freezeEnabled {
-		thawed, err := r.ensureTargetThawed(ctx, app.Namespace, svcName)
+		thawed, err := r.ensureTargetThawed(ctx, &ho, app.Namespace, svcName)
 		if err != nil {
 			logger.Error(err, "failed to thaw target pod")
 			r.setApplied(ctx, &ho, "ThawInProgress", fmt.Sprintf("thawing frozen target: %v", err))
@@ -197,6 +213,9 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 	}
 
 	if svcReady && trigReady {
+		if ho.Status.Timestamps.Ready == nil {
+			ho.Status.Timestamps.Ready = microNow()
+		}
 		r.setReady(ctx, &ho, "Ready", "target replica is ready")
 		return ctrl.Result{}, nil
 	}
@@ -341,7 +360,7 @@ func (r *EdgeApplicationHandoffReconciler) expectedTriggerNamespace(ctx context.
 // user-container (Terminated due to CRIU checkpoint) and, if so, sends an
 // HTTP request through the queue-proxy to trigger the freezer plugin's thaw.
 // Returns (true, nil) when the pod is confirmed running (not frozen).
-func (r *EdgeApplicationHandoffReconciler) ensureTargetThawed(ctx context.Context, ns, svcName string) (bool, error) {
+func (r *EdgeApplicationHandoffReconciler) ensureTargetThawed(ctx context.Context, ho *mecv1alpha1.EdgeApplicationHandoff, ns, svcName string) (bool, error) {
 	logger := logf.FromContext(ctx)
 
 	var pods corev1.PodList
@@ -370,6 +389,10 @@ func (r *EdgeApplicationHandoffReconciler) ensureTargetThawed(ctx context.Contex
 			// user-container is terminated (frozen by CRIU checkpoint).
 			// Send a request to the queue-proxy to trigger thaw.
 			logger.Info("Thawing frozen target pod", "pod", pod.Name, "podIP", pod.Status.PodIP)
+			if ho.Status.Timestamps.ThawStarted == nil {
+				ho.Status.Timestamps.ThawStarted = microNow()
+			}
+
 			thawURL := fmt.Sprintf("http://%s:%d", pod.Status.PodIP, queueProxyPort)
 			httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, thawURL, nil)
 			if err != nil {
@@ -382,6 +405,10 @@ func (r *EdgeApplicationHandoffReconciler) ensureTargetThawed(ctx context.Contex
 				return false, fmt.Errorf("thaw request to pod %s failed: %w", pod.Name, err)
 			}
 			resp.Body.Close()
+
+			if ho.Status.Timestamps.ThawCompleted == nil {
+				ho.Status.Timestamps.ThawCompleted = microNow()
+			}
 
 			logger.Info("Thaw request completed", "pod", pod.Name, "status", resp.StatusCode)
 			// Any HTTP response means queue-proxy processed the request,
@@ -441,21 +468,19 @@ func (r *EdgeApplicationHandoffReconciler) setPhaseCondition(
 	msg string,
 	status metav1.ConditionStatus,
 ) {
-	hoCopy := ho.DeepCopy()
-	hoCopy.Status.Phase = phase
-	hoCopy.Status.ObservedGeneration = hoCopy.Generation
+	ho.Status.Phase = phase
+	ho.Status.ObservedGeneration = ho.Generation
 
-	meta.SetStatusCondition(&hoCopy.Status.Conditions, metav1.Condition{
+	meta.SetStatusCondition(&ho.Status.Conditions, metav1.Condition{
 		Type:               condType,
 		Status:             status,
 		Reason:             reason,
 		Message:            msg,
-		ObservedGeneration: hoCopy.Generation,
+		ObservedGeneration: ho.Generation,
 		LastTransitionTime: metav1.Now(),
 	})
 
-	_ = r.Status().Patch(ctx, hoCopy, client.MergeFrom(ho))
-	*ho = *hoCopy
+	_ = r.Status().Update(ctx, ho)
 }
 
 // --- Utilities ---

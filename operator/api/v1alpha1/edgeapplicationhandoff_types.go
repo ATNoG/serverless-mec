@@ -29,6 +29,26 @@ type EdgeApplicationHandoffSpec struct {
 	CleanupOnDelete bool `json:"cleanupOnDelete,omitempty"`
 }
 
+// HandoffTimestamps records microsecond-precision timestamps at each phase
+// of the handoff lifecycle, enabling accurate sub-second benchmarking.
+type HandoffTimestamps struct {
+	// When the reconciler first observed this CR.
+	// +optional
+	ReconcileStart *metav1.MicroTime `json:"reconcileStart,omitempty"`
+	// When the replica was upserted into EdgeApplication.spec.replicas.
+	// +optional
+	ReplicaApplied *metav1.MicroTime `json:"replicaApplied,omitempty"`
+	// When the thaw HTTP request was sent to the queue-proxy (freeze only).
+	// +optional
+	ThawStarted *metav1.MicroTime `json:"thawStarted,omitempty"`
+	// When the thaw HTTP response was received (freeze only).
+	// +optional
+	ThawCompleted *metav1.MicroTime `json:"thawCompleted,omitempty"`
+	// When the target KService and Trigger became Ready.
+	// +optional
+	Ready *metav1.MicroTime `json:"ready,omitempty"`
+}
+
 type EdgeApplicationHandoffStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
@@ -38,6 +58,10 @@ type EdgeApplicationHandoffStatus struct {
 	TargetKService string `json:"targetKService,omitempty"`
 	// +optional
 	TargetTrigger string `json:"targetTrigger,omitempty"`
+
+	// Microsecond-precision timestamps for each handoff phase.
+	// +optional
+	Timestamps *HandoffTimestamps `json:"timestamps,omitempty"`
 
 	// +listType=map
 	// +listMapKey=type
