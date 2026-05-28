@@ -114,6 +114,28 @@ def _compute_phases(row: dict) -> dict:
     if d is not None:
         phases["applied_to_ready_ms"] = d
 
+    # --- Microsecond-precision phases from operator status.timestamps ---
+    # These override the second-precision k8s condition timestamps when available.
+    d = _phase_duration_ms(p, "micro_reconcileStart", "micro_replicaApplied")
+    if d is not None:
+        phases["micro_reconcile_to_applied_ms"] = d
+
+    d = _phase_duration_ms(p, "micro_reconcileStart", "micro_ready")
+    if d is not None:
+        phases["micro_reconcile_to_ready_ms"] = d
+
+    d = _phase_duration_ms(p, "micro_replicaApplied", "micro_ready")
+    if d is not None:
+        phases["micro_applied_to_ready_ms"] = d
+
+    d = _phase_duration_ms(p, "micro_thawStarted", "micro_thawCompleted")
+    if d is not None:
+        phases["micro_thaw_duration_ms"] = d
+
+    d = _phase_duration_ms(p, "micro_thawCompleted", "micro_ready")
+    if d is not None:
+        phases["micro_thaw_to_ready_ms"] = d
+
     return phases
 
 
@@ -211,10 +233,17 @@ PIPELINE_PHASES_COLDSTART = [
     ("pod_total_startup_ms", "Pod Total Startup"),
     ("applied_to_ready_ms", "Applied -> Ready"),
     ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
+    ("micro_reconcile_to_applied_ms", "Reconcile -> Applied (µs)"),
+    ("micro_applied_to_ready_ms", "Applied -> Ready (µs)"),
+    ("micro_reconcile_to_ready_ms", "Reconcile -> Ready (µs)"),
     ("handoff_wall_ms", "Handoff Wall Clock"),
 ]
 PIPELINE_PHASES_FREEZE = [
     ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
+    ("micro_reconcile_to_applied_ms", "Reconcile -> Applied (µs)"),
+    ("micro_thaw_duration_ms", "Thaw Duration (µs)"),
+    ("micro_thaw_to_ready_ms", "Thaw -> Ready (µs)"),
+    ("micro_reconcile_to_ready_ms", "Reconcile -> Ready (µs)"),
     ("handoff_wall_ms", "Handoff Wall Clock"),
 ]
 

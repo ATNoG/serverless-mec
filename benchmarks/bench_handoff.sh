@@ -178,6 +178,8 @@ print(json.dumps(r, separators=(',',':')))
 collect_pipeline_timestamps() {
     # Extracts raw timestamps from the handoff CR, target KService, and target
     # pod. The analysis script computes phase durations from these.
+    # Includes microsecond-precision timestamps from status.timestamps when
+    # available (operator v2+).
     local target="$1"
     local cr_name="${HANDOFF_CR_PREFIX}${target}"
     local target_svc="${EA_NAME}-${target}"
@@ -200,6 +202,12 @@ if cr:
         t = c.get('type', '')
         out[f'cr_cond_{t.lower()}_ts'] = c.get('lastTransitionTime', '')
         out[f'cr_cond_{t.lower()}_reason'] = c.get('reason', '')
+    # Microsecond-precision timestamps from operator
+    ts = cr.get('status', {}).get('timestamps', {})
+    if ts:
+        for k in ('reconcileStart', 'replicaApplied', 'thawStarted', 'thawCompleted', 'ready'):
+            if ts.get(k):
+                out[f'micro_{k}'] = ts[k]
 
 # Target KService timestamps
 svc = kubectl_json(['get', 'ksvc', target_svc, '-n', ns, '-o', 'json'])
@@ -368,19 +376,20 @@ delete_handoff_cr() {
 wait_for_handoff_ready() {
     local target="$1"
     local cr_name="${HANDOFF_CR_PREFIX}${target}"
-    local deadline=$(( $(date +%s) + HANDOFF_POLL_TIMEOUT ))
-    while (( $(date +%s) < deadline )); do
-        local phase
-        phase=$(kubectl get edgeapplicationhandoff "$cr_name" -n "$NAMESPACE" \
-            -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-        if [[ "$phase" == "Ready" ]]; then
-            return 0
-        fi
-        if [[ "$phase" == "Failed" ]]; then
-            return 1
-        fi
-        sleep 0.5
-    done
+    # Use kubectl wait with jsonpath to block until phase=Ready or phase=Failed,
+    # eliminating polling noise from the wall clock measurement.
+    if kubectl wait edgeapplicationhandoff/"$cr_name" -n "$NAMESPACE" \
+        --for=jsonpath='{.status.phase}'=Ready \
+        --timeout="${HANDOFF_POLL_TIMEOUT}s" >/dev/null 2>&1; then
+        return 0
+    fi
+    # kubectl wait exited non-zero: check if it's Failed or a timeout.
+    local phase
+    phase=$(kubectl get edgeapplicationhandoff "$cr_name" -n "$NAMESPACE" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+    if [[ "$phase" == "Failed" ]]; then
+        return 1
+    fi
     return 2  # timeout
 }
 
