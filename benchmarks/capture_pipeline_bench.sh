@@ -172,7 +172,7 @@ cleanup() {
     log "captured $n bench rows total (this file)"
     echo
     if [[ -s "$COMBINED" ]]; then
-        python3 "$SCRIPT_DIR/analyze_pipeline_bench.py" --run-id "$RUN_ID" "$COMBINED"
+        python3 "$SCRIPT_DIR/analyze_pipeline_bench.py" --run-id "$RUN_ID" --iqr "$COMBINED"
     else
         log "no rows captured — skipping analysis"
     fi
