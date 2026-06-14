@@ -10,6 +10,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# Common figure width for IEEE single-column (3.5in)
+COL_WIDTH = 3.5
 # Use seaborn defaults with serif font for IEEE style
 sns.set_theme(style="whitegrid", font="serif", rc={
     'font.size': 8,
@@ -26,15 +28,22 @@ BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 FIGURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'figures')
 palette = sns.color_palette("colorblind")
 
+ANNOT_SIZE = 8  # annotation font size, consistent across all plots
 
-def ci95_filter(data):
-    """Remove outliers outside the 95% confidence interval (mean ± 1.96 * sd)."""
+
+def sigma2_filter(data):
+    """Remove outliers beyond 2 standard deviations from the mean."""
     if len(data) < 4:
         return data
     mean = np.mean(data)
     sd = np.std(data, ddof=1)
-    lo, hi = mean - 1.96 * sd, mean + 1.96 * sd
+    lo, hi = mean - 2 * sd, mean + 2 * sd
     return [x for x in data if lo <= x <= hi]
+
+
+def se(data):
+    """Standard error of the mean."""
+    return np.std(data, ddof=1) / np.sqrt(len(data))
 
 
 # ── 1. Checkpoint/Restore vs Cold Start Box Plot ──
@@ -51,16 +60,16 @@ def plot_freeze_vs_coldstart():
                 elif d.get('mode') == 'cold_start' and 't_ttfb_s' in d:
                     cold_ttfb.append(d['t_ttfb_s'] * 1000)
 
-    thaw_f = ci95_filter(thaw_ttfb)[:2000]
-    cold_f = ci95_filter(cold_ttfb)[:2000]
+    thaw_f = sigma2_filter(thaw_ttfb)[:2000]
+    cold_f = sigma2_filter(cold_ttfb)[:2000]
 
     thaw_mean = np.mean(thaw_f)
     cold_mean = np.mean(cold_f)
-    thaw_std = np.std(thaw_f, ddof=1)
-    cold_std = np.std(cold_f, ddof=1)
+    thaw_se = se(thaw_f)
+    cold_se = se(cold_f)
 
     # Order: worst to best (cold start, then checkpoint restore)
-    fig, ax = plt.subplots(figsize=(3.5, 2.4))
+    fig, ax = plt.subplots(figsize=(COL_WIDTH, 2.4))
     bp = ax.boxplot([cold_f, thaw_f],
                     tick_labels=['Cold Start', 'Checkpoint\nRestore'],
                     widths=0.5,
@@ -72,14 +81,14 @@ def plot_freeze_vs_coldstart():
 
     # Cold start: right side, at ~80% of the worst result height
     cold_max = max(cold_f)
-    ax.annotate(f'{cold_mean:.0f} $\\pm$ {cold_std:.0f} ms',
+    ax.annotate(f'{cold_mean:.0f} $\\pm$ {cold_se:.0f} ms',
                 xy=(1.3, cold_max * 0.80), xytext=(-20, 0), textcoords='offset points',
-                fontsize=8, ha='left', va='center')
+                fontsize=ANNOT_SIZE, ha='left', va='center')
     # Checkpoint: directly above the worst result
-    ax.annotate(f'{thaw_mean:.0f} $\\pm$ {thaw_std:.0f} ms',
+    ax.annotate(f'{thaw_mean:.0f} $\\pm$ {thaw_se:.1f} ms',
                 xy=(2, max(thaw_f)),
                 xytext=(0, 10), textcoords='offset points',
-                fontsize=8, ha='center')
+                fontsize=ANNOT_SIZE, ha='center')
 
     ymax = max(max(cold_f), max(thaw_f))
     ax.set_ylim(top=ymax * 1.12)
@@ -87,8 +96,8 @@ def plot_freeze_vs_coldstart():
     ax.grid(axis='y', alpha=0.3)
     fig.savefig(f'{FIGURES_DIR}/freeze_vs_coldstart.pdf')
     plt.close()
-    print(f'Cold Start:         n={len(cold_f)}, mean={cold_mean:.0f}ms, std={cold_std:.0f}ms')
-    print(f'Checkpoint/Restore: n={len(thaw_f)}, mean={thaw_mean:.0f}ms, std={thaw_std:.0f}ms')
+    print(f'Cold Start:         n={len(cold_f)}, mean={cold_mean:.0f}ms, se={cold_se:.1f}ms')
+    print(f'Checkpoint/Restore: n={len(thaw_f)}, mean={thaw_mean:.0f}ms, se={thaw_se:.1f}ms')
     print(f'Speedup: {cold_mean/thaw_mean:.1f}x')
 
 
@@ -139,12 +148,12 @@ def plot_pipeline():
             if 0 < v < 10000:
                 e2e.append(v)
 
-    sn_f = ci95_filter(sn_processing)[:20000]
-    net_f = ci95_filter(network)[:20000]
-    rt_f = ci95_filter(rt_processing)[:20000]
-    e2e_f = ci95_filter(e2e)[:20000]
+    sn_f = sigma2_filter(sn_processing)[:20000]
+    net_f = sigma2_filter(network)[:20000]
+    rt_f = sigma2_filter(rt_processing)[:20000]
+    e2e_f = sigma2_filter(e2e)[:20000]
 
-    fig, ax = plt.subplots(figsize=(3.5, 2.4))
+    fig, ax = plt.subplots(figsize=(COL_WIDTH, 2.4))
     data = [sn_f, net_f, rt_f, e2e_f]
     labels = ['Sniffer', 'Network\nTransit', 'Retrans-\nmitter', 'End-to-\nEnd']
     bp = ax.boxplot(data, tick_labels=labels, widths=0.5, patch_artist=True,
@@ -154,19 +163,23 @@ def plot_pipeline():
         patch.set_facecolor(palette[i])
 
     # Annotate means: stages above worst result, E2E below best result
+    # Sniffer and Network Transit need horizontal offsets to avoid overlap
+    stage_offsets = [(10, 8), (0, 18), (0, 8)]  # (x_offset, y_offset) for first 3 stages
+    stage_ha = ['center', 'center', 'center']
     for i, d in enumerate(data, 1):
         mean = np.mean(d)
-        std = np.std(d, ddof=1)
+        s = se(d)
         if i < len(data):  # stages: above worst result
-            ax.annotate(f'{mean:.1f} $\\pm$ {std:.1f} ms',
+            xoff, yoff = stage_offsets[i - 1]
+            ax.annotate(f'{mean:.1f} $\\pm$ {s:.2f} ms',
                         xy=(i, max(d)),
-                        xytext=(0, 8), textcoords='offset points',
-                        fontsize=7, ha='center')
+                        xytext=(xoff, yoff), textcoords='offset points',
+                        fontsize=ANNOT_SIZE, ha=stage_ha[i - 1])
         else:  # E2E: below best result
-            ax.annotate(f'{mean:.1f} $\\pm$ {std:.1f} ms',
+            ax.annotate(f'{mean:.1f} $\\pm$ {s:.2f} ms',
                         xy=(i, min(d)),
-                        xytext=(0, -10), textcoords='offset points',
-                        fontsize=7, ha='center', va='top')
+                        xytext=(-10, -10), textcoords='offset points',
+                        fontsize=ANNOT_SIZE, ha='center', va='top')
 
     ax.set_ylabel('Latency (ms)')
     ax.grid(axis='y', alpha=0.3)
@@ -174,7 +187,7 @@ def plot_pipeline():
     plt.close()
 
     for label, d in zip(['Sniffer', 'Network', 'Retransmitter', 'E2E'], data):
-        print(f'Pipeline {label}: n={len(d)}, mean={np.mean(d):.1f}ms, std={np.std(d, ddof=1):.1f}ms')
+        print(f'Pipeline {label}: n={len(d)}, mean={np.mean(d):.1f}ms, se={se(d):.2f}ms')
 
 
 # ── 3. Handoff Box Plot ──
@@ -205,26 +218,26 @@ def plot_handoff():
     stats = []
     for sc in order:
         if sc in scenarios:
-            filt = [x / 1000 for x in ci95_filter(scenarios[sc])][:1000]
+            filt = [x / 1000 for x in sigma2_filter(scenarios[sc])][:1000]
             data.append(filt)
             labels.append(labels_map.get(sc, sc))
             mean = np.mean(filt)
-            std = np.std(filt, ddof=1)
-            stats.append((mean, std))
-            print(f'Handoff {sc}: n={len(filt)}, mean={mean:.1f}s, std={std:.1f}s')
+            s = se(filt)
+            stats.append((mean, s))
+            print(f'Handoff {sc}: n={len(filt)}, mean={mean:.1f}s, se={s:.2f}s')
 
-    fig, ax = plt.subplots(figsize=(5.0, 2.6))
+    fig, ax = plt.subplots(figsize=(COL_WIDTH * 1.43, 2.6))  # wider for 5 boxes
     bp = ax.boxplot(data, tick_labels=labels, widths=0.5, patch_artist=True,
                     medianprops=dict(color='black', linewidth=1.5),
                     flierprops=dict(marker='.', markersize=3, alpha=0.5))
     for i, patch in enumerate(bp['boxes']):
         patch.set_facecolor(palette[i])
 
-    for i, (d, (mean, std)) in enumerate(zip(data, stats), 1):
-        ax.annotate(f'{mean:.1f} $\\pm$ {std:.1f} s',
+    for i, (d, (mean, s)) in enumerate(zip(data, stats), 1):
+        ax.annotate(f'{mean:.1f} $\\pm$ {s:.1f} s',
                     xy=(i, max(d)),
                     xytext=(0, 8), textcoords='offset points',
-                    fontsize=8, ha='center')
+                    fontsize=ANNOT_SIZE, ha='center')
 
     all_vals = [v for sublist in data for v in sublist]
     ax.set_ylim(top=max(all_vals) * 1.18)
