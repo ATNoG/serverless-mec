@@ -97,6 +97,9 @@ def plot_freeze_vs_coldstart():
     ax.set_ylabel('TTFB (ms)', fontsize=fs_fvc)
     ax.tick_params(axis='both', labelsize=fs_fvc)
     ax.grid(axis='y', alpha=0.3)
+    ax.text(0.99, 0.99, 'Labels report mean ± standard error',
+            transform=ax.transAxes, fontsize=BASE_FONT * 0.85,
+            ha='right', va='top', style='italic', color='0.4')
     fig.savefig(f'{FIGURES_DIR}/freeze_vs_coldstart.pdf')
     plt.close()
     print(f'Cold Start:         n={len(cold_f)}, mean={cold_mean:.0f}ms, se={cold_se:.1f}ms')
@@ -186,6 +189,9 @@ def plot_pipeline():
 
     ax.set_ylabel('Latency (ms)')
     ax.grid(axis='y', alpha=0.3)
+    ax.text(0.01, 0.99, 'Labels report mean ± standard error',
+            transform=ax.transAxes, fontsize=BASE_FONT * 0.85,
+            ha='left', va='top', style='italic', color='0.4')
     fig.savefig(f'{FIGURES_DIR}/pipeline_stages.pdf')
     plt.close()
 
@@ -252,6 +258,9 @@ def plot_handoff():
     ax.set_ylim(top=max(all_vals) * 1.18)
     ax.set_ylabel('Handoff Time (s)')
     ax.grid(axis='y', alpha=0.3)
+    ax.text(0.99, 0.99, 'Labels report mean ± standard error',
+            transform=ax.transAxes, fontsize=BASE_FONT * 0.85,
+            ha='right', va='top', style='italic', color='0.4')
     fig.savefig(f'{FIGURES_DIR}/handoff_boxplot.pdf')
     plt.close()
 
