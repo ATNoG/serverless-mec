@@ -13,12 +13,13 @@ import seaborn as sns
 # Common figure width for IEEE single-column (3.5in)
 COL_WIDTH = 3.5
 # Use seaborn defaults with serif font for IEEE style
+BASE_FONT = 7
 sns.set_theme(style="whitegrid", font="serif", rc={
-    'font.size': 8,
-    'axes.labelsize': 8,
-    'xtick.labelsize': 8,
-    'ytick.labelsize': 8,
-    'legend.fontsize': 8,
+    'font.size': BASE_FONT,
+    'axes.labelsize': BASE_FONT,
+    'xtick.labelsize': BASE_FONT,
+    'ytick.labelsize': BASE_FONT,
+    'legend.fontsize': BASE_FONT,
     'figure.dpi': 300,
     'savefig.bbox': 'tight',
     'savefig.pad_inches': 0.05,
@@ -28,7 +29,7 @@ BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 FIGURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'figures')
 palette = sns.color_palette("colorblind")
 
-ANNOT_SIZE = 8  # annotation font size, consistent across all plots
+ANNOT_SIZE = BASE_FONT  # annotation font size, consistent across all plots
 
 
 def sigma2_filter(data):
@@ -235,8 +236,8 @@ def plot_handoff():
     for i, patch in enumerate(bp['boxes']):
         patch.set_facecolor(palette[i])
 
-    ax.tick_params(axis='y', labelsize=8)
-    ax.tick_params(axis='x', labelsize=7.5)
+    ax.tick_params(axis='y', labelsize=BASE_FONT)
+    ax.tick_params(axis='x', labelsize=BASE_FONT * 0.94)
 
     # (x_offset, y_offset) per box
     annot_off = [(12, 8), (0, 16), (0, 8), (0, 8), (-10, 28)]
@@ -245,7 +246,7 @@ def plot_handoff():
         ax.annotate(f'{mean:.1f} $\\pm$ {s:.2f} s',
                     xy=(i, max(d)),
                     xytext=(xoff, yoff), textcoords='offset points',
-                    fontsize=8, ha='center')
+                    fontsize=BASE_FONT, ha='center')
 
     all_vals = [v for sublist in data for v in sublist]
     ax.set_ylim(top=max(all_vals) * 1.18)
