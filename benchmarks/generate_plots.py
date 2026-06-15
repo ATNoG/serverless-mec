@@ -226,22 +226,25 @@ def plot_handoff():
             stats.append((mean, s))
             print(f'Handoff {sc}: n={len(filt)}, mean={mean:.1f}s, se={s:.2f}s')
 
-    fig, ax = plt.subplots(figsize=(COL_WIDTH * 1.43, 2.6))  # wider for 5 boxes
+    HANDOFF_SCALE = 1.43  # figure is wider; scale fonts so they match after \columnwidth scaling
+    fs = ANNOT_SIZE * HANDOFF_SCALE
+    fig, ax = plt.subplots(figsize=(COL_WIDTH * HANDOFF_SCALE, 2.6))
     bp = ax.boxplot(data, tick_labels=labels, widths=0.5, patch_artist=True,
                     medianprops=dict(color='black', linewidth=1.5),
                     flierprops=dict(marker='.', markersize=3, alpha=0.5))
     for i, patch in enumerate(bp['boxes']):
         patch.set_facecolor(palette[i])
 
+    annot_yoff = [8, 20, 8, 8, 20]  # stagger adjacent pairs
     for i, (d, (mean, s)) in enumerate(zip(data, stats), 1):
         ax.annotate(f'{mean:.1f} $\\pm$ {s:.1f} s',
                     xy=(i, max(d)),
-                    xytext=(0, 8), textcoords='offset points',
-                    fontsize=ANNOT_SIZE, ha='center')
+                    xytext=(0, annot_yoff[i - 1]), textcoords='offset points',
+                    fontsize=fs, ha='center')
 
     all_vals = [v for sublist in data for v in sublist]
     ax.set_ylim(top=max(all_vals) * 1.18)
-    ax.set_ylabel('Handoff Time (s)')
+    ax.set_ylabel('Handoff Time (s)', fontsize=fs)
     ax.grid(axis='y', alpha=0.3)
     fig.savefig(f'{FIGURES_DIR}/handoff_boxplot.pdf')
     plt.close()
