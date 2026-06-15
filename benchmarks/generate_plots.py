@@ -81,11 +81,11 @@ def plot_freeze_vs_coldstart():
 
     # Cold start: right side, at ~80% of the worst result height
     cold_max = max(cold_f)
-    ax.annotate(f'{cold_mean:.0f} $\\pm$ {cold_se:.0f} ms',
+    ax.annotate(f'{cold_mean:.0f} $\\pm$ {cold_se:.2f} ms',
                 xy=(1.3, cold_max * 0.80), xytext=(-20, 0), textcoords='offset points',
                 fontsize=ANNOT_SIZE, ha='left', va='center')
     # Checkpoint: directly above the worst result
-    ax.annotate(f'{thaw_mean:.0f} $\\pm$ {thaw_se:.1f} ms',
+    ax.annotate(f'{thaw_mean:.0f} $\\pm$ {thaw_se:.2f} ms',
                 xy=(2, max(thaw_f)),
                 xytext=(0, 10), textcoords='offset points',
                 fontsize=ANNOT_SIZE, ha='center')
@@ -235,11 +235,13 @@ def plot_handoff():
     for i, patch in enumerate(bp['boxes']):
         patch.set_facecolor(palette[i])
 
-    annot_yoff = [8, 20, 8, 8, 20]  # stagger adjacent pairs
+    # (x_offset, y_offset) per box
+    annot_off = [(15, 8), (0, 20), (0, 8), (0, 8), (-10, 30)]
     for i, (d, (mean, s)) in enumerate(zip(data, stats), 1):
-        ax.annotate(f'{mean:.1f} $\\pm$ {s:.1f} s',
+        xoff, yoff = annot_off[i - 1]
+        ax.annotate(f'{mean:.1f} $\\pm$ {s:.2f} s',
                     xy=(i, max(d)),
-                    xytext=(0, annot_yoff[i - 1]), textcoords='offset points',
+                    xytext=(xoff, yoff), textcoords='offset points',
                     fontsize=fs, ha='center')
 
     all_vals = [v for sublist in data for v in sublist]
