@@ -81,18 +81,20 @@ def plot_freeze_vs_coldstart():
 
     # Cold start: right side, at ~80% of the worst result height
     cold_max = max(cold_f)
+    fs_fvc = ANNOT_SIZE * 1.1
     ax.annotate(f'{cold_mean:.0f} $\\pm$ {cold_se:.2f} ms',
                 xy=(1.3, cold_max * 0.80), xytext=(-20, 0), textcoords='offset points',
-                fontsize=ANNOT_SIZE, ha='left', va='center')
+                fontsize=fs_fvc, ha='left', va='center')
     # Checkpoint: directly above the worst result
     ax.annotate(f'{thaw_mean:.0f} $\\pm$ {thaw_se:.2f} ms',
                 xy=(2, max(thaw_f)),
                 xytext=(0, 10), textcoords='offset points',
-                fontsize=ANNOT_SIZE, ha='center')
+                fontsize=fs_fvc, ha='center')
 
     ymax = max(max(cold_f), max(thaw_f))
     ax.set_ylim(top=ymax * 1.12)
-    ax.set_ylabel('TTFB (ms)')
+    ax.set_ylabel('TTFB (ms)', fontsize=fs_fvc)
+    ax.tick_params(axis='both', labelsize=fs_fvc)
     ax.grid(axis='y', alpha=0.3)
     fig.savefig(f'{FIGURES_DIR}/freeze_vs_coldstart.pdf')
     plt.close()
@@ -205,11 +207,11 @@ def plot_handoff():
                     scenarios.setdefault(sc, []).append(d['handoff_wall_ms'])
 
     labels_map = {
-        'rsu-a-coldstart': 'RSU→RSU\nCold Start',
-        'worker1-coldstart': 'VM→VM\nCold Start',
-        'worker2-coldstart': 'RSU→VM\nCold Start',
-        'worker1-freeze': 'VM→VM\nCheckpoint',
-        'worker2-freeze': 'RSU→VM\nCheckpoint',
+        'rsu-a-coldstart': 'RSU→RSU\nCold',
+        'worker1-coldstart': 'VM→VM\nCold',
+        'worker2-coldstart': 'RSU→VM\nCold',
+        'worker1-freeze': 'VM→VM\nCkpt',
+        'worker2-freeze': 'RSU→VM\nCkpt',
     }
     # Worst to best
     order = ['rsu-a-coldstart', 'worker1-coldstart', 'worker2-coldstart', 'worker1-freeze', 'worker2-freeze']
@@ -226,27 +228,28 @@ def plot_handoff():
             stats.append((mean, s))
             print(f'Handoff {sc}: n={len(filt)}, mean={mean:.1f}s, se={s:.2f}s')
 
-    HANDOFF_SCALE = 1.43  # figure is wider; scale fonts so they match after \columnwidth scaling
-    fs = ANNOT_SIZE * HANDOFF_SCALE
-    fig, ax = plt.subplots(figsize=(COL_WIDTH * HANDOFF_SCALE, 2.6))
+    fig, ax = plt.subplots(figsize=(COL_WIDTH, 2.4))
     bp = ax.boxplot(data, tick_labels=labels, widths=0.5, patch_artist=True,
                     medianprops=dict(color='black', linewidth=1.5),
                     flierprops=dict(marker='.', markersize=3, alpha=0.5))
     for i, patch in enumerate(bp['boxes']):
         patch.set_facecolor(palette[i])
 
+    ax.tick_params(axis='y', labelsize=8)
+    ax.tick_params(axis='x', labelsize=7.5)
+
     # (x_offset, y_offset) per box
-    annot_off = [(15, 8), (0, 20), (0, 8), (0, 8), (-10, 30)]
+    annot_off = [(12, 8), (0, 16), (0, 8), (0, 8), (-10, 28)]
     for i, (d, (mean, s)) in enumerate(zip(data, stats), 1):
         xoff, yoff = annot_off[i - 1]
         ax.annotate(f'{mean:.1f} $\\pm$ {s:.2f} s',
                     xy=(i, max(d)),
                     xytext=(xoff, yoff), textcoords='offset points',
-                    fontsize=fs, ha='center')
+                    fontsize=8, ha='center')
 
     all_vals = [v for sublist in data for v in sublist]
     ax.set_ylim(top=max(all_vals) * 1.18)
-    ax.set_ylabel('Handoff Time (s)', fontsize=fs)
+    ax.set_ylabel('Handoff Time (s)')
     ax.grid(axis='y', alpha=0.3)
     fig.savefig(f'{FIGURES_DIR}/handoff_boxplot.pdf')
     plt.close()
