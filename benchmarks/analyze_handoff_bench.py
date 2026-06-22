@@ -225,12 +225,13 @@ def _iqr_filter(vals: List[float]) -> List[float]:
 
 
 SCENARIOS = [
-    "rsu-a-coldstart",
+    "rsu-a-coldstart", "rsu-a-freeze",
     "worker1-coldstart", "worker1-freeze",
     "worker2-coldstart", "worker2-freeze",
 ]
 SCENARIO_LABELS = {
     "rsu-a-coldstart": "RSU-A Cold Start",
+    "rsu-a-freeze": "RSU-A Freeze Handoff",
     "worker1-coldstart": "Worker-1 Cold Start",
     "worker1-freeze": "Worker-1 Freeze Handoff",
     "worker2-coldstart": "Worker-2 Cold Start",
@@ -238,6 +239,7 @@ SCENARIO_LABELS = {
 }
 SCENARIO_COLORS = {
     "RSU-A Cold Start": "#FF9800",
+    "RSU-A Freeze Handoff": "#F44336",
     "Worker-1 Cold Start": "#4CAF50",
     "Worker-1 Freeze Handoff": "#2196F3",
     "Worker-2 Cold Start": "#9C27B0",
@@ -282,8 +284,13 @@ def _get_phase_values(rows: List[dict], scenario: str, phase_key: str,
     for idx, r in enumerate(rows):
         if r.get("scenario") != scenario:
             continue
-        if r.get("handoff_phase") != "Ready":
-            continue
+        hp = r.get("handoff_phase", "")
+        if "freeze" in scenario:
+            if hp not in ("Ready", "Applied"):
+                continue
+        else:
+            if hp != "Ready":
+                continue
         phases = computed.get(idx, {})
         v = phases.get(phase_key)
         if isinstance(v, (int, float)) and v >= 0:
