@@ -4,17 +4,41 @@ set -euo pipefail
 # ===========================================================================
 #  Handoff Benchmark
 #
-#  Measures the full pipeline: event send -> retransmission -> handoff CR
-#  creation -> operator applies replica -> target KService ready.
+#  Measures the full handoff pipeline via direct CR apply:
+#    CR apply -> operator reconciles -> target KService created -> pod ready
+#    -> CR Ready (cold start) or thawCompleted (CRIU freeze).
 #
-#  Three scenarios:
-#    1) RSU-A cold start handoff   (normal queue-proxy, no freeze)
-#    2) Worker-1 cold start handoff (no freeze, handoff to worker-1)
-#    3) Worker-1 CRIU thaw handoff  (freeze enabled on target, measures
-#       thaw latency of a frozen target pod after handoff is primed)
+#  Scenarios:
+#    rsu-cold    RSU-A cold start handoff (no freeze, source on RSU-B)
+#    rsu-freeze  RSU-A CRIU thaw handoff  (freeze enabled, 5s idle timeout)
+#    rsu         Both RSU-A scenarios (cold + freeze)
+#    worker1-cold   Worker-1 cold start handoff
+#    worker1-freeze Worker-1 CRIU thaw handoff
+#    worker2-cold   Worker-2 cold start handoff
+#    worker2-freeze Worker-2 CRIU thaw handoff
+#    all            All scenarios
+#
+#  The source pod (on RSU-B or worker-1) is unused — the handoff CR is
+#  applied directly via kubectl, bypassing the retransmission event path.
+#
+#  Freeze scenarios use CRIU checkpoint/restore. After warmup, the target
+#  pod freezes via idle timeout. Each iteration thaws the frozen pod and
+#  measures latency to thawCompleted (not phase=Ready, since kubelet
+#  doesn't update container state after CRIU restore).
+#
+#  Cold start scenarios do NOT run periodic disk cleanup — there are no
+#  CRIU checkpoints to clean, and image pruning + re-pull would add I/O
+#  contention that skews measurements.
+#
+#  Environment variables:
+#    ITERATIONS                    Number of iterations per scenario (default: 20)
+#    SCENARIO                      Scenario to run (default: all)
+#    CHECKPOINT_CLEANUP_INTERVAL   Freeze iterations between disk cleanups (default: 10)
+#    FREEZER_IDLE_TIMEOUT          Seconds before freezer checkpoints idle pod (default: 5)
 #
 #  Usage:
-#    ./bench_handoff.sh [--iterations N] [--scenario all|rsu-a|worker1-cold|worker1-freeze|worker2-cold|worker2-freeze]
+#    ./bench_handoff.sh [--iterations N] [--scenario rsu|rsu-cold|rsu-freeze|...]
+#    CHECKPOINT_CLEANUP_INTERVAL=2 ./bench_handoff.sh --iterations 3 --scenario rsu
 # ===========================================================================
 
 # ---- configuration --------------------------------------------------------
@@ -28,8 +52,8 @@ ITERATIONS=${ITERATIONS:-20}
 SCENARIO=${SCENARIO:-"all"}
 
 HANDOFF_CR_PREFIX="${EA_NAME}-to-"
-HANDOFF_POLL_TIMEOUT=300  # seconds
-CHECKPOINT_CLEANUP_INTERVAL=5
+HANDOFF_POLL_TIMEOUT=600  # seconds
+CHECKPOINT_CLEANUP_INTERVAL="${CHECKPOINT_CLEANUP_INTERVAL:-10}"
 
 QUEUE_PROXY_PORT=8012
 FREEZE_WAIT_TIMEOUT=300
@@ -400,6 +424,33 @@ get_handoff_phase() {
         -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown"
 }
 
+wait_for_handoff_thaw() {
+    # For freeze scenarios: wait for the operator to record thawCompleted in
+    # the CR status timestamps. After CRIU restore, the container state in
+    # kubelet still shows Terminated/Error so the KService never reaches Ready
+    # and the CR stays at Applied. thawCompleted is the correct success signal.
+    local target="$1"
+    local cr_name="${HANDOFF_CR_PREFIX}${target}"
+    local deadline=$((SECONDS + HANDOFF_POLL_TIMEOUT))
+    while (( SECONDS < deadline )); do
+        local thaw_ts
+        thaw_ts=$(kubectl get edgeapplicationhandoff "$cr_name" -n "$NAMESPACE" \
+            -o jsonpath='{.status.timestamps.thawCompleted}' 2>/dev/null)
+        if [[ -n "$thaw_ts" ]]; then
+            return 0
+        fi
+        # Also check for failure
+        local phase
+        phase=$(kubectl get edgeapplicationhandoff "$cr_name" -n "$NAMESPACE" \
+            -o jsonpath='{.status.phase}' 2>/dev/null)
+        if [[ "$phase" == "Failed" ]]; then
+            return 1
+        fi
+        sleep 0.5
+    done
+    return 2  # timeout
+}
+
 # ---- freeze helpers (for freeze scenarios) ----------------------------------
 
 get_target_pod_name() {
@@ -410,10 +461,13 @@ get_target_pod_name() {
     if [[ -z "$latest_rev" ]]; then
         return
     fi
+    # Return the newest Running pod to avoid picking a stale pod that is
+    # about to be replaced by a Kyverno-triggered rollout.
     kubectl get pods -n "$NAMESPACE" \
         -l "serving.knative.dev/revision=$latest_rev" \
         --field-selector=status.phase=Running \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+        --sort-by=.metadata.creationTimestamp \
+        -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null
 }
 
 get_pod_ip() {
@@ -444,36 +498,61 @@ wait_for_target_pod_ready() {
     return 1
 }
 
+get_target_freeze_count() {
+    local pod="$1" freeze_daemon_pod="$2"
+    kubectl logs "$freeze_daemon_pod" -n knative-serving 2>/dev/null \
+        | grep -c -F "pause request received, freezing pod: ${NAMESPACE}/${pod}" || echo 0
+}
+
 wait_for_target_freeze() {
     local pod="$1"
+    local freeze_daemon_pod="${2:-}"
+    local prev_count="${3:-}"
     log "  Waiting for freezer to checkpoint target pod $pod..."
 
-    # Stream the queue-proxy log to a temp file and poll for "fake listener
-    # started". This matches the approach in bench_freeze_vs_coldstart.sh
-    # and is more reliable than polling --tail=50 (which can miss the line).
-    # Use --since=30s to capture recent freeze events (the pod may have
-    # already frozen by the time we start watching, e.g. 5s idle timeout).
-    local debug_log
-    debug_log=$(mktemp -t qproxy_log.XXXXXX)
-    kubectl logs -f "$pod" -n "$NAMESPACE" -c queue-proxy --since=30s \
-        >"$debug_log" 2>/dev/null &
-    local watcher_pid=$!
+    if [[ -z "$freeze_daemon_pod" ]]; then
+        log "  ERROR: freeze daemon pod not provided"
+        return 1
+    fi
+
+    # Watch the freeze daemon logs instead of queue-proxy logs.
+    # After CRIU restore the pod shows 1/2 Error (cosmetic) and kubectl logs
+    # for queue-proxy returns nothing. The freeze daemon is never checkpointed,
+    # so its logs are always accessible.
+    local freeze_pattern="pause request received, freezing pod: ${NAMESPACE}/${pod}"
+    local error_pattern="freezing pod ${NAMESPACE}/${pod} failed"
+
+    # Use caller-provided baseline count if available. With short idle
+    # timeouts the pod can re-freeze before we start polling.
+    if [[ -z "$prev_count" ]]; then
+        prev_count=$(kubectl logs "$freeze_daemon_pod" -n knative-serving 2>/dev/null \
+            | grep -c -F "$freeze_pattern") || prev_count=0
+    fi
 
     local start_epoch
     start_epoch=$(date +%s)
     local last_diag_epoch=$start_epoch
     while :; do
-        if grep -q -F 'fake listener started' "$debug_log" 2>/dev/null; then
-            kill "$watcher_pid" 2>/dev/null; wait "$watcher_pid" 2>/dev/null
-            rm -f "$debug_log"
-            log "  Target container frozen (fake listener active)."
+        local cur_count
+        cur_count=$(kubectl logs "$freeze_daemon_pod" -n knative-serving 2>/dev/null \
+            | grep -c -F "$freeze_pattern") || cur_count=0
+        if (( cur_count > prev_count )); then
+            # Checkpoint initiated. Wait for it to complete on ARM64.
+            sleep 5
+            # Verify no error was logged for this checkpoint.
+            local err_count
+            err_count=$(kubectl logs "$freeze_daemon_pod" -n knative-serving 2>/dev/null \
+                | grep -c -F "$error_pattern") || err_count=0
+            if (( err_count >= cur_count )); then
+                log "  WARNING: freeze daemon reported checkpoint failure"
+                return 1
+            fi
+            log "  Target container frozen (confirmed by freeze daemon)."
             return 0
         fi
 
         # Check pod still exists
         if ! kubectl get pod "$pod" -n "$NAMESPACE" --no-headers >/dev/null 2>&1; then
-            kill "$watcher_pid" 2>/dev/null; wait "$watcher_pid" 2>/dev/null
-            rm -f "$debug_log"
             log "  WARNING: pod $pod no longer exists"
             return 1
         fi
@@ -483,8 +562,6 @@ wait_for_target_freeze() {
         elapsed=$((now - start_epoch))
 
         if (( elapsed >= FREEZE_WAIT_TIMEOUT )); then
-            kill "$watcher_pid" 2>/dev/null; wait "$watcher_pid" 2>/dev/null
-            rm -f "$debug_log"
             log "  WARNING: freezer did not checkpoint within ${FREEZE_WAIT_TIMEOUT}s"
             return 1
         fi
@@ -494,7 +571,7 @@ wait_for_target_freeze() {
             last_diag_epoch=$now
         fi
 
-        sleep 1
+        sleep 2
     done
 }
 
@@ -577,7 +654,14 @@ spec:
                     restartPolicy: Never
 POLICY
     )
-    kubectl_apply_retry "$_policy_yaml"
+    if ! kubectl_apply_retry "$_policy_yaml" 5; then
+        log "  WARNING: Kyverno policy apply failed, waiting 10s and retrying..."
+        sleep 10
+        if ! kubectl_apply_retry "$_policy_yaml" 5; then
+            log "  ERROR: failed to apply Kyverno restartPolicy=Never policy after extended retry"
+            return 1
+        fi
+    fi
 
 }
 
@@ -612,6 +696,9 @@ cleanup_node_disk() {
     # Cleans up disk space on a node to prevent disk-pressure taints:
     #  1) /tmp/ctrd-checkpoint* — CRIU checkpoint temp dirs (~49 MB each)
     #  2) /var/lib/kubelet/checkpoints/* — kubelet checkpoint archives
+    #  NOTE: /run/freezer-checkpoints/* and /run/freezer-fifo/* are NOT cleaned
+    #        here — the freeze daemon holds in-memory references to active
+    #        checkpoints stored there. Deleting them breaks the next restore.
     #  3) crictl rmi --prune — unused container images
     #  4) Remove checkpoint images + snapshots from containerd — CRIU checkpoint
     #     blobs stay referenced in containerd's metadata DB and are never
@@ -662,14 +749,23 @@ cleanup_node_disk() {
             }]
           }
         }' >/dev/null 2>&1
-    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=180s >/dev/null 2>&1; then
-        local result
-        result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
-        if [[ -n "$result" && "$result" != "cleaned_checkpoints=0" ]]; then
-            log "  Disk cleanup on $node_name: $result"
-        fi
+    # Poll for pod completion — kubectl wait hangs if the pod doesn't exist
+    # or goes to Failed instead of Succeeded.
+    local _cleanup_deadline=$((SECONDS + 180))
+    while (( SECONDS < _cleanup_deadline )); do
+        local _cleanup_phase
+        _cleanup_phase=$(kubectl get pod "$pod_name" -n "$NAMESPACE" \
+            -o jsonpath='{.status.phase}' 2>/dev/null)
+        [[ -z "$_cleanup_phase" ]] && break
+        [[ "$_cleanup_phase" == "Succeeded" || "$_cleanup_phase" == "Failed" ]] && break
+        sleep 2
+    done
+    local result
+    result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
+    if [[ -n "$result" && "$result" != "cleaned_checkpoints=0" ]]; then
+        log "  Disk cleanup on $node_name: $result"
     fi
-    kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
 }
 
 # ---- EA patching -----------------------------------------------------------
@@ -678,6 +774,7 @@ patch_ea() {
     local freeze="$1" node_key="$2" node_val="$3" target_replica="$4" node_selector_json="$5"
     local cleanup_on_delete="${6:-true}"
     local clear_triggers="${7:-false}"
+    local idle_timeout="${8:-$FREEZER_IDLE_TIMEOUT}"
 
     # Single atomic JSON patch to avoid multiple reconciliation cycles.
     # Multiple sequential patches cause the operator to create a new Knative
@@ -697,6 +794,7 @@ envs = [
 ops = [
     {'op': 'replace', 'path': '/spec/service/nodeSelector', 'value': {'$node_key': '$node_val'}},
     {'op': 'replace', 'path': '/spec/service/freezeEnabled', 'value': '$freeze' == 'true'},
+    {'op': 'replace', 'path': '/spec/service/freezeIdleTimeout', 'value': $idle_timeout},
     {'op': 'replace', 'path': '/spec/service/container/env', 'value': envs},
 ]
 if '$clear_triggers' == 'true':
@@ -715,8 +813,7 @@ EA_BACKUP=""
 TRIGGERS_BACKUP=""
 cleanup() {
     log "Cleanup..."
-    # Clean all worker nodes that may have accumulated CRIU checkpoint blobs.
-    # Different scenarios target different nodes; clean them all.
+    # Clean all nodes that may have accumulated CRIU checkpoint blobs.
     cleanup_node_disk "$BENCH_NODE_NAME"
     local w2_node
     w2_node=$(kubectl get nodes -l vm-id=worker-2 \
@@ -724,13 +821,26 @@ cleanup() {
     if [[ -n "$w2_node" && "$w2_node" != "$BENCH_NODE_NAME" ]]; then
         cleanup_node_disk "$w2_node"
     fi
+    # Clean RSU nodes used as handoff targets
+    local rsu_node
+    for rsu_label in rsu-a rsu-b; do
+        rsu_node=$(kubectl get nodes -l "rsu-id=$rsu_label" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [[ -n "$rsu_node" && "$rsu_node" != "$BENCH_NODE_NAME" ]]; then
+            cleanup_node_disk "$rsu_node"
+        fi
+    done
     kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
     kubectl delete clusterpolicy bench-freeze-idle-timeout --ignore-not-found >/dev/null 2>&1 || true
     restore_queue_proxy_image
 
-    # Delete any leftover handoff CRs
+    # Delete any leftover handoff CRs and target KServices
     kubectl delete edgeapplicationhandoff --all -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+    # Delete target ksvc replicas (operator may not clean up fast enough)
+    kubectl get ksvc -n "$NAMESPACE" --no-headers 2>/dev/null \
+        | awk '{print $1}' | grep -v "^${SERVICE_NAME}$" \
+        | xargs -r kubectl delete ksvc -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
 
     # Restore original EA (delete + create to avoid merge issues with nodeSelector)
     if [[ -n "$EA_BACKUP" ]]; then
@@ -773,10 +883,12 @@ run_handoff_iteration() {
     # Delete any existing handoff CR from previous iteration
     delete_handoff_cr "$handoff_target"
 
-    # Wait for target KService cleanup (operator deletes it via cleanupOnDelete)
+    # Wait for target KService and pods cleanup (operator deletes via cleanupOnDelete)
     local target_svc="${EA_NAME}-${handoff_target}"
     kubectl wait ksvc "$target_svc" -n "$NAMESPACE" --for=delete --timeout=60s >/dev/null 2>&1 || true
-    sleep 1
+    kubectl wait pods -n "$NAMESPACE" \
+        -l "serving.knative.dev/service=$target_svc" \
+        --for=delete --timeout=90s >/dev/null 2>&1 || true
 
     # Build and apply handoff CR — measure from CR apply to CR Ready
     local _cr_yaml
@@ -790,28 +902,36 @@ run_handoff_iteration() {
         log "  SKIPPED: failed to apply handoff CR after retries"
         return
     fi
+    log "  Waiting for target pod 2/2 Ready..."
 
+    local handoff_end handoff_wall_ms phase ts_after
     if wait_for_handoff_ready "$handoff_target"; then
-        local handoff_end handoff_wall_ms phase ts_after
         handoff_end=$(date +%s%N)
         handoff_wall_ms=$(( (handoff_end - handoff_start) / 1000000 ))
         ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
         phase=$(get_handoff_phase "$handoff_target")
-        log "  Handoff $phase in ${handoff_wall_ms}ms"
+        log "  Result: ${handoff_wall_ms}ms cold start (phase=$phase)"
         emit_result "$scenario" "$iteration" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
     else
-        local handoff_end handoff_wall_ms phase ts_after
         handoff_end=$(date +%s%N)
         handoff_wall_ms=$(( (handoff_end - handoff_start) / 1000000 ))
         ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
         phase=$(get_handoff_phase "$handoff_target")
-        log "  Handoff $phase after ${handoff_wall_ms}ms (timeout)"
+        log "  TIMEOUT: ${handoff_wall_ms}ms (phase=$phase)"
         emit_result "$scenario" "$iteration" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
     fi
 
     # Cleanup handoff CR so next iteration starts fresh
     delete_handoff_cr "$handoff_target"
-    sleep 1
+
+    # Wait for target KService and ALL its pods to fully terminate.
+    # On I/O-constrained nodes (RSU ARM64), a Terminating pod causes severe
+    # contention with the next iteration's pod creation, inflating times.
+    log "  Waiting for scale to zero..."
+    kubectl wait ksvc "$target_svc" -n "$NAMESPACE" --for=delete --timeout=60s >/dev/null 2>&1 || true
+    kubectl wait pods -n "$NAMESPACE" \
+        -l "serving.knative.dev/service=$target_svc" \
+        --for=delete --timeout=90s >/dev/null 2>&1 || true
 }
 
 # ---- scenario runners -------------------------------------------------------
@@ -821,8 +941,22 @@ run_scenario() {
     local handoff_target="$5" handoff_node_selector="$6"
     local iterations="$7"
 
+    # Resolve target node name from the handoff_node_selector JSON
+    # e.g. '{"rsu-id":"rsu-a"}' → find node with label rsu-id=rsu-a
+    local target_node_name=""
+    if [[ -n "$handoff_node_selector" ]]; then
+        local _sel_key _sel_val
+        _sel_key=$(echo "$handoff_node_selector" | python3 -c "import sys,json; d=json.load(sys.stdin); print(list(d.keys())[0])" 2>/dev/null)
+        _sel_val=$(echo "$handoff_node_selector" | python3 -c "import sys,json; d=json.load(sys.stdin); print(list(d.values())[0])" 2>/dev/null)
+        if [[ -n "$_sel_key" && -n "$_sel_val" ]]; then
+            target_node_name=$(kubectl get nodes -l "$_sel_key=$_sel_val" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        fi
+    fi
+
     log "=== SCENARIO: $scenario ($iterations iterations) ==="
-    log "  freeze=$freeze, source=$node_key=$node_val, target=$handoff_target"
+    log "  Measures full cold start handoff latency (direct CR apply)"
+    log "  Source: $node_key=$node_val, Target: $handoff_target (node: ${target_node_name:-unknown})"
 
     if ! patch_ea "$freeze" "$node_key" "$node_val" "$handoff_target" "$handoff_node_selector"; then
         log "  ERROR: patch_ea failed, retrying once..."
@@ -833,27 +967,40 @@ run_scenario() {
         }
     fi
 
-    # Wait for the new revision to stabilize before proceeding
-    wait_for_knative_rollout "$SERVICE_NAME" || log "  WARNING: rollout did not stabilize, proceeding anyway"
-
-    # Force-delete old pods and do a warmup iteration
-    kubectl delete pods -n "$NAMESPACE" \
-        -l "serving.knative.dev/service=$SERVICE_NAME" \
-        --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
-    sleep 2
-
+    # Source pod rollout is not waited on — we apply the handoff CR directly
+    # so the source pod is unused. Let it stabilize in the background.
     log "  Warmup iteration (direct CR apply)..."
     delete_handoff_cr "$handoff_target"
     local _warmup_cr
     _warmup_cr=$(_build_handoff_cr "$handoff_target" "true" "$handoff_node_selector")
     kubectl_apply_retry "$_warmup_cr" || true
-    sleep 2
-    wait_for_handoff_ready "$handoff_target" || true
+    # Wait for warmup handoff with a short timeout. The CR may get deleted
+    # by the operator (cleanupOnDelete=true) before reaching Ready, causing
+    # kubectl wait to hang on a non-existent resource. Use a direct poll
+    # loop with a 120s timeout instead.
+    local _warmup_deadline=$((SECONDS + 120))
+    while (( SECONDS < _warmup_deadline )); do
+        # Check if CR still exists — if not, operator deleted it (cleanupOnDelete)
+        if ! kubectl get edgeapplicationhandoff "${HANDOFF_CR_PREFIX}${handoff_target}" \
+            -n "$NAMESPACE" --no-headers >/dev/null 2>&1; then
+            break
+        fi
+        local _warmup_phase
+        _warmup_phase=$(kubectl get edgeapplicationhandoff "${HANDOFF_CR_PREFIX}${handoff_target}" \
+            -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
+        if [[ "$_warmup_phase" == "Ready" || "$_warmup_phase" == "Failed" ]]; then
+            break
+        fi
+        sleep 2
+    done
     delete_handoff_cr "$handoff_target"
-    # Wait for target KService cleanup before first measured iteration
+    # Wait for target KService AND all pods to fully terminate before first
+    # measured iteration. On RSU, leftover Terminating pods cause I/O contention.
     local target_svc="${EA_NAME}-${handoff_target}"
     kubectl wait ksvc "$target_svc" -n "$NAMESPACE" --for=delete --timeout=60s >/dev/null 2>&1 || true
-    sleep 2
+    kubectl wait pods -n "$NAMESPACE" \
+        -l "serving.knative.dev/service=$target_svc" \
+        --for=delete --timeout=90s >/dev/null 2>&1 || true
 
     local i
     for (( i=1; i<=iterations; i++ )); do
@@ -863,10 +1010,6 @@ run_scenario() {
         if ! wait_for_operator; then
             log "  SKIPPED: operator not ready"
             continue
-        fi
-
-        if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
-            cleanup_node_disk
         fi
 
         run_handoff_iteration "$scenario" "$i" "$handoff_target" "$handoff_node_selector"
@@ -903,6 +1046,7 @@ run_scenario() {
 run_freeze_scenario() {
     local scenario_name="$1" iterations="$2" handoff_target="$3"
     local handoff_node_selector="$4" target_node_key="$5" target_node_val="$6"
+    local idle_timeout="${7:-$FREEZER_IDLE_TIMEOUT}"
     local target_svc="${EA_NAME}-${handoff_target}"
 
     # Resolve the target node name for disk cleanup during iterations
@@ -910,20 +1054,25 @@ run_freeze_scenario() {
     target_node_name=$(kubectl get nodes -l "$target_node_key=$target_node_val" \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
+    # Find the freeze daemon pod on the target node for freeze detection
+    local target_freeze_daemon
+    target_freeze_daemon=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
+        | grep freeze-daemon-containerd | grep "$target_node_name" | awk '{print $1}')
+
     log "=== SCENARIO: $scenario_name ($iterations iterations) ==="
     log "  Measures full handoff latency with CRIU-frozen target"
-    log "  Target KService: $target_svc (node: $target_node_name)"
+    log "  Target KService: $target_svc (node: $target_node_name, daemon: $target_freeze_daemon)"
 
     # Step 1: Patch EA — freeze=true, clear triggerFilters.
     # triggerFilters must be empty to prevent the broker from dispatching
     # events to the target pod (which would keep it awake and prevent freeze).
     # cleanupOnDelete=false so the target KService survives handoff CR deletion.
     if ! patch_ea "true" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
-        "$handoff_target" "$handoff_node_selector" "false" "true"; then
+        "$handoff_target" "$handoff_node_selector" "false" "true" "$idle_timeout"; then
         log "  ERROR: patch_ea failed, retrying once..."
         sleep 5
         patch_ea "true" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
-            "$handoff_target" "$handoff_node_selector" "false" "true" || {
+            "$handoff_target" "$handoff_node_selector" "false" "true" "$idle_timeout" || {
             log "  ERROR: patch_ea failed twice, aborting scenario $scenario_name"
             return 1
         }
@@ -932,7 +1081,8 @@ run_freeze_scenario() {
     kubectl delete trigger -n "$NAMESPACE" \
         -l "mec.atnog.org/app=$EA_NAME" --ignore-not-found >/dev/null 2>&1
 
-    wait_for_knative_rollout "$SERVICE_NAME" || log "  WARNING: rollout did not stabilize, proceeding anyway"
+    # Source pod rollout is not waited on — we apply the handoff CR directly
+    # so the source pod is unused. Let it stabilize in the background.
 
     # Step 2: Apply Kyverno policy BEFORE the target KService exists.
     # This ensures the first pod created gets restartPolicy=Never via the
@@ -963,6 +1113,11 @@ CLEANUP
     sleep 1
     delete_handoff_cr "$handoff_target"
     kubectl wait ksvc "$target_svc" -n "$NAMESPACE" --for=delete --timeout=30s >/dev/null 2>&1 || true
+    # Wait for ALL pods to fully terminate — on RSU, concurrent pods cause
+    # I/O contention that prevents the warmup pod from starting cleanly.
+    kubectl wait pods -n "$NAMESPACE" \
+        -l "serving.knative.dev/service=$target_svc" \
+        --for=delete --timeout=90s >/dev/null 2>&1 || true
     log "  Clean slate established."
 
     # Step 4: Warmup — create the target KService via direct handoff CR.
@@ -989,37 +1144,35 @@ EOF
         return
     fi
 
-    if ! wait_for_handoff_ready "$handoff_target"; then
-        local phase
-        phase=$(get_handoff_phase "$handoff_target")
-        log "  ERROR: warmup handoff did not reach Ready (phase=$phase), aborting freeze scenario"
-        return
-    fi
-    log "  Warmup handoff Ready — target KService $target_svc exists"
-
-    delete_handoff_cr "$handoff_target"
-    wait_for_knative_rollout "$target_svc" || log "  WARNING: target rollout did not stabilize, proceeding anyway"
-
-    # Wait for a stable target pod and freeze. With restartPolicy=Never and
-    # 5s idle timeout, the pod freezes shortly after starting. We poll for
-    # a Running pod and then wait for the freeze marker in its logs.
-    # Retry if the pod disappears (old pod from rollout being cleaned up).
-    local warmup_pod="" freeze_ok=false
+    # Don't wait for handoff CR Ready — with short idle timeouts the freezer
+    # checkpoints the user-container before the KService reaches Ready, leaving
+    # the CR stuck at Applied. Instead, wait for the target pod to exist and
+    # freeze directly. The warmup only needs a frozen pod, not a Ready CR.
+    # Retry if the pod disappears (Kyverno rollout can replace it).
+    local warmup_pod="" freeze_ok=false freeze_baseline="0"
     local deadline=$((SECONDS + 180))
     while (( SECONDS < deadline )); do
-        warmup_pod=$(get_target_pod_name "$target_svc")
+        warmup_pod=$(kubectl get pods -n "$NAMESPACE" \
+            -l "serving.knative.dev/service=$target_svc" \
+            --field-selector=status.phase!=Succeeded,status.phase!=Failed \
+            --sort-by=.metadata.creationTimestamp \
+            -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
         if [[ -z "$warmup_pod" ]]; then
             sleep 2
             continue
         fi
-        if wait_for_target_freeze "$warmup_pod"; then
+        log "  Target pod: $warmup_pod — waiting for freeze..."
+        if wait_for_target_freeze "$warmup_pod" "$target_freeze_daemon"; then
             freeze_ok=true
             break
         fi
-        # Pod disappeared — retry with a newer one
+        # Pod disappeared or freeze failed — retry with a newer one
         log "  Retrying with next target pod..."
         sleep 2
     done
+
+    delete_handoff_cr "$handoff_target"
+
     if [[ "$freeze_ok" != "true" ]]; then
         log "  ERROR: target did not freeze after warmup within 180s, aborting"
         return
@@ -1027,10 +1180,9 @@ EOF
     log "  Target frozen — starting measured iterations"
 
     # Step 5: Run measured iterations.
-    # Each iteration uses a fresh pod to guarantee clean CRIU state.
-    # After CRIU restore, the 3rd checkpoint/restore cycle on the same pod
-    # fails (CRIU limitation with accumulated TCP/PID state). Fresh pods
-    # ensure every measurement is from a clean first-restore.
+    # The target pod is already frozen from warmup. Each iteration triggers
+    # a handoff (CRIU thaw), measures the latency, then waits for the pod
+    # to re-freeze via idle timeout before the next iteration.
     local i
     for (( i=1; i<=iterations; i++ )); do
         log "--- $scenario_name iteration $i/$iterations ---"
@@ -1041,42 +1193,36 @@ EOF
             continue
         fi
 
-        if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
-            cleanup_node_disk "$target_node_name"
-        fi
-
         # Delete handoff CR from previous iteration (KService survives)
         delete_handoff_cr "$handoff_target"
 
-        # Delete the target pod so the KService creates a fresh one.
-        # This guarantees clean CRIU state for every measurement.
-        local old_pod
-        old_pod=$(get_target_pod_name "$target_svc")
-        if [[ -n "$old_pod" ]]; then
-            log "  Recycling target pod for clean CRIU state..."
-            kubectl delete pod "$old_pod" -n "$NAMESPACE" --grace-period=1 --wait=false >/dev/null 2>&1 || true
-            kubectl wait pod "$old_pod" -n "$NAMESPACE" --for=delete --timeout=60s >/dev/null 2>&1 || true
+        # Clean up old CRIU checkpoint blobs between thaw and re-freeze.
+        # After Resume(), the daemon deletes the checkpoint reference, so
+        # there is no active checkpoint to protect at this point. Cleaning
+        # BEFORE the next freeze ensures the new checkpoint is not deleted.
+        if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
+            log "  Running periodic disk cleanup on $target_node_name (every ${CHECKPOINT_CLEANUP_INTERVAL} iterations)..."
+            cleanup_node_disk "$target_node_name"
         fi
 
-        # Wait for replacement pod to be ready
-        if ! wait_for_target_pod_ready "$target_svc"; then
-            log "  SKIPPED: replacement target pod not ready"
-            continue
-        fi
-
-        # Trigger freeze directly via the freezer daemon API
+        # Wait for the target to re-freeze before triggering the next handoff.
+        # After the previous iteration's thaw, the pod goes idle and re-freezes
+        # via the idle timeout. Use --since-time to ignore stale freeze log lines
+        # from previous cycles.
         local target_pod
-        target_pod=$(get_target_pod_name "$target_svc")
+        target_pod=$(kubectl get pods -n "$NAMESPACE" \
+            -l "serving.knative.dev/service=$target_svc" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
         if [[ -z "$target_pod" ]]; then
             log "  SKIPPED: no target pod found"
             continue
         fi
-        # Wait for freeze via idle timeout (~30s) + CRIU checkpoint (~5s)
-        if ! wait_for_target_freeze "$target_pod"; then
-            log "  SKIPPED: target did not freeze"
+        log "  Waiting for target to re-freeze ($target_pod)..."
+        if ! wait_for_target_freeze "$target_pod" "$target_freeze_daemon" "$freeze_baseline"; then
+            log "  SKIPPED: target did not re-freeze"
             continue
         fi
-        log "  Target confirmed frozen."
+        log "  Container frozen (confirmed by freeze daemon)."
 
         # Create the handoff CR and measure time to Ready.
         # handoff_wall_ms captures the full lifecycle: CR creation →
@@ -1084,6 +1230,10 @@ EOF
         local ts_before handoff_start
         ts_before=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
         handoff_start=$(date +%s%N)
+
+        # Snapshot freeze count BEFORE thaw. After the thaw the pod re-freezes
+        # quickly (short idle timeout), so snapshotting after would race.
+        freeze_baseline=$(get_target_freeze_count "$target_pod" "$target_freeze_daemon")
 
         local _cr_yaml
         _cr_yaml=$(cat <<EOF
@@ -1105,21 +1255,23 @@ EOF
             continue
         fi
 
-        if wait_for_handoff_ready "$handoff_target"; then
-            local handoff_end handoff_wall_ms phase ts_after
+        # For freeze scenarios, wait for thawCompleted (not phase=Ready).
+        # After CRIU restore, kubelet still sees the user-container as
+        # Terminated/Error so the KService never reaches Ready.
+        local handoff_end handoff_wall_ms phase ts_after
+        if wait_for_handoff_thaw "$handoff_target"; then
             handoff_end=$(date +%s%N)
             handoff_wall_ms=$(( (handoff_end - handoff_start) / 1000000 ))
             ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
             phase=$(get_handoff_phase "$handoff_target")
-            log "  Handoff $phase in ${handoff_wall_ms}ms"
+                log "  Result: ${handoff_wall_ms}ms thaw (phase=$phase)"
             emit_result "$scenario_name" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
         else
-            local handoff_end handoff_wall_ms phase ts_after
             handoff_end=$(date +%s%N)
             handoff_wall_ms=$(( (handoff_end - handoff_start) / 1000000 ))
             ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
             phase=$(get_handoff_phase "$handoff_target")
-            log "  Handoff $phase after ${handoff_wall_ms}ms"
+                log "  TIMEOUT: ${handoff_wall_ms}ms thaw (phase=$phase)"
             emit_result "$scenario_name" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
         fi
     done
@@ -1139,6 +1291,7 @@ main() {
 
     log "Handoff Benchmark"
     log "  iterations=$ITERATIONS, scenario=$SCENARIO"
+    log "  cleanup_interval=$CHECKPOINT_CLEANUP_INTERVAL, freeze_idle_timeout=${FREEZER_IDLE_TIMEOUT}s"
     log "  output=$OUTFILE"
 
     # Backup EA state and triggers
@@ -1186,10 +1339,18 @@ main() {
     # Run selected scenarios — each is isolated so one failure doesn't abort the rest.
     local _scenario_failed=0
     case "$SCENARIO" in
-        rsu-a|all)
+        rsu-cold|rsu|all)
             run_scenario "rsu-a-coldstart" "false" "rsu-id" "rsu-b" \
-                "rsu-a" "" "$ITERATIONS" \
+                "rsu-a" '{"rsu-id":"rsu-a"}' "$ITERATIONS" \
                 || { log "ERROR: rsu-a-coldstart scenario failed, continuing..."; _scenario_failed=1; }
+            ;;&
+        rsu-freeze|rsu|all)
+            local _saved_key="$BENCH_NODE_SELECTOR_KEY" _saved_val="$BENCH_NODE_SELECTOR_VAL"
+            BENCH_NODE_SELECTOR_KEY="rsu-id" BENCH_NODE_SELECTOR_VAL="rsu-b"
+            run_freeze_scenario "rsu-a-freeze" "$ITERATIONS" \
+                "rsu-a" '{"rsu-id":"rsu-a"}' "rsu-id" "rsu-a" "$FREEZER_IDLE_TIMEOUT" \
+                || { log "ERROR: rsu-a-freeze scenario failed, continuing..."; _scenario_failed=1; }
+            BENCH_NODE_SELECTOR_KEY="$_saved_key" BENCH_NODE_SELECTOR_VAL="$_saved_val"
             ;;&
         worker1-cold|all)
             run_scenario "worker1-coldstart" "false" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
