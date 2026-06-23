@@ -11,7 +11,9 @@ WORKDIR /app
 # If you run into build issues for any lib, uncomment build-base.
 RUN apk add --no-cache \
     ca-certificates \
-    && update-ca-certificates
+    tar \
+    && update-ca-certificates \
+    && ln -sf /usr/bin/tar /bin/tar
     # && apk add --no-cache --virtual .build-deps build-base
 
 # Install Python dependencies
