@@ -14,7 +14,7 @@ spec:
 
   service:
     nodeSelector:
-      rsu-id: "rsu-a"
+      rsu-id: "rsu-b"
 
     hostNetwork: true
     dnsPolicy: ClusterFirstWithHostNet

@@ -29,7 +29,7 @@ spec:
         app: http-sink
     spec:
       nodeSelector:
-        rsu-id: "rsu-a"
+        rsu-id: "rsu-b"
       containers:
         - name: nginx
           image: nginx:alpine
