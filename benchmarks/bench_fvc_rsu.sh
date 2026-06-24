@@ -23,7 +23,7 @@ BENCH_NODE_SELECTOR_VAL="${BENCH_NODE:-rsu-a}"
 SERVICE_URL="http://retransmitter.default.svc.cluster.local"
 QUEUE_PROXY_PORT=8012
 FREEZE_WAIT_TIMEOUT=300
-CHECKPOINT_CLEANUP_INTERVAL="${CHECKPOINT_CLEANUP_INTERVAL:-10}"
+CHECKPOINT_CLEANUP_INTERVAL="${CHECKPOINT_CLEANUP_INTERVAL:-100}"
 
 # Optional: override Knative scale-to-zero timing for the cold start phase.
 # If set, patches config-autoscaler before cold start and restores after.
@@ -422,6 +422,42 @@ emit_result() {
 
 # ---- disk cleanup -----------------------------------------------------------
 
+# Light cleanup: checkpoint dirs + containerd checkpoint images/snapshots only.
+# No crictl rmi --prune or image re-pull (heavy I/O on eMMC).
+cleanup_node_disk_light() {
+    if [[ -z "$BENCH_NODE_NAME" ]]; then return; fi
+
+    local pod_name="bench-disk-cleanup"
+    kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    sleep 2
+
+    kubectl run "$pod_name" -n "$NAMESPACE" --restart=Never --image=busybox \
+        --overrides='{
+          "spec": {
+            "nodeName": "'"$BENCH_NODE_NAME"'",
+            "hostPID": true,
+            "tolerations": [{"operator": "Exists"}],
+            "containers": [{
+              "name": "cleanup",
+              "image": "busybox",
+              "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
+                "n=$(find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d 2>/dev/null | wc -l); find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d -exec rm -rf {} + 2>/dev/null; rm -rf /var/lib/kubelet/checkpoints/* 2>/dev/null; k3s ctr -n k8s.io images ls -q 2>/dev/null | grep '\''^containerd.io/checkpoint/'\'' | xargs -r k3s ctr -n k8s.io images rm >/dev/null 2>&1; k3s ctr -n k8s.io content prune references >/dev/null 2>&1; k3s ctr -n k8s.io snapshots ls 2>/dev/null | grep parent-view | sed \"s/ .*//\" | xargs -r -n1 k3s ctr -n k8s.io snapshots rm >/dev/null 2>&1; echo cleaned_checkpoints=$n"],
+              "securityContext": {"privileged": true}
+            }]
+          }
+        }' >/dev/null 2>&1
+    if kubectl wait pod "$pod_name" -n "$NAMESPACE" --for=jsonpath='{.status.phase}'=Succeeded --timeout=180s >/dev/null 2>&1; then
+        local result
+        result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
+        if [[ -n "$result" ]]; then
+            log "  Disk cleanup (light) on $BENCH_NODE_NAME: $result"
+        fi
+    fi
+    kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+}
+
+# Full cleanup: everything in light + crictl rmi --prune + image re-pull.
+# Use in cold start loop and final cleanup where images accumulate.
 cleanup_node_disk() {
     if [[ -z "$BENCH_NODE_NAME" ]]; then return; fi
 
@@ -617,14 +653,16 @@ for (( i=1; i<=ITERATIONS; i++ )); do
     # and before the next freeze creates a new one.
     if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
         log "  Running periodic disk cleanup on $BENCH_NODE_NAME (every ${CHECKPOINT_CLEANUP_INTERVAL} iterations)..."
-        cleanup_node_disk
+        cleanup_node_disk_light
     fi
 
     if ! wait_for_freeze "$pod" "$freeze_baseline"; then
         log "  SKIPPED: freeze failed — recycling pod..."
-        kubectl delete pod "$pod" -n "$NAMESPACE" --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
-        # Wait for Knative to create a fresh pod
-        _recycle_deadline=$((SECONDS + 120))
+        kubectl delete pod "$pod" -n "$NAMESPACE" --grace-period=0 --force >/dev/null 2>&1 || true
+        # Send a request to trigger Knative to scale up a new pod
+        send_event_internal "http://${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local" >/dev/null 2>&1 || true
+        # Wait for new pod to be Running with an IP
+        _recycle_deadline=$((SECONDS + 180))
         pod="" pod_ip=""
         while (( SECONDS < _recycle_deadline )); do
             pod=$(kubectl get pods -n "$NAMESPACE" \
@@ -639,7 +677,7 @@ for (( i=1; i<=ITERATIONS; i++ )); do
                     break
                 fi
             fi
-            sleep 3
+            sleep 5
         done
         if [[ -z "$pod" || -z "$pod_ip" ]]; then
             log "  ERROR: no new pod appeared after recycle, aborting CRIU phase"
@@ -663,6 +701,31 @@ for (( i=1; i<=ITERATIONS; i++ )); do
     if [[ "$http_code" == "422" ]]; then
         log "  Result: ${t_total}s (HTTP $http_code)"
         emit_result "criu_thaw" "$i" "$timings" "$ts_before" "$ts_after"
+    elif [[ "$http_code" == "000" ]]; then
+        log "  SKIPPED: HTTP 000 (timeout/connection refused) — pod likely dead, recycling..."
+        kubectl delete pod "$pod" -n "$NAMESPACE" --grace-period=0 --force >/dev/null 2>&1 || true
+        send_event_internal "http://${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local" >/dev/null 2>&1 || true
+        _recycle_deadline=$((SECONDS + 180))
+        pod="" pod_ip=""
+        while (( SECONDS < _recycle_deadline )); do
+            pod=$(kubectl get pods -n "$NAMESPACE" \
+                -l "serving.knative.dev/service=$SERVICE_NAME" \
+                --field-selector=status.phase=Running \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            if [[ -n "$pod" ]]; then
+                pod_ip=$(get_pod_ip "$pod")
+                if [[ -n "$pod_ip" ]]; then
+                    log "  New pod: $pod ($pod_ip)"
+                    freeze_baseline=""
+                    break
+                fi
+            fi
+            sleep 5
+        done
+        if [[ -z "$pod" || -z "$pod_ip" ]]; then
+            log "  ERROR: no new pod appeared after recycle, aborting CRIU phase"
+            break
+        fi
     else
         log "  SKIPPED: HTTP $http_code (expected 422)"
     fi
@@ -692,6 +755,11 @@ sleep 5
 
 for (( i=1; i<=ITERATIONS; i++ )); do
     log "--- Cold start iteration $i/$ITERATIONS ---"
+
+    if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
+        log "  Running periodic disk cleanup on $BENCH_NODE_NAME (every ${CHECKPOINT_CLEANUP_INTERVAL} iterations)..."
+        cleanup_node_disk
+    fi
 
     # Wait for natural scale-to-zero. Don't force-delete — that causes the
     # deployment to immediately recreate the pod, adding an extra pod lifecycle.
