@@ -16,10 +16,9 @@ spec:
   # --- Vendor-specific block ---
   service:
     freezeEnabled: true
-    freezeIdleTimeout: 5
+    #freezeIdleTimeout: 5
     nodeSelector:
-      vm-id: "worker-1"
-      #rsu-id: "rsu-b"
+      rsu-id: "rsu-a"
     container:
       image: ghcr.io/pmacoutinho/retransmitter:latest
       env:

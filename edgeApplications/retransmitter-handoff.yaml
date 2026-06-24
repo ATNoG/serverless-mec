@@ -36,6 +36,13 @@ spec:
         # Example for worker-1: '{"vm-id":"worker-1"}'
         - name: HANDOFF_NODE_SELECTOR
           value: ""
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
       securityContext:
         runAsUser: 0
     serviceAccountName: retransmitter-handoff-sa
