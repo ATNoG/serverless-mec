@@ -258,9 +258,10 @@ wait_for_freeze() {
     # Use caller-provided baseline count if available. With short idle
     # timeouts the pod can re-freeze before we start polling, so callers
     # should snapshot get_freeze_count() right after each thaw.
+    # For the first call (warmup), no baseline is provided — use 0 so
+    # that any existing freeze is detected immediately.
     if [[ -z "$prev_count" ]]; then
-        prev_count=$(kubectl logs "$FREEZE_DAEMON_POD" -n knative-serving 2>/dev/null \
-            | grep -c -F "$freeze_pattern") || prev_count=0
+        prev_count=0
     fi
 
     local start_epoch
@@ -270,8 +271,6 @@ wait_for_freeze() {
         cur_count=$(kubectl logs "$FREEZE_DAEMON_POD" -n knative-serving 2>/dev/null \
             | grep -c -F "$freeze_pattern") || cur_count=0
         if (( cur_count > prev_count )); then
-            # Checkpoint initiated. Wait for it to complete on ARM64.
-            sleep 5
             # Verify no error was logged for this checkpoint.
             local err_count
             err_count=$(kubectl logs "$FREEZE_DAEMON_POD" -n knative-serving 2>/dev/null \
@@ -280,6 +279,22 @@ wait_for_freeze() {
                 log "  WARNING: freeze daemon reported checkpoint failure"
                 return 1
             fi
+            # Wait for the fake listener to start. After CRIU checkpoint,
+            # there is a gap before the queue-proxy's fake listener binds
+            # to port 8080. Requests during this gap get "connection
+            # refused" and never trigger ApproveRequest()/thaw.
+            # Count fake listener messages to avoid matching stale logs
+            # from previous freeze cycles.
+            local _fl_deadline=$((SECONDS + 60))
+            while (( SECONDS < _fl_deadline )); do
+                local fl_count
+                fl_count=$(kubectl logs "$pod" -c queue-proxy -n "$NAMESPACE" 2>/dev/null \
+                    | grep -c "fake listener started") || fl_count=0
+                if (( fl_count >= cur_count )); then
+                    break
+                fi
+                sleep 2
+            done
             log "  Container frozen (confirmed by freeze daemon)."
             return 0
         fi
