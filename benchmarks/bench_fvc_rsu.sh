@@ -328,7 +328,6 @@ wait_for_freeze() {
             log "  Freeze not detected after 150s — restarting freeze daemon..."
             if restart_freeze_daemon; then
                 daemon_restarted=1
-                start_epoch=$(date +%s)  # reset timeout for the new daemon
                 log "  Retrying freeze detection with new daemon pod..."
             else
                 log "  WARNING: daemon restart failed, continuing to wait..."
@@ -622,7 +621,30 @@ for (( i=1; i<=ITERATIONS; i++ )); do
     fi
 
     if ! wait_for_freeze "$pod" "$freeze_baseline"; then
-        log "  SKIPPED: freeze failed"
+        log "  SKIPPED: freeze failed — recycling pod..."
+        kubectl delete pod "$pod" -n "$NAMESPACE" --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
+        # Wait for Knative to create a fresh pod
+        _recycle_deadline=$((SECONDS + 120))
+        pod="" pod_ip=""
+        while (( SECONDS < _recycle_deadline )); do
+            pod=$(kubectl get pods -n "$NAMESPACE" \
+                -l "serving.knative.dev/service=$SERVICE_NAME" \
+                --field-selector=status.phase=Running \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            if [[ -n "$pod" ]]; then
+                pod_ip=$(get_pod_ip "$pod")
+                if [[ -n "$pod_ip" ]]; then
+                    log "  New pod: $pod ($pod_ip)"
+                    freeze_baseline=""
+                    break
+                fi
+            fi
+            sleep 3
+        done
+        if [[ -z "$pod" || -z "$pod_ip" ]]; then
+            log "  ERROR: no new pod appeared after recycle, aborting CRIU phase"
+            break
+        fi
         continue
     fi
 
