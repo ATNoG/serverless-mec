@@ -158,6 +158,38 @@ resolve_bench_node() {
     log "Freeze daemon: $FREEZE_DAEMON_POD"
 }
 
+LOAD_CHECK_INTERVAL="${LOAD_CHECK_INTERVAL:-50}"
+LOAD_HIGH_THRESHOLD=7
+LOAD_LOW_THRESHOLD=4
+
+get_node_load() {
+    kubectl exec "$FREEZE_DAEMON_POD" -n knative-serving -- cat /proc/loadavg 2>/dev/null \
+        | awk '{print $1}'
+}
+
+check_load() {
+    local load
+    load=$(get_node_load)
+    [[ -z "$load" ]] && return
+    local load_int=${load%%.*}
+    if (( load_int >= LOAD_HIGH_THRESHOLD )); then
+        log "  High load on $BENCH_NODE_NAME: $load — waiting for it to drop below $LOAD_LOW_THRESHOLD..."
+        local deadline=$((SECONDS + 300))
+        while (( SECONDS < deadline )); do
+            sleep 15
+            load=$(get_node_load)
+            [[ -z "$load" ]] && continue
+            load_int=${load%%.*}
+            if (( load_int < LOAD_LOW_THRESHOLD )); then
+                log "  Load dropped to $load — resuming"
+                return
+            fi
+            log "  Load: $load — still waiting..."
+        done
+        log "  WARNING: load did not drop within 5min, continuing anyway"
+    fi
+}
+
 restart_freeze_daemon() {
     log "  Restarting freeze daemon on $BENCH_NODE_NAME..."
     kubectl delete pod "$FREEZE_DAEMON_POD" -n knative-serving --wait=true 2>/dev/null
@@ -656,6 +688,11 @@ for (( i=1; i<=ITERATIONS; i++ )); do
         cleanup_node_disk_light
     fi
 
+    # Periodic load check — pause if RSU is overloaded.
+    if (( i % LOAD_CHECK_INTERVAL == 0 )); then
+        check_load
+    fi
+
     if ! wait_for_freeze "$pod" "$freeze_baseline"; then
         log "  SKIPPED: freeze failed — recycling pod..."
         kubectl delete pod "$pod" -n "$NAMESPACE" --grace-period=0 --force >/dev/null 2>&1 || true
@@ -759,6 +796,10 @@ for (( i=1; i<=ITERATIONS; i++ )); do
     if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
         log "  Running periodic disk cleanup on $BENCH_NODE_NAME (every ${CHECKPOINT_CLEANUP_INTERVAL} iterations)..."
         cleanup_node_disk
+    fi
+
+    if (( i % LOAD_CHECK_INTERVAL == 0 )); then
+        check_load
     fi
 
     # Wait for natural scale-to-zero. Don't force-delete — that causes the
