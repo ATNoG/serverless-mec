@@ -158,6 +158,25 @@ resolve_bench_node() {
     log "Freeze daemon: $FREEZE_DAEMON_POD"
 }
 
+restart_freeze_daemon() {
+    log "  Restarting freeze daemon on $BENCH_NODE_NAME..."
+    kubectl delete pod "$FREEZE_DAEMON_POD" -n knative-serving --wait=true 2>/dev/null
+    # Wait for the DaemonSet to recreate it
+    local _deadline=$((SECONDS + 60))
+    while (( SECONDS < _deadline )); do
+        FREEZE_DAEMON_POD=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
+            | grep freeze-daemon-containerd | grep "$BENCH_NODE_NAME" \
+            | grep Running | awk '{print $1}')
+        if [[ -n "$FREEZE_DAEMON_POD" ]]; then
+            log "  Freeze daemon restarted: $FREEZE_DAEMON_POD"
+            return 0
+        fi
+        sleep 3
+    done
+    log "  ERROR: freeze daemon did not restart within 60s"
+    return 1
+}
+
 setup_curl_pod() {
     kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     sleep 3
@@ -264,7 +283,7 @@ wait_for_freeze() {
         prev_count=0
     fi
 
-    local start_epoch
+    local start_epoch daemon_restarted=0
     start_epoch=$(date +%s)
     while :; do
         local cur_count
@@ -303,6 +322,17 @@ wait_for_freeze() {
         if (( now >= FREEZE_WAIT_TIMEOUT )); then
             log "  WARNING: freeze did not happen within ${FREEZE_WAIT_TIMEOUT}s"
             return 1
+        fi
+        # If freeze hasn't happened after 150s, restart the daemon and retry.
+        if (( now >= 150 && now < 153 && !daemon_restarted )); then
+            log "  Freeze not detected after 150s — restarting freeze daemon..."
+            if restart_freeze_daemon; then
+                daemon_restarted=1
+                start_epoch=$(date +%s)  # reset timeout for the new daemon
+                log "  Retrying freeze detection with new daemon pod..."
+            else
+                log "  WARNING: daemon restart failed, continuing to wait..."
+            fi
         fi
         if (( now % 30 == 0 && now > 0 )); then
             log "  [+${now}s] still waiting for freeze..."
