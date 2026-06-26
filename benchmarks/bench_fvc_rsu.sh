@@ -9,12 +9,14 @@
 #   BENCH_NODE_SELECTOR_KEY=vm-id BENCH_NODE=worker-1 ./bench_fvc_rsu.sh [ITERATIONS] [LABEL]
 #
 # Usage:
-#   ./bench_fvc_rsu.sh [ITERATIONS] [LABEL]
+#   ./bench_fvc_rsu.sh [ITERATIONS] [LABEL] [MODE]
+#   MODE: both (default), cold_start, thaw
 
 set -uo pipefail
 
 ITERATIONS="${1:-3}"
 LABEL="${2:-}"
+BENCH_MODE="${3:-both}"
 NAMESPACE="default"
 SERVICE_NAME="retransmitter"
 EA_NAME="retransmitter"
@@ -621,6 +623,7 @@ setup_curl_pod
 
 # ---- PHASE 1: CRIU THAW ----------------------------------------------------
 
+if [[ "$BENCH_MODE" == "both" || "$BENCH_MODE" == "thaw" ]]; then
 log "=== PHASE 1: CRIU THAW ($ITERATIONS iterations) ==="
 
 delete_ea_and_wait
@@ -699,12 +702,12 @@ for (( i=1; i<=ITERATIONS; i++ )); do
         # Send a request to trigger Knative to scale up a new pod
         send_event_internal "http://${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local" >/dev/null 2>&1 || true
         # Wait for new pod to be Running with an IP
-        _recycle_deadline=$((SECONDS + 180))
+        _recycle_deadline=$((SECONDS + 300))
         pod="" pod_ip=""
         while (( SECONDS < _recycle_deadline )); do
             pod=$(kubectl get pods -n "$NAMESPACE" \
                 -l "serving.knative.dev/service=$SERVICE_NAME" \
-                --field-selector=status.phase=Running \
+                --field-selector=status.phase!=Succeeded,status.phase!=Failed \
                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
             if [[ -n "$pod" ]]; then
                 pod_ip=$(get_pod_ip "$pod")
@@ -742,12 +745,12 @@ for (( i=1; i<=ITERATIONS; i++ )); do
         log "  SKIPPED: HTTP 000 (timeout/connection refused) — pod likely dead, recycling..."
         kubectl delete pod "$pod" -n "$NAMESPACE" --grace-period=0 --force >/dev/null 2>&1 || true
         send_event_internal "http://${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local" >/dev/null 2>&1 || true
-        _recycle_deadline=$((SECONDS + 180))
+        _recycle_deadline=$((SECONDS + 300))
         pod="" pod_ip=""
         while (( SECONDS < _recycle_deadline )); do
             pod=$(kubectl get pods -n "$NAMESPACE" \
                 -l "serving.knative.dev/service=$SERVICE_NAME" \
-                --field-selector=status.phase=Running \
+                --field-selector=status.phase!=Succeeded,status.phase!=Failed \
                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
             if [[ -n "$pod" ]]; then
                 pod_ip=$(get_pod_ip "$pod")
@@ -768,8 +771,11 @@ for (( i=1; i<=ITERATIONS; i++ )); do
     fi
 done
 
+fi  # end BENCH_MODE thaw
+
 # ---- PHASE 2: COLD START ---------------------------------------------------
 
+if [[ "$BENCH_MODE" == "both" || "$BENCH_MODE" == "cold_start" ]]; then
 log ""
 log "=== PHASE 2: COLD START ($ITERATIONS iterations) ==="
 
@@ -823,6 +829,7 @@ for (( i=1; i<=ITERATIONS; i++ )); do
 done
 
 restore_scale_to_zero
+fi  # end BENCH_MODE cold_start
 
 # ---- results ----------------------------------------------------------------
 
