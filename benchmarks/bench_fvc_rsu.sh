@@ -33,13 +33,13 @@ CHECKPOINT_CLEANUP_INTERVAL="${CHECKPOINT_CLEANUP_INTERVAL:-100}"
 COLD_START_SCALE_TO_ZERO="${COLD_START_SCALE_TO_ZERO:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-OUTDIR="$SCRIPT_DIR/freeze_vs_coldstart_logs"
+OUTDIR="$SCRIPT_DIR/freeze_vs_coldstart_rsu_logs"
 mkdir -p "$OUTDIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 if [[ -n "$LABEL" ]]; then
-    OUTFILE="$OUTDIR/freeze_vs_coldstart_${LABEL}_${TIMESTAMP}.ndjson"
+    OUTFILE="$OUTDIR/freeze_vs_coldstart_rsu_${LABEL}_${TIMESTAMP}.ndjson"
 else
-    OUTFILE="$OUTDIR/freeze_vs_coldstart_${TIMESTAMP}.ndjson"
+    OUTFILE="$OUTDIR/freeze_vs_coldstart_rsu_${TIMESTAMP}.ndjson"
 fi
 
 BENCH_NODE_NAME=""
@@ -698,6 +698,7 @@ for (( i=1; i<=ITERATIONS; i++ )); do
 
     if ! wait_for_freeze "$pod" "$freeze_baseline"; then
         log "  SKIPPED: freeze failed — recycling pod..."
+        _old_pod="$pod"
         kubectl delete pod "$pod" -n "$NAMESPACE" --grace-period=0 --force >/dev/null 2>&1 || true
         # Send a request to trigger Knative to scale up a new pod
         send_event_internal "http://${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local" >/dev/null 2>&1 || true
@@ -709,7 +710,7 @@ for (( i=1; i<=ITERATIONS; i++ )); do
                 -l "serving.knative.dev/service=$SERVICE_NAME" \
                 --field-selector=status.phase!=Succeeded,status.phase!=Failed \
                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-            if [[ -n "$pod" ]]; then
+            if [[ -n "$pod" && "$pod" != "$_old_pod" ]]; then
                 pod_ip=$(get_pod_ip "$pod")
                 if [[ -n "$pod_ip" ]]; then
                     log "  New pod: $pod ($pod_ip)"
@@ -743,6 +744,7 @@ for (( i=1; i<=ITERATIONS; i++ )); do
         emit_result "criu_thaw" "$i" "$timings" "$ts_before" "$ts_after"
     elif [[ "$http_code" == "000" ]]; then
         log "  SKIPPED: HTTP 000 (timeout/connection refused) — pod likely dead, recycling..."
+        _old_pod="$pod"
         kubectl delete pod "$pod" -n "$NAMESPACE" --grace-period=0 --force >/dev/null 2>&1 || true
         send_event_internal "http://${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local" >/dev/null 2>&1 || true
         _recycle_deadline=$((SECONDS + 300))
@@ -752,7 +754,7 @@ for (( i=1; i<=ITERATIONS; i++ )); do
                 -l "serving.knative.dev/service=$SERVICE_NAME" \
                 --field-selector=status.phase!=Succeeded,status.phase!=Failed \
                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-            if [[ -n "$pod" ]]; then
+            if [[ -n "$pod" && "$pod" != "$_old_pod" ]]; then
                 pod_ip=$(get_pod_ip "$pod")
                 if [[ -n "$pod_ip" ]]; then
                     log "  New pod: $pod ($pod_ip)"
