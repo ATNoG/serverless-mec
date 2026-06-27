@@ -53,7 +53,7 @@ SCENARIO=${SCENARIO:-"all"}
 
 HANDOFF_CR_PREFIX="${EA_NAME}-to-"
 HANDOFF_POLL_TIMEOUT=600  # seconds
-CHECKPOINT_CLEANUP_INTERVAL="${CHECKPOINT_CLEANUP_INTERVAL:-10}"
+CHECKPOINT_CLEANUP_INTERVAL="${CHECKPOINT_CLEANUP_INTERVAL:-100}"
 
 QUEUE_PROXY_PORT=8012
 FREEZE_WAIT_TIMEOUT=300
@@ -768,6 +768,49 @@ cleanup_node_disk() {
     kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
 }
 
+cleanup_node_disk_light() {
+    # Light cleanup: checkpoint dirs + containerd checkpoint images/snapshots only.
+    # Does NOT run crictl rmi --prune or image re-pull (heavy eMMC I/O that can
+    # kill frozen pods). Safe to use during freeze iterations.
+    local node_name="${1:-$BENCH_NODE_NAME}"
+    if [[ -z "$node_name" ]]; then return; fi
+
+    local pod_name="bench-disk-cleanup-$(echo "$node_name" | cut -d- -f1)"
+    kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    sleep 2
+
+    kubectl run "$pod_name" -n "$NAMESPACE" --restart=Never --image=busybox \
+        --overrides='{
+          "spec": {
+            "nodeName": "'"$node_name"'",
+            "hostPID": true,
+            "tolerations": [{"operator": "Exists"}],
+            "containers": [{
+              "name": "cleanup",
+              "image": "busybox",
+              "command": ["nsenter", "-t", "1", "-m", "--", "sh", "-c",
+                "n=$(find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d 2>/dev/null | wc -l); find /tmp -maxdepth 1 -name \"ctrd-checkpoint*\" -type d -exec rm -rf {} + 2>/dev/null; rm -rf /var/lib/kubelet/checkpoints/* 2>/dev/null; k3s ctr -n k8s.io images ls -q 2>/dev/null | grep '\''^containerd.io/checkpoint/'\'' | xargs -r k3s ctr -n k8s.io images rm >/dev/null 2>&1; k3s ctr -n k8s.io content prune references >/dev/null 2>&1; k3s ctr -n k8s.io snapshots ls 2>/dev/null | grep parent-view | sed \"s/ .*//\" | xargs -r -n1 k3s ctr -n k8s.io snapshots rm >/dev/null 2>&1; echo cleaned_checkpoints=$n"],
+              "securityContext": {"privileged": true}
+            }]
+          }
+        }' >/dev/null 2>&1
+    local _cleanup_deadline=$((SECONDS + 180))
+    while (( SECONDS < _cleanup_deadline )); do
+        local _cleanup_phase
+        _cleanup_phase=$(kubectl get pod "$pod_name" -n "$NAMESPACE" \
+            -o jsonpath='{.status.phase}' 2>/dev/null)
+        [[ -z "$_cleanup_phase" ]] && break
+        [[ "$_cleanup_phase" == "Succeeded" || "$_cleanup_phase" == "Failed" ]] && break
+        sleep 2
+    done
+    local result
+    result=$(kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -1)
+    if [[ -n "$result" && "$result" != "cleaned_checkpoints=0" ]]; then
+        log "  Disk cleanup (light) on $node_name: $result"
+    fi
+    kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+}
+
 # ---- EA patching -----------------------------------------------------------
 
 patch_ea() {
@@ -1197,30 +1240,64 @@ EOF
         delete_handoff_cr "$handoff_target"
 
         # Clean up old CRIU checkpoint blobs between thaw and re-freeze.
-        # After Resume(), the daemon deletes the checkpoint reference, so
-        # there is no active checkpoint to protect at this point. Cleaning
-        # BEFORE the next freeze ensures the new checkpoint is not deleted.
+        # Uses light cleanup (no crictl rmi --prune) to avoid killing the frozen pod.
         if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
-            log "  Running periodic disk cleanup on $target_node_name (every ${CHECKPOINT_CLEANUP_INTERVAL} iterations)..."
-            cleanup_node_disk "$target_node_name"
+            log "  Running periodic disk cleanup (light) on $target_node_name (every ${CHECKPOINT_CLEANUP_INTERVAL} iterations)..."
+            cleanup_node_disk_light "$target_node_name"
         fi
 
         # Wait for the target to re-freeze before triggering the next handoff.
         # After the previous iteration's thaw, the pod goes idle and re-freezes
-        # via the idle timeout. Use --since-time to ignore stale freeze log lines
-        # from previous cycles.
+        # via the idle timeout.
         local target_pod
         target_pod=$(kubectl get pods -n "$NAMESPACE" \
             -l "serving.knative.dev/service=$target_svc" \
             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
         if [[ -z "$target_pod" ]]; then
-            log "  SKIPPED: no target pod found"
-            continue
-        fi
-        log "  Waiting for target to re-freeze ($target_pod)..."
-        if ! wait_for_target_freeze "$target_pod" "$target_freeze_daemon" "$freeze_baseline"; then
-            log "  SKIPPED: target did not re-freeze"
-            continue
+            # Target pod disappeared — re-prime the target KService
+            log "  WARNING: target pod gone, re-priming target KService..."
+            delete_handoff_cr "$handoff_target"
+            kubectl delete ksvc "$target_svc" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+            kubectl wait pods -n "$NAMESPACE" \
+                -l "serving.knative.dev/service=$target_svc" \
+                --for=delete --timeout=90s >/dev/null 2>&1 || true
+            local _reprime_cr
+            _reprime_cr=$(_build_handoff_cr "$handoff_target" "false" "$handoff_node_selector")
+            if ! kubectl_apply_retry "$_reprime_cr"; then
+                log "  SKIPPED: failed to re-prime target"
+                continue
+            fi
+            local _reprime_deadline=$((SECONDS + 300))
+            local _reprime_ok=false
+            while (( SECONDS < _reprime_deadline )); do
+                target_pod=$(kubectl get pods -n "$NAMESPACE" \
+                    -l "serving.knative.dev/service=$target_svc" \
+                    --field-selector=status.phase!=Succeeded,status.phase!=Failed \
+                    --sort-by=.metadata.creationTimestamp \
+                    -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+                if [[ -n "$target_pod" ]]; then
+                    log "  Re-primed target pod: $target_pod — waiting for freeze..."
+                    if wait_for_target_freeze "$target_pod" "$target_freeze_daemon"; then
+                        _reprime_ok=true
+                        freeze_baseline=$(get_target_freeze_count "$target_pod" "$target_freeze_daemon")
+                        break
+                    fi
+                fi
+                sleep 2
+            done
+            delete_handoff_cr "$handoff_target"
+            if [[ "$_reprime_ok" != "true" ]]; then
+                log "  SKIPPED: failed to re-prime and freeze target"
+                continue
+            fi
+            log "  Target re-primed and frozen — resuming iterations"
+            # Fall through to the measured handoff below
+        else
+            log "  Waiting for target to re-freeze ($target_pod)..."
+            if ! wait_for_target_freeze "$target_pod" "$target_freeze_daemon" "$freeze_baseline"; then
+                log "  SKIPPED: target did not re-freeze"
+                continue
+            fi
         fi
         log "  Container frozen (confirmed by freeze daemon)."
 
