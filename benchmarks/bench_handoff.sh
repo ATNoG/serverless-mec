@@ -504,14 +504,17 @@ get_target_freeze_count() {
         | grep -c -F "pause request received, freezing pod: ${NAMESPACE}/${pod}" || echo 0
 }
 
+_TARGET_FREEZE_DAEMON=""  # set by caller, updated by wait_for_target_freeze on daemon restart
+
 wait_for_target_freeze() {
     local pod="$1"
-    local freeze_daemon_pod="${2:-}"
-    local prev_count="${3:-}"
+    local prev_count="${2:-}"
+    local target_node_name="${3:-}"
+    local _daemon_restarted=0
     log "  Waiting for freezer to checkpoint target pod $pod..."
 
-    if [[ -z "$freeze_daemon_pod" ]]; then
-        log "  ERROR: freeze daemon pod not provided"
+    if [[ -z "$_TARGET_FREEZE_DAEMON" ]]; then
+        log "  ERROR: _TARGET_FREEZE_DAEMON not set"
         return 1
     fi
 
@@ -525,7 +528,7 @@ wait_for_target_freeze() {
     # Use caller-provided baseline count if available. With short idle
     # timeouts the pod can re-freeze before we start polling.
     if [[ -z "$prev_count" ]]; then
-        prev_count=$(kubectl logs "$freeze_daemon_pod" -n knative-serving 2>/dev/null \
+        prev_count=$(kubectl logs "$_TARGET_FREEZE_DAEMON" -n knative-serving 2>/dev/null \
             | grep -c -F "$freeze_pattern") || prev_count=0
     fi
 
@@ -534,14 +537,14 @@ wait_for_target_freeze() {
     local last_diag_epoch=$start_epoch
     while :; do
         local cur_count
-        cur_count=$(kubectl logs "$freeze_daemon_pod" -n knative-serving 2>/dev/null \
+        cur_count=$(kubectl logs "$_TARGET_FREEZE_DAEMON" -n knative-serving 2>/dev/null \
             | grep -c -F "$freeze_pattern") || cur_count=0
         if (( cur_count > prev_count )); then
             # Checkpoint initiated. Wait for it to complete on ARM64.
             sleep 5
             # Verify no error was logged for this checkpoint.
             local err_count
-            err_count=$(kubectl logs "$freeze_daemon_pod" -n knative-serving 2>/dev/null \
+            err_count=$(kubectl logs "$_TARGET_FREEZE_DAEMON" -n knative-serving 2>/dev/null \
                 | grep -c -F "$error_pattern") || err_count=0
             if (( err_count >= cur_count )); then
                 log "  WARNING: freeze daemon reported checkpoint failure"
@@ -564,6 +567,28 @@ wait_for_target_freeze() {
         if (( elapsed >= FREEZE_WAIT_TIMEOUT )); then
             log "  WARNING: freezer did not checkpoint within ${FREEZE_WAIT_TIMEOUT}s"
             return 1
+        fi
+
+        # If freeze hasn't happened after 150s, restart the daemon and retry.
+        if (( elapsed >= 150 && elapsed < 153 && !_daemon_restarted )); then
+            log "  Freeze not detected after 150s — restarting freeze daemon..."
+            kubectl delete pod "$_TARGET_FREEZE_DAEMON" -n knative-serving --wait=true 2>/dev/null || true
+            local _rd_deadline=$((SECONDS + 60))
+            while (( SECONDS < _rd_deadline )); do
+                _TARGET_FREEZE_DAEMON=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
+                    | grep freeze-daemon-containerd | grep "$target_node_name" \
+                    | grep Running | awk '{print $1}')
+                if [[ -n "$_TARGET_FREEZE_DAEMON" ]]; then
+                    log "  Freeze daemon restarted: $_TARGET_FREEZE_DAEMON"
+                    _daemon_restarted=1
+                    prev_count=0
+                    break
+                fi
+                sleep 3
+            done
+            if [[ -z "$_TARGET_FREEZE_DAEMON" ]]; then
+                log "  WARNING: daemon restart failed, continuing to wait..."
+            fi
         fi
 
         if (( now - last_diag_epoch >= 30 )); then
@@ -1098,13 +1123,12 @@ run_freeze_scenario() {
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
     # Find the freeze daemon pod on the target node for freeze detection
-    local target_freeze_daemon
-    target_freeze_daemon=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
+    _TARGET_FREEZE_DAEMON=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
         | grep freeze-daemon-containerd | grep "$target_node_name" | awk '{print $1}')
 
     log "=== SCENARIO: $scenario_name ($iterations iterations) ==="
     log "  Measures full handoff latency with CRIU-frozen target"
-    log "  Target KService: $target_svc (node: $target_node_name, daemon: $target_freeze_daemon)"
+    log "  Target KService: $target_svc (node: $target_node_name, daemon: $_TARGET_FREEZE_DAEMON)"
 
     # Step 1: Patch EA — freeze=true, clear triggerFilters.
     # triggerFilters must be empty to prevent the broker from dispatching
@@ -1205,7 +1229,7 @@ EOF
             continue
         fi
         log "  Target pod: $warmup_pod — waiting for freeze..."
-        if wait_for_target_freeze "$warmup_pod" "$target_freeze_daemon"; then
+        if wait_for_target_freeze "$warmup_pod" "" "$target_node_name"; then
             freeze_ok=true
             break
         fi
@@ -1277,9 +1301,9 @@ EOF
                     -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
                 if [[ -n "$target_pod" ]]; then
                     log "  Re-primed target pod: $target_pod — waiting for freeze..."
-                    if wait_for_target_freeze "$target_pod" "$target_freeze_daemon"; then
+                    if wait_for_target_freeze "$target_pod" "" "$target_node_name"; then
                         _reprime_ok=true
-                        freeze_baseline=$(get_target_freeze_count "$target_pod" "$target_freeze_daemon")
+                        freeze_baseline=$(get_target_freeze_count "$target_pod" "$_TARGET_FREEZE_DAEMON")
                         break
                     fi
                 fi
@@ -1294,7 +1318,7 @@ EOF
             # Fall through to the measured handoff below
         else
             log "  Waiting for target to re-freeze ($target_pod)..."
-            if ! wait_for_target_freeze "$target_pod" "$target_freeze_daemon" "$freeze_baseline"; then
+            if ! wait_for_target_freeze "$target_pod" "$freeze_baseline" "$target_node_name"; then
                 log "  SKIPPED: target did not re-freeze"
                 continue
             fi
@@ -1310,7 +1334,7 @@ EOF
 
         # Snapshot freeze count BEFORE thaw. After the thaw the pod re-freezes
         # quickly (short idle timeout), so snapshotting after would race.
-        freeze_baseline=$(get_target_freeze_count "$target_pod" "$target_freeze_daemon")
+        freeze_baseline=$(get_target_freeze_count "$target_pod" "$_TARGET_FREEZE_DAEMON")
 
         local _cr_yaml
         _cr_yaml=$(cat <<EOF
