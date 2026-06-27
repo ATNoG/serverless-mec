@@ -572,13 +572,15 @@ wait_for_target_freeze() {
         # If freeze hasn't happened after 150s, restart the daemon and retry.
         if (( elapsed >= 150 && elapsed < 153 && !_daemon_restarted )); then
             log "  Freeze not detected after 150s — restarting freeze daemon..."
+            local _old_daemon="$_TARGET_FREEZE_DAEMON"
             kubectl delete pod "$_TARGET_FREEZE_DAEMON" -n knative-serving --wait=true 2>/dev/null || true
-            local _rd_deadline=$((SECONDS + 60))
+            local _rd_deadline=$((SECONDS + 120)) _new_daemon=""
             while (( SECONDS < _rd_deadline )); do
-                _TARGET_FREEZE_DAEMON=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
+                _new_daemon=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
                     | grep freeze-daemon-containerd | grep "$target_node_name" \
                     | grep Running | awk '{print $1}')
-                if [[ -n "$_TARGET_FREEZE_DAEMON" ]]; then
+                if [[ -n "$_new_daemon" && "$_new_daemon" != "$_old_daemon" ]]; then
+                    _TARGET_FREEZE_DAEMON="$_new_daemon"
                     log "  Freeze daemon restarted: $_TARGET_FREEZE_DAEMON"
                     _daemon_restarted=1
                     prev_count=0
@@ -586,7 +588,7 @@ wait_for_target_freeze() {
                 fi
                 sleep 3
             done
-            if [[ -z "$_TARGET_FREEZE_DAEMON" ]]; then
+            if (( !_daemon_restarted )); then
                 log "  WARNING: daemon restart failed, continuing to wait..."
             fi
         fi
@@ -1246,6 +1248,8 @@ EOF
     fi
     log "  Target frozen — starting measured iterations"
 
+    local _consec_freeze_fails=0
+
     # Step 5: Run measured iterations.
     # The target pod is already frozen from warmup. Each iteration triggers
     # a handoff (CRIU thaw), measures the latency, then waits for the pod
@@ -1258,6 +1262,20 @@ EOF
         if ! wait_for_operator; then
             log "  SKIPPED: operator not ready"
             continue
+        fi
+
+        # Re-resolve freeze daemon if it was lost (e.g. after a failed restart)
+        if [[ -z "$_TARGET_FREEZE_DAEMON" ]]; then
+            log "  Re-resolving freeze daemon on $target_node_name..."
+            _TARGET_FREEZE_DAEMON=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
+                | grep freeze-daemon-containerd | grep "$target_node_name" \
+                | grep Running | awk '{print $1}')
+            if [[ -n "$_TARGET_FREEZE_DAEMON" ]]; then
+                log "  Freeze daemon found: $_TARGET_FREEZE_DAEMON"
+            else
+                log "  SKIPPED: freeze daemon not found on $target_node_name"
+                continue
+            fi
         fi
 
         # Delete handoff CR from previous iteration (KService survives)
@@ -1277,10 +1295,11 @@ EOF
         target_pod=$(kubectl get pods -n "$NAMESPACE" \
             -l "serving.knative.dev/service=$target_svc" \
             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-        if [[ -z "$target_pod" ]]; then
-            # Target pod disappeared — re-prime the target KService
-            log "  WARNING: target pod gone, re-priming target KService..."
+        # Helper: recycle the target pod and re-prime the KService
+        _reprime_target() {
+            log "  Recycling target — deleting pod and re-priming KService..."
             delete_handoff_cr "$handoff_target"
+            kubectl delete pod "$target_pod" -n "$NAMESPACE" --grace-period=0 --force >/dev/null 2>&1 || true
             kubectl delete ksvc "$target_svc" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
             kubectl wait pods -n "$NAMESPACE" \
                 -l "serving.knative.dev/service=$target_svc" \
@@ -1288,11 +1307,9 @@ EOF
             local _reprime_cr
             _reprime_cr=$(_build_handoff_cr "$handoff_target" "false" "$handoff_node_selector")
             if ! kubectl_apply_retry "$_reprime_cr"; then
-                log "  SKIPPED: failed to re-prime target"
-                continue
+                return 1
             fi
             local _reprime_deadline=$((SECONDS + 300))
-            local _reprime_ok=false
             while (( SECONDS < _reprime_deadline )); do
                 target_pod=$(kubectl get pods -n "$NAMESPACE" \
                     -l "serving.knative.dev/service=$target_svc" \
@@ -1302,26 +1319,42 @@ EOF
                 if [[ -n "$target_pod" ]]; then
                     log "  Re-primed target pod: $target_pod — waiting for freeze..."
                     if wait_for_target_freeze "$target_pod" "" "$target_node_name"; then
-                        _reprime_ok=true
                         freeze_baseline=$(get_target_freeze_count "$target_pod" "$_TARGET_FREEZE_DAEMON")
-                        break
+                        delete_handoff_cr "$handoff_target"
+                        _consec_freeze_fails=0
+                        return 0
                     fi
                 fi
                 sleep 2
             done
             delete_handoff_cr "$handoff_target"
-            if [[ "$_reprime_ok" != "true" ]]; then
+            return 1
+        }
+
+        if [[ -z "$target_pod" ]]; then
+            log "  WARNING: target pod gone, re-priming..."
+            if ! _reprime_target; then
                 log "  SKIPPED: failed to re-prime and freeze target"
                 continue
             fi
             log "  Target re-primed and frozen — resuming iterations"
-            # Fall through to the measured handoff below
         else
             log "  Waiting for target to re-freeze ($target_pod)..."
             if ! wait_for_target_freeze "$target_pod" "$freeze_baseline" "$target_node_name"; then
-                log "  SKIPPED: target did not re-freeze"
+                (( _consec_freeze_fails++ ))
+                if (( _consec_freeze_fails >= 2 )); then
+                    log "  $_consec_freeze_fails consecutive freeze failures — recycling pod..."
+                    if _reprime_target; then
+                        log "  Target recycled and frozen — resuming iterations"
+                    else
+                        log "  SKIPPED: failed to recycle target"
+                    fi
+                else
+                    log "  SKIPPED: target did not re-freeze ($_consec_freeze_fails consecutive)"
+                fi
                 continue
             fi
+            _consec_freeze_fails=0
         fi
         log "  Container frozen (confirmed by freeze daemon)."
 
