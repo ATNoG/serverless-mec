@@ -386,50 +386,40 @@ func (r *EdgeApplicationHandoffReconciler) ensureTargetThawed(ctx context.Contex
 			continue
 		}
 
-		for _, cs := range pod.Status.ContainerStatuses {
-			if cs.Name != "user-container" {
-				continue
-			}
-			if cs.State.Terminated == nil {
-				// user-container is running — not frozen
-				return true, nil
-			}
-
-			// user-container is terminated (frozen by CRIU checkpoint).
-			// Send a request to the queue-proxy to trigger thaw.
-			logger.Info("Thawing frozen target pod", "pod", pod.Name, "podIP", pod.Status.PodIP)
-			if ho.Status.Timestamps.ThawStarted == nil {
-				ho.Status.Timestamps.ThawStarted = microNow()
-			}
-
-			thawURL := fmt.Sprintf("http://%s:%d", pod.Status.PodIP, queueProxyPort)
-			httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, thawURL, nil)
-			if err != nil {
-				return false, err
-			}
-
-			httpClient := &http.Client{Timeout: 30 * time.Second}
-			resp, err := httpClient.Do(httpReq)
-			if err != nil {
-				return false, fmt.Errorf("thaw request to pod %s failed: %w", pod.Name, err)
-			}
-			resp.Body.Close()
-
-			if ho.Status.Timestamps.ThawCompleted == nil {
-				ho.Status.Timestamps.ThawCompleted = microNow()
-			}
-
-			logger.Info("Thaw request completed", "pod", pod.Name, "status", resp.StatusCode)
-			// Any HTTP response means queue-proxy processed the request,
-			// so the freezer plugin's ApproveRequest() already triggered
-			// the CRIU restore. The Kubernetes API may not update the
-			// container status from Terminated→Running after CRIU restore,
-			// so we trust the HTTP response and consider the pod thawed.
-			return true, nil
+		// Always send a request through the queue-proxy when freeze is
+		// enabled.  We cannot rely on container Terminated status to
+		// detect a CRIU-frozen container because kubelet may not have
+		// observed the process exit yet (the fake listener keeps
+		// readiness probes passing).  The queue-proxy plugin handles
+		// both cases: if the container is frozen it restores it; if
+		// already running it simply forwards the request as a no-op.
+		logger.Info("Thawing target pod", "pod", pod.Name, "podIP", pod.Status.PodIP)
+		if ho.Status.Timestamps.ThawStarted == nil {
+			ho.Status.Timestamps.ThawStarted = microNow()
 		}
+
+		thawURL := fmt.Sprintf("http://%s:%d", pod.Status.PodIP, queueProxyPort)
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, thawURL, nil)
+		if err != nil {
+			return false, err
+		}
+
+		httpClient := &http.Client{Timeout: 30 * time.Second}
+		resp, err := httpClient.Do(httpReq)
+		if err != nil {
+			return false, fmt.Errorf("thaw request to pod %s failed: %w", pod.Name, err)
+		}
+		resp.Body.Close()
+
+		if ho.Status.Timestamps.ThawCompleted == nil {
+			ho.Status.Timestamps.ThawCompleted = microNow()
+		}
+
+		logger.Info("Thaw request completed", "pod", pod.Name, "status", resp.StatusCode)
+		return true, nil
 	}
 
-	// No pods found with a terminated user-container — assume not frozen
+	// No running pods found — nothing to thaw
 	return true, nil
 }
 
