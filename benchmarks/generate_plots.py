@@ -48,63 +48,80 @@ def se(data):
 
 
 # ── 1. Checkpoint/Restore vs Cold Start Box Plot ──
-# Ordered worst to best (cold start first)
+# Shows VM and RSU results side by side, ordered worst to best
 def plot_freeze_vs_coldstart():
-    files = sorted(glob.glob(f'{BENCH_DIR}/freeze_vs_coldstart_logs/*.ndjson'))
-    thaw_ttfb, cold_ttfb = [], []
-    for f in files:
+    # VM data
+    vm_thaw, vm_cold = [], []
+    for f in sorted(glob.glob(f'{BENCH_DIR}/freeze_vs_coldstart_logs/*.ndjson')):
         with open(f) as fh:
             for line in fh:
                 d = json.loads(line)
                 if d.get('mode') == 'criu_thaw' and 't_ttfb_s' in d:
-                    thaw_ttfb.append(d['t_ttfb_s'] * 1000)
+                    vm_thaw.append(d['t_ttfb_s'] * 1000)
                 elif d.get('mode') == 'cold_start' and 't_ttfb_s' in d:
-                    cold_ttfb.append(d['t_ttfb_s'] * 1000)
+                    vm_cold.append(d['t_ttfb_s'] * 1000)
 
-    thaw_f = sigma2_filter(thaw_ttfb)[:2000]
-    cold_f = sigma2_filter(cold_ttfb)[:2000]
+    # RSU data
+    rsu_thaw, rsu_cold = [], []
+    for f in sorted(glob.glob(f'{BENCH_DIR}/freeze_vs_coldstart_rsu_logs/*.ndjson')):
+        with open(f) as fh:
+            for line in fh:
+                d = json.loads(line)
+                if d.get('mode') == 'criu_thaw' and 't_ttfb_s' in d:
+                    rsu_thaw.append(d['t_ttfb_s'] * 1000)
+                elif d.get('mode') == 'cold_start' and 't_ttfb_s' in d:
+                    rsu_cold.append(d['t_ttfb_s'] * 1000)
 
-    thaw_mean = np.mean(thaw_f)
-    cold_mean = np.mean(cold_f)
-    thaw_se = se(thaw_f)
-    cold_se = se(cold_f)
+    vm_cold_f = sigma2_filter(vm_cold)[:2000]
+    vm_thaw_f = sigma2_filter(vm_thaw)[:2000]
+    rsu_cold_f = sigma2_filter(rsu_cold)[:1000]
+    rsu_thaw_f = sigma2_filter(rsu_thaw)[:1000]
 
-    # Order: worst to best (cold start, then checkpoint restore)
+    # Grouped by platform: VM first, then RSU
+    all_data = [vm_cold_f, vm_thaw_f, rsu_cold_f, rsu_thaw_f]
+    all_labels = ['VM\nCold Start', 'VM\nCheckpoint', 'RSU\nCold Start', 'RSU\nCheckpoint']
+    all_colors = [palette[2], palette[4], palette[1], palette[0]]
+
     fig, ax = plt.subplots(figsize=(COL_WIDTH, 2.4))
-    bp = ax.boxplot([cold_f, thaw_f],
-                    tick_labels=['Cold Start', 'Checkpoint\nRestore'],
+    bp = ax.boxplot(all_data,
+                    tick_labels=all_labels,
                     widths=0.5,
                     patch_artist=True,
                     medianprops=dict(color='black', linewidth=1.5),
                     flierprops=dict(marker='.', markersize=3, alpha=0.5))
-    bp['boxes'][0].set_facecolor(palette[1])
-    bp['boxes'][1].set_facecolor(palette[0])
+    for i, patch in enumerate(bp['boxes']):
+        patch.set_facecolor(all_colors[i])
 
-    # Cold start: right side, at ~80% of the worst result height
-    cold_max = max(cold_f)
     fs_fvc = ANNOT_SIZE * 1.1
-    ax.annotate(f'{cold_mean:.0f} $\\pm$ {cold_se:.2f} ms',
-                xy=(1.3, cold_max * 0.80), xytext=(-20, 0), textcoords='offset points',
-                fontsize=fs_fvc, ha='left', va='center')
-    # Checkpoint: directly above the worst result
-    ax.annotate(f'{thaw_mean:.0f} $\\pm$ {thaw_se:.2f} ms',
-                xy=(2, max(thaw_f)),
-                xytext=(0, 10), textcoords='offset points',
-                fontsize=fs_fvc, ha='center')
+    # (anchor, xoff, yoff): 'top' anchors to max(d), 'bot' anchors to min(d)
+    annot_cfg = [('top', 13, 8), ('top', 0, 20), ('bot', 0, -10), ('bot', -15, -2)]
+    for i, d in enumerate(all_data):
+        mean = np.mean(d)
+        s = se(d)
+        anchor, xoff, yoff = annot_cfg[i]
+        y_anchor = max(d) if anchor == 'top' else min(d)
+        va = 'bottom' if anchor == 'top' else 'top'
+        ax.annotate(f'{mean:.0f} $\\pm$ {s:.2f} ms',
+                    xy=(i + 1, y_anchor),
+                    xytext=(xoff, yoff), textcoords='offset points',
+                    fontsize=fs_fvc, ha='center', va=va)
 
-    ymax = max(max(cold_f), max(thaw_f))
-    ax.set_ylim(top=ymax * 1.12)
+    ymax = max(max(d) for d in all_data)
+    ax.set_ylim(top=ymax * 1.15)
     ax.set_ylabel('TTFB (ms)', fontsize=fs_fvc)
     ax.tick_params(axis='both', labelsize=fs_fvc)
     ax.grid(axis='y', alpha=0.3)
-    ax.text(0.99, 0.99, 'Labels report mean ± standard error',
+    ax.text(0.01, 0.99, 'Labels report mean ± standard error',
             transform=ax.transAxes, fontsize=BASE_FONT * 0.85,
-            ha='right', va='top', style='italic', color='0.4')
+            ha='left', va='top', style='italic', color='0.4')
     fig.savefig(f'{FIGURES_DIR}/freeze_vs_coldstart.pdf')
     plt.close()
-    print(f'Cold Start:         n={len(cold_f)}, mean={cold_mean:.0f}ms, se={cold_se:.1f}ms')
-    print(f'Checkpoint/Restore: n={len(thaw_f)}, mean={thaw_mean:.0f}ms, se={thaw_se:.1f}ms')
-    print(f'Speedup: {cold_mean/thaw_mean:.1f}x')
+
+    for label, d in zip(all_labels, all_data):
+        l = label.replace('\n', ' ')
+        print(f'{l:20s}: n={len(d)}, mean={np.mean(d):.0f}ms, se={se(d):.1f}ms')
+    print(f'VM Speedup:  {np.mean(vm_cold_f)/np.mean(vm_thaw_f):.1f}x')
+    print(f'RSU Speedup: {np.mean(rsu_cold_f)/np.mean(rsu_thaw_f):.1f}x')
 
 
 # ── 2. Pipeline Latency Stage Boxplot ──
@@ -199,11 +216,14 @@ def plot_pipeline():
         print(f'Pipeline {label}: n={len(d)}, mean={np.mean(d):.1f}ms, se={se(d):.2f}ms')
 
 
-# ── 3. Handoff Box Plot ──
-# Ordered worst to best
+# ── 3. Migration Box Plot ──
+# 4 scenarios: RSU cold + ckpt, VM cold + ckpt (worst to best)
 def plot_handoff():
     files = sorted(glob.glob(f'{BENCH_DIR}/handoff_bench_logs/*.ndjson') +
                     glob.glob(f'{BENCH_DIR}/handoff_bench_logs/old_metrics/*.ndjson'))
+    # For RSU scenarios, only use recent samples (last 3 days) to match
+    # the current testbed configuration.
+    RSU_DATE_CUTOFF = '2026-06-26'
     scenarios = {}
     for f in files:
         with open(f) as fh:
@@ -211,42 +231,47 @@ def plot_handoff():
                 d = json.loads(line)
                 if d.get('handoff_phase') == 'Ready' and 'handoff_wall_ms' in d:
                     sc = d.get('scenario', 'unknown')
+                    if sc.startswith('rsu-'):
+                        ts = d.get('ts_before', '')
+                        if ts < RSU_DATE_CUTOFF:
+                            continue
                     scenarios.setdefault(sc, []).append(d['handoff_wall_ms'])
 
     labels_map = {
-        'rsu-a-coldstart': 'RSU→RSU\nCold',
-        'worker1-coldstart': 'VM→VM\nCold',
-        'worker2-coldstart': 'RSU→VM\nCold',
-        'worker1-freeze': 'VM→VM\nCkpt',
-        'worker2-freeze': 'RSU→VM\nCkpt',
+        'rsu-a-coldstart': 'RSU\nCold Start',
+        'rsu-a-freeze': 'RSU\nCheckpoint',
+        'worker1-coldstart': 'VM\nCold Start',
+        'worker1-freeze': 'VM\nCheckpoint',
     }
-    # Worst to best
-    order = ['rsu-a-coldstart', 'worker1-coldstart', 'worker2-coldstart', 'worker1-freeze', 'worker2-freeze']
+    # Grouped by platform: VM first, then RSU
+    order = ['worker1-coldstart', 'worker1-freeze', 'rsu-a-coldstart', 'rsu-a-freeze']
+    colors = [palette[2], palette[4], palette[1], palette[0]]
     data = []
     labels = []
     stats = []
     for sc in order:
         if sc in scenarios:
-            filt = [x / 1000 for x in sigma2_filter(scenarios[sc])][:1000]
+            raw = scenarios[sc]
+            cap = 500 if sc.startswith('rsu-') else 1000
+            filt = [x / 1000 for x in sigma2_filter(raw)][:cap]
             data.append(filt)
             labels.append(labels_map.get(sc, sc))
             mean = np.mean(filt)
             s = se(filt)
             stats.append((mean, s))
-            print(f'Handoff {sc}: n={len(filt)}, mean={mean:.1f}s, se={s:.2f}s')
+            print(f'Migration {sc}: n={len(filt)}, mean={mean:.1f}s, se={s:.2f}s')
 
     fig, ax = plt.subplots(figsize=(COL_WIDTH, 2.4))
     bp = ax.boxplot(data, tick_labels=labels, widths=0.5, patch_artist=True,
                     medianprops=dict(color='black', linewidth=1.5),
                     flierprops=dict(marker='.', markersize=3, alpha=0.5))
     for i, patch in enumerate(bp['boxes']):
-        patch.set_facecolor(palette[i])
+        patch.set_facecolor(colors[i])
 
     ax.tick_params(axis='y', labelsize=BASE_FONT)
     ax.tick_params(axis='x', labelsize=BASE_FONT * 0.94)
 
-    # (x_offset, y_offset) per box
-    annot_off = [(12, 8), (0, 16), (0, 8), (0, 8), (-10, 28)]
+    annot_off = [(0, 8), (0, 16), (0, 6), (0, 8)]
     for i, (d, (mean, s)) in enumerate(zip(data, stats), 1):
         xoff, yoff = annot_off[i - 1]
         ax.annotate(f'{mean:.1f} $\\pm$ {s:.2f} s',
@@ -256,11 +281,11 @@ def plot_handoff():
 
     all_vals = [v for sublist in data for v in sublist]
     ax.set_ylim(top=max(all_vals) * 1.18)
-    ax.set_ylabel('Handoff Time (s)')
+    ax.set_ylabel('Migration Time (s)')
     ax.grid(axis='y', alpha=0.3)
-    ax.text(0.99, 0.99, 'Labels report mean ± standard error',
+    ax.text(0.01, 0.99, 'Labels report mean ± standard error',
             transform=ax.transAxes, fontsize=BASE_FONT * 0.85,
-            ha='right', va='top', style='italic', color='0.4')
+            ha='left', va='top', style='italic', color='0.4')
     fig.savefig(f'{FIGURES_DIR}/handoff_boxplot.pdf')
     plt.close()
 
