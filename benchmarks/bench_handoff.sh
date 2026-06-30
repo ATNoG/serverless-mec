@@ -33,7 +33,7 @@ set -euo pipefail
 #  Environment variables:
 #    ITERATIONS                    Number of iterations per scenario (default: 20)
 #    SCENARIO                      Scenario to run (default: all)
-#    CHECKPOINT_CLEANUP_INTERVAL   Freeze iterations between disk cleanups (default: 10)
+#    CHECKPOINT_CLEANUP_INTERVAL   Freeze iterations between disk cleanups (default: 50)
 #    FREEZER_IDLE_TIMEOUT          Seconds before freezer checkpoints idle pod (default: 5)
 #
 #  Usage:
@@ -52,14 +52,19 @@ ITERATIONS=${ITERATIONS:-20}
 SCENARIO=${SCENARIO:-"all"}
 
 HANDOFF_CR_PREFIX="${EA_NAME}-to-"
-HANDOFF_POLL_TIMEOUT=600  # seconds
-CHECKPOINT_CLEANUP_INTERVAL="${CHECKPOINT_CLEANUP_INTERVAL:-100}"
+HANDOFF_POLL_TIMEOUT=600  # seconds (cold start scenarios)
+FREEZE_THAW_TIMEOUT=60   # seconds (freeze scenarios — thaw should be fast)
+CHECKPOINT_CLEANUP_INTERVAL="${CHECKPOINT_CLEANUP_INTERVAL:-50}"
 
 QUEUE_PROXY_PORT=8012
-FREEZE_WAIT_TIMEOUT=300
-FREEZER_IDLE_TIMEOUT=5  # seconds — configured via EdgeApplication CRD (freezeIdleTimeout)
+FREEZE_WAIT_TIMEOUT=60   # seconds — max wait for pod to re-freeze
+FREEZER_IDLE_TIMEOUT=5   # seconds — configured via EdgeApplication CRD (freezeIdleTimeout)
+
+LOAD_HIGH_THRESHOLD=7
+LOAD_LOW_THRESHOLD=4
 
 QP_IMAGE_BACKUP=""
+EA_CREATED_BY_US=false
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_DIR="$SCRIPT_DIR/../knative-freezer-plugin"
@@ -430,8 +435,9 @@ wait_for_handoff_thaw() {
     # kubelet still shows Terminated/Error so the KService never reaches Ready
     # and the CR stays at Applied. thawCompleted is the correct success signal.
     local target="$1"
+    local timeout="${2:-$HANDOFF_POLL_TIMEOUT}"
     local cr_name="${HANDOFF_CR_PREFIX}${target}"
-    local deadline=$((SECONDS + HANDOFF_POLL_TIMEOUT))
+    local deadline=$((SECONDS + timeout))
     while (( SECONDS < deadline )); do
         local thaw_ts
         thaw_ts=$(kubectl get edgeapplicationhandoff "$cr_name" -n "$NAMESPACE" \
@@ -504,14 +510,95 @@ get_target_freeze_count() {
         | grep -c -F "pause request received, freezing pod: ${NAMESPACE}/${pod}" || echo 0
 }
 
-_TARGET_FREEZE_DAEMON=""  # set by caller, updated by wait_for_target_freeze on daemon restart
+_TARGET_FREEZE_DAEMON=""  # set by caller; refreshed by _refresh_target_daemon
+_TARGET_NODE_NAME=""      # set by caller for daemon re-resolve
+
+# Re-resolve the freeze daemon pod name on the target node.
+# Kyverno policy rollouts replace daemon pods every ~20 iterations,
+# making the cached name stale.
+_refresh_target_daemon() {
+    local _new
+    _new=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
+        | grep freeze-daemon-containerd | grep "$_TARGET_NODE_NAME" \
+        | grep Running | awk '{print $1}')
+    if [[ -n "$_new" && "$_new" != "$_TARGET_FREEZE_DAEMON" ]]; then
+        log "  Freeze daemon refreshed: $_TARGET_FREEZE_DAEMON → $_new"
+        _TARGET_FREEZE_DAEMON="$_new"
+    fi
+}
+
+get_target_node_load() {
+    [[ -z "$_TARGET_FREEZE_DAEMON" ]] && return
+    local _val
+    _val=$(kubectl exec "$_TARGET_FREEZE_DAEMON" -n knative-serving -- cat /proc/loadavg 2>/dev/null \
+        | awk '{print $1}')
+    if [[ -n "$_val" ]]; then
+        echo "$_val"
+        return
+    fi
+    # exec failed — daemon pod may have been replaced. Re-resolve and retry.
+    _refresh_target_daemon
+    [[ -z "$_TARGET_FREEZE_DAEMON" ]] && return
+    kubectl exec "$_TARGET_FREEZE_DAEMON" -n knative-serving -- cat /proc/loadavg 2>/dev/null \
+        | awk '{print $1}'
+}
+
+check_target_load() {
+    local load
+    load=$(get_target_node_load)
+    # exec failed — likely daemon was replaced (Kyverno). Don't block.
+    [[ -z "$load" ]] && return
+    local load_int=${load%%.*}
+    if (( load_int >= LOAD_HIGH_THRESHOLD )); then
+        log "  High load on target node: $load — waiting for it to drop below $LOAD_LOW_THRESHOLD..."
+        local deadline=$((SECONDS + 300))
+        while (( SECONDS < deadline )); do
+            sleep 15
+            load=$(get_target_node_load)
+            [[ -z "$load" ]] && continue
+            load_int=${load%%.*}
+            if (( load_int < LOAD_LOW_THRESHOLD )); then
+                log "  Load dropped to $load — resuming"
+                return
+            fi
+            log "  Load: $load — still waiting..."
+        done
+        log "  WARNING: load did not drop within 5min, continuing anyway"
+    fi
+}
+
+# Restart the freeze daemon on a target node.
+# Matches FvC approach: graceful delete + wait for DaemonSet to recreate.
+_restart_freeze_daemon() {
+    local target_node_name="$1"
+    local _old_daemon="$_TARGET_FREEZE_DAEMON"
+    log "  Restarting freeze daemon $_old_daemon on $target_node_name..."
+    kubectl delete pod "$_TARGET_FREEZE_DAEMON" -n knative-serving --wait=true 2>/dev/null || true
+    # Wait for the DaemonSet to recreate it
+    local _rd_deadline=$((SECONDS + 120)) _new_daemon=""
+    while (( SECONDS < _rd_deadline )); do
+        _new_daemon=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
+            | grep freeze-daemon-containerd | grep "$target_node_name" \
+            | grep Running | awk '{print $1}')
+        if [[ -n "$_new_daemon" && "$_new_daemon" != "$_old_daemon" ]]; then
+            _TARGET_FREEZE_DAEMON="$_new_daemon"
+            log "  Freeze daemon restarted: $_TARGET_FREEZE_DAEMON"
+            return 0
+        fi
+        sleep 3
+    done
+    log "  WARNING: freeze daemon did not restart within 120s"
+    return 1
+}
 
 wait_for_target_freeze() {
     local pod="$1"
     local prev_count="${2:-}"
     local target_node_name="${3:-}"
-    local _daemon_restarted=0
     log "  Waiting for freezer to checkpoint target pod $pod..."
+
+    # Re-resolve daemon name in case Kyverno replaced it.
+    _refresh_target_daemon
 
     if [[ -z "$_TARGET_FREEZE_DAEMON" ]]; then
         log "  ERROR: _TARGET_FREEZE_DAEMON not set"
@@ -526,19 +613,35 @@ wait_for_target_freeze() {
     local error_pattern="freezing pod ${NAMESPACE}/${pod} failed"
 
     # Use caller-provided baseline count if available. With short idle
-    # timeouts the pod can re-freeze before we start polling.
+    # timeouts the pod can re-freeze before we start polling, so callers
+    # should snapshot get_target_freeze_count() right after each thaw.
+    # For the first call (warmup), no baseline is provided — use 0 so
+    # that any existing freeze is detected immediately.
     if [[ -z "$prev_count" ]]; then
-        prev_count=$(kubectl logs "$_TARGET_FREEZE_DAEMON" -n knative-serving 2>/dev/null \
-            | grep -c -F "$freeze_pattern") || prev_count=0
+        prev_count=0
     fi
 
     local start_epoch
     start_epoch=$(date +%s)
     local last_diag_epoch=$start_epoch
+    local _prev_daemon="$_TARGET_FREEZE_DAEMON"
     while :; do
         local cur_count
         cur_count=$(kubectl logs "$_TARGET_FREEZE_DAEMON" -n knative-serving 2>/dev/null \
             | grep -c -F "$freeze_pattern") || cur_count=0
+
+        # If daemon was replaced mid-loop, re-resolve and reset baseline
+        # (new daemon's logs won't have old freeze entries).
+        if (( cur_count == 0 )); then
+            _refresh_target_daemon
+            if [[ "$_TARGET_FREEZE_DAEMON" != "$_prev_daemon" ]]; then
+                prev_count=0
+                _prev_daemon="$_TARGET_FREEZE_DAEMON"
+                cur_count=$(kubectl logs "$_TARGET_FREEZE_DAEMON" -n knative-serving 2>/dev/null \
+                    | grep -c -F "$freeze_pattern") || cur_count=0
+            fi
+        fi
+
         if (( cur_count > prev_count )); then
             # Checkpoint initiated. Wait for it to complete on ARM64.
             sleep 5
@@ -554,9 +657,15 @@ wait_for_target_freeze() {
             return 0
         fi
 
-        # Check pod still exists
-        if ! kubectl get pod "$pod" -n "$NAMESPACE" --no-headers >/dev/null 2>&1; then
+        # Check pod still exists and is not Terminating
+        local _pod_phase
+        _pod_phase=$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.metadata.deletionTimestamp},{.status.phase}' 2>/dev/null)
+        if [[ -z "$_pod_phase" ]]; then
             log "  WARNING: pod $pod no longer exists"
+            return 1
+        fi
+        if [[ "$_pod_phase" == *","* && "${_pod_phase%%,*}" != "" ]]; then
+            log "  WARNING: pod $pod is Terminating"
             return 1
         fi
 
@@ -569,29 +678,11 @@ wait_for_target_freeze() {
             return 1
         fi
 
-        # If freeze hasn't happened after 150s, restart the daemon and retry.
-        if (( elapsed >= 150 && elapsed < 153 && !_daemon_restarted )); then
-            log "  Freeze not detected after 150s — restarting freeze daemon..."
-            local _old_daemon="$_TARGET_FREEZE_DAEMON"
-            kubectl delete pod "$_TARGET_FREEZE_DAEMON" -n knative-serving --wait=true 2>/dev/null || true
-            local _rd_deadline=$((SECONDS + 120)) _new_daemon=""
-            while (( SECONDS < _rd_deadline )); do
-                _new_daemon=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
-                    | grep freeze-daemon-containerd | grep "$target_node_name" \
-                    | grep Running | awk '{print $1}')
-                if [[ -n "$_new_daemon" && "$_new_daemon" != "$_old_daemon" ]]; then
-                    _TARGET_FREEZE_DAEMON="$_new_daemon"
-                    log "  Freeze daemon restarted: $_TARGET_FREEZE_DAEMON"
-                    _daemon_restarted=1
-                    prev_count=0
-                    break
-                fi
-                sleep 3
-            done
-            if (( !_daemon_restarted )); then
-                log "  WARNING: daemon restart failed, continuing to wait..."
-            fi
-        fi
+        # NOTE: Unlike FvC (where daemon is local), handoff targets a REMOTE RSU.
+        # Restarting the daemon on the RSU is destructive — the RSU often cannot
+        # recreate the pod (slow DNS, flaky image pulls, context deadline exceeded).
+        # Do NOT restart the daemon here; let the timeout expire and rely on
+        # proactive pod recycling to prevent CRIU degradation in the first place.
 
         if (( now - last_diag_epoch >= 30 )); then
             log "  [+${elapsed}s] still waiting for freeze..."
@@ -877,6 +968,105 @@ print(json.dumps(ops))
     sleep 5
 }
 
+# ---- self-contained resource creation --------------------------------------
+
+create_handoff_resources() {
+    # Create the RBAC resources needed by the retransmitter-handoff service account.
+    kubectl_apply_retry "$(cat <<'RBAC_EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: retransmitter-handoff-sa
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edgeapplicationhandoff-manager
+rules:
+  - apiGroups: ["mec.atnog.org"]
+    resources: ["edgeapplicationhandoffs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: retransmitter-handoff-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edgeapplicationhandoff-manager
+subjects:
+  - kind: ServiceAccount
+    name: retransmitter-handoff-sa
+    namespace: default
+RBAC_EOF
+)" 5
+    log "  RBAC resources created."
+
+    # Create the EdgeApplication CR.
+    kubectl_apply_retry "$(cat <<'EA_EOF'
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
+metadata:
+  name: retransmitter-handoff
+  namespace: default
+spec:
+  dId: "retransmitter-handoff-appd-v1"
+  name: "retransmitter-handoff"
+  provider: "example.mec"
+  softVersion: "1.0.0"
+  dVersion: "1.0.0"
+  infoName: "Retransmitter with handoff"
+  description: "Retransmits packet then triggers an EdgeApplicationHandoff to a target replica"
+  service:
+    freezeEnabled: true
+    freezeIdleTimeout: 5
+    nodeSelector:
+      rsu-id: "rsu-b"
+    container:
+      image: ghcr.io/pmacoutinho/retransmitter-handoff:latest
+      env:
+        - name: FORWARD_URL
+          value: "http://http-sink.default.svc.cluster.local"
+        - name: HOP_NAME
+          value: "retransmitter-handoff"
+        - name: HANDOFF_EA_NAME
+          value: "retransmitter-handoff"
+        - name: HANDOFF_TARGET_REPLICA
+          value: "rsu-a"
+        - name: HANDOFF_NAMESPACE
+          value: "default"
+        - name: HANDOFF_CLEANUP_ON_DELETE
+          value: "true"
+        - name: HANDOFF_NODE_SELECTOR
+          value: ""
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+      securityContext:
+        runAsUser: 0
+    serviceAccountName: retransmitter-handoff-sa
+    triggerFilters:
+      - type: its.cam
+EA_EOF
+)" 5
+    log "  EdgeApplication $EA_NAME created."
+}
+
+delete_handoff_resources() {
+    log "  Deleting EdgeApplication and RBAC created by benchmark..."
+    kubectl delete edgeapplication "$EA_NAME" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+    kubectl delete clusterrolebinding retransmitter-handoff-binding --ignore-not-found >/dev/null 2>&1 || true
+    kubectl delete clusterrole edgeapplicationhandoff-manager --ignore-not-found >/dev/null 2>&1 || true
+    kubectl delete serviceaccount retransmitter-handoff-sa -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+    log "  Handoff resources deleted."
+}
+
 # ---- cleanup ---------------------------------------------------------------
 
 EA_BACKUP=""
@@ -912,30 +1102,35 @@ cleanup() {
         | awk '{print $1}' | grep -v "^${SERVICE_NAME}$" \
         | xargs -r kubectl delete ksvc -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
 
-    # Restore original EA (delete + create to avoid merge issues with nodeSelector)
-    if [[ -n "$EA_BACKUP" ]]; then
-        log "Restoring original EdgeApplication..."
-        kubectl delete edgeapplication "$EA_NAME" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
-        sleep 2
-        echo "$EA_BACKUP" | strip_server_fields 2>/dev/null \
-            | kubectl apply -f - >/dev/null 2>&1 \
-            || log "  WARNING: failed to restore $EA_NAME"
-        log "  Restored $EA_NAME."
-    fi
-
-    # Restore triggers (only if none exist — the EA controller may
-    # have already recreated them from triggerFilters during EA restore)
-    local existing_triggers
-    existing_triggers=$(kubectl get triggers -n "$NAMESPACE" \
-        -l "mec.atnog.org/app=$EA_NAME" --no-headers 2>/dev/null | wc -l)
-    if [[ "${existing_triggers:-0}" -eq 0 ]] && \
-       [[ -n "$TRIGGERS_BACKUP" ]] && printf '%s' "$TRIGGERS_BACKUP" | grep -q 'apiVersion:'; then
-        echo "$TRIGGERS_BACKUP" | strip_server_fields 2>/dev/null \
-            | kubectl apply -f - >/dev/null 2>&1 \
-            || log "  WARNING: failed to restore triggers"
-        log "  Restored Knative Triggers from backup."
+    if [[ "$EA_CREATED_BY_US" == "true" ]]; then
+        # We created the EA and RBAC — delete them entirely.
+        delete_handoff_resources
     else
-        log "  Triggers already present (operator recreated them)."
+        # Restore original EA (delete + create to avoid merge issues with nodeSelector)
+        if [[ -n "$EA_BACKUP" ]]; then
+            log "Restoring original EdgeApplication..."
+            kubectl delete edgeapplication "$EA_NAME" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
+            sleep 2
+            echo "$EA_BACKUP" | strip_server_fields 2>/dev/null \
+                | kubectl apply -f - >/dev/null 2>&1 \
+                || log "  WARNING: failed to restore $EA_NAME"
+            log "  Restored $EA_NAME."
+        fi
+
+        # Restore triggers (only if none exist — the EA controller may
+        # have already recreated them from triggerFilters during EA restore)
+        local existing_triggers
+        existing_triggers=$(kubectl get triggers -n "$NAMESPACE" \
+            -l "mec.atnog.org/app=$EA_NAME" --no-headers 2>/dev/null | wc -l)
+        if [[ "${existing_triggers:-0}" -eq 0 ]] && \
+           [[ -n "$TRIGGERS_BACKUP" ]] && printf '%s' "$TRIGGERS_BACKUP" | grep -q 'apiVersion:'; then
+            echo "$TRIGGERS_BACKUP" | strip_server_fields 2>/dev/null \
+                | kubectl apply -f - >/dev/null 2>&1 \
+                || log "  WARNING: failed to restore triggers"
+            log "  Restored Knative Triggers from backup."
+        else
+            log "  Triggers already present (operator recreated them)."
+        fi
     fi
 }
 trap cleanup EXIT
@@ -1125,6 +1320,7 @@ run_freeze_scenario() {
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
     # Find the freeze daemon pod on the target node for freeze detection
+    _TARGET_NODE_NAME="$target_node_name"
     _TARGET_FREEZE_DAEMON=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
         | grep freeze-daemon-containerd | grep "$target_node_name" | awk '{print $1}')
 
@@ -1219,7 +1415,7 @@ EOF
     # freeze directly. The warmup only needs a frozen pod, not a Ready CR.
     # Retry if the pod disappears (Kyverno rollout can replace it).
     local warmup_pod="" freeze_ok=false freeze_baseline="0"
-    local deadline=$((SECONDS + 180))
+    local deadline=$((SECONDS + 300))
     while (( SECONDS < deadline )); do
         warmup_pod=$(kubectl get pods -n "$NAMESPACE" \
             -l "serving.knative.dev/service=$target_svc" \
@@ -1243,7 +1439,7 @@ EOF
     delete_handoff_cr "$handoff_target"
 
     if [[ "$freeze_ok" != "true" ]]; then
-        log "  ERROR: target did not freeze after warmup within 180s, aborting"
+        log "  ERROR: target did not freeze after warmup within 300s, aborting"
         return
     fi
     log "  Target frozen — starting measured iterations"
@@ -1264,46 +1460,66 @@ EOF
             continue
         fi
 
-        # Re-resolve freeze daemon if it was lost (e.g. after a failed restart)
+        # Re-resolve freeze daemon if it was lost (e.g. after a failed restart).
+        # Block and wait — on RSU the DaemonSet pod can take 5-20 minutes to
+        # come back. Spinning through iterations wastes all remaining samples.
         if [[ -z "$_TARGET_FREEZE_DAEMON" ]]; then
-            log "  Re-resolving freeze daemon on $target_node_name..."
-            _TARGET_FREEZE_DAEMON=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
-                | grep freeze-daemon-containerd | grep "$target_node_name" \
-                | grep Running | awk '{print $1}')
-            if [[ -n "$_TARGET_FREEZE_DAEMON" ]]; then
-                log "  Freeze daemon found: $_TARGET_FREEZE_DAEMON"
-            else
-                log "  SKIPPED: freeze daemon not found on $target_node_name"
-                continue
+            log "  Waiting for freeze daemon to come back on $target_node_name (up to 1200s)..."
+            local _daemon_wait_deadline=$((SECONDS + 1200))
+            while (( SECONDS < _daemon_wait_deadline )); do
+                _TARGET_FREEZE_DAEMON=$(kubectl get pods -n knative-serving -o wide --no-headers 2>/dev/null \
+                    | grep freeze-daemon-containerd | grep "$target_node_name" \
+                    | grep Running | awk '{print $1}')
+                if [[ -n "$_TARGET_FREEZE_DAEMON" ]]; then
+                    log "  Freeze daemon recovered: $_TARGET_FREEZE_DAEMON"
+                    break
+                fi
+                sleep 10
+            done
+            if [[ -z "$_TARGET_FREEZE_DAEMON" ]]; then
+                log "  ERROR: freeze daemon did not recover within 1200s, aborting scenario"
+                break
             fi
         fi
 
         # Delete handoff CR from previous iteration (KService survives)
         delete_handoff_cr "$handoff_target"
 
-        # Clean up old CRIU checkpoint blobs between thaw and re-freeze.
-        # Uses light cleanup (no crictl rmi --prune) to avoid killing the frozen pod.
-        if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
-            log "  Running periodic disk cleanup (light) on $target_node_name (every ${CHECKPOINT_CLEANUP_INTERVAL} iterations)..."
-            cleanup_node_disk_light "$target_node_name"
-        fi
-
         # Wait for the target to re-freeze before triggering the next handoff.
-        # After the previous iteration's thaw, the pod goes idle and re-freezes
-        # via the idle timeout.
         local target_pod
         target_pod=$(kubectl get pods -n "$NAMESPACE" \
             -l "serving.knative.dev/service=$target_svc" \
             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+        # Helper: wait for ALL pods on the target KService to fully terminate.
+        # Prevents pod pile-up that overwhelms the RSU.
+        _wait_all_target_pods_gone() {
+            log "  Waiting for all target pods to terminate..."
+            local _gone_deadline=$((SECONDS + 180))
+            while (( SECONDS < _gone_deadline )); do
+                local _count
+                _count=$(kubectl get pods -n "$NAMESPACE" \
+                    -l "serving.knative.dev/service=$target_svc" \
+                    --no-headers 2>/dev/null | wc -l)
+                if (( _count == 0 )); then
+                    return 0
+                fi
+                sleep 5
+            done
+            log "  WARNING: pods still present after 180s"
+            return 1
+        }
+
         # Helper: recycle the target pod and re-prime the KService
         _reprime_target() {
             log "  Recycling target — deleting pod and re-priming KService..."
             delete_handoff_cr "$handoff_target"
             kubectl delete pod "$target_pod" -n "$NAMESPACE" --grace-period=0 --force >/dev/null 2>&1 || true
             kubectl delete ksvc "$target_svc" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-            kubectl wait pods -n "$NAMESPACE" \
-                -l "serving.knative.dev/service=$target_svc" \
-                --for=delete --timeout=90s >/dev/null 2>&1 || true
+            # Wait for ALL pods to be fully gone — not just the target pod.
+            # On RSU, Terminating pods cause I/O contention that prevents new
+            # pods from freezing, creating a death spiral.
+            _wait_all_target_pods_gone
             local _reprime_cr
             _reprime_cr=$(_build_handoff_cr "$handoff_target" "false" "$handoff_node_selector")
             if ! kubectl_apply_retry "$_reprime_cr"; then
@@ -1321,9 +1537,9 @@ EOF
                     if wait_for_target_freeze "$target_pod" "" "$target_node_name"; then
                         freeze_baseline=$(get_target_freeze_count "$target_pod" "$_TARGET_FREEZE_DAEMON")
                         delete_handoff_cr "$handoff_target"
-                        _consec_freeze_fails=0
                         return 0
                     fi
+                    break
                 fi
                 sleep 2
             done
@@ -1331,7 +1547,23 @@ EOF
             return 1
         }
 
-        if [[ -z "$target_pod" ]]; then
+        # Proactive pod recycling: CRIU on ARM64 RSU degrades after ~70-80
+        # checkpoint cycles. Recycle before that and clean up disk.
+        local _skip_freeze_wait=false
+        if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
+            log "  Proactive pod recycle (every ${CHECKPOINT_CLEANUP_INTERVAL} iterations)..."
+            cleanup_node_disk_light "$target_node_name"
+            if _reprime_target; then
+                log "  Proactive recycle complete — pod frozen and ready"
+                _skip_freeze_wait=true
+            else
+                log "  WARNING: proactive recycle failed, continuing with current pod"
+            fi
+        fi
+
+        if $_skip_freeze_wait; then
+            : # Pod already frozen by proactive recycle
+        elif [[ -z "$target_pod" ]]; then
             log "  WARNING: target pod gone, re-priming..."
             if ! _reprime_target; then
                 log "  SKIPPED: failed to re-prime and freeze target"
@@ -1341,33 +1573,58 @@ EOF
         else
             log "  Waiting for target to re-freeze ($target_pod)..."
             if ! wait_for_target_freeze "$target_pod" "$freeze_baseline" "$target_node_name"; then
-                (( _consec_freeze_fails++ ))
-                if (( _consec_freeze_fails >= 2 )); then
-                    log "  $_consec_freeze_fails consecutive freeze failures — recycling pod..."
-                    if _reprime_target; then
-                        log "  Target recycled and frozen — resuming iterations"
+                # Before recycling, check if Kyverno replaced the pod and
+                # the replacement is already running. If so, just switch to it.
+                local _new_pod
+                _new_pod=$(kubectl get pods -n "$NAMESPACE" \
+                    -l "serving.knative.dev/service=$target_svc" \
+                    --field-selector=status.phase!=Succeeded,status.phase!=Failed \
+                    --sort-by=.metadata.creationTimestamp \
+                    -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+                if [[ -n "$_new_pod" && "$_new_pod" != "$target_pod" ]]; then
+                    log "  Pod replaced by Kyverno rollout: $target_pod → $_new_pod"
+                    target_pod="$_new_pod"
+                    # The new pod may already be frozen — check directly
+                    if wait_for_target_freeze "$target_pod" "" "$target_node_name"; then
+                        freeze_baseline=$(get_target_freeze_count "$target_pod" "$_TARGET_FREEZE_DAEMON")
+                        log "  Replacement pod already frozen — continuing"
                     else
-                        log "  SKIPPED: failed to recycle target"
+                        log "  Replacement pod failed to freeze — recycling..."
+                        sleep 60
+                        if ! _reprime_target; then
+                            log "  SKIPPED: recycle failed"
+                            continue
+                        fi
                     fi
                 else
-                    log "  SKIPPED: target did not re-freeze ($_consec_freeze_fails consecutive)"
+                    # Genuine freeze failure — recycle with backoff.
+                    log "  Freeze failed — waiting 60s for RSU to settle before recycling..."
+                    sleep 60
+                    if _reprime_target; then
+                        log "  Target recycled and frozen — resuming"
+                    else
+                        log "  Recycle failed — backing off 5min to let RSU recover..."
+                        sleep 300
+                        if _reprime_target; then
+                            log "  Recovery succeeded after backoff"
+                        else
+                            log "  SKIPPED: RSU still not recovering"
+                            continue
+                        fi
+                    fi
                 fi
-                continue
             fi
-            _consec_freeze_fails=0
         fi
         log "  Container frozen (confirmed by freeze daemon)."
 
-        # Create the handoff CR and measure time to Ready.
-        # handoff_wall_ms captures the full lifecycle: CR creation →
-        # operator detection → CRIU thaw → CR Ready.
+        # Snapshot freeze count BEFORE thaw — after thaw the pod re-freezes
+        # quickly, so snapshotting after would race.
+        freeze_baseline=$(get_target_freeze_count "$target_pod" "$_TARGET_FREEZE_DAEMON")
+
+        # Create the handoff CR and measure time to thawCompleted.
         local ts_before handoff_start
         ts_before=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
         handoff_start=$(date +%s%N)
-
-        # Snapshot freeze count BEFORE thaw. After the thaw the pod re-freezes
-        # quickly (short idle timeout), so snapshotting after would race.
-        freeze_baseline=$(get_target_freeze_count "$target_pod" "$_TARGET_FREEZE_DAEMON")
 
         local _cr_yaml
         _cr_yaml=$(cat <<EOF
@@ -1389,24 +1646,31 @@ EOF
             continue
         fi
 
-        # For freeze scenarios, wait for thawCompleted (not phase=Ready).
-        # After CRIU restore, kubelet still sees the user-container as
-        # Terminated/Error so the KService never reaches Ready.
         local handoff_end handoff_wall_ms phase ts_after
-        if wait_for_handoff_thaw "$handoff_target"; then
+        if wait_for_handoff_thaw "$handoff_target" "$FREEZE_THAW_TIMEOUT"; then
             handoff_end=$(date +%s%N)
             handoff_wall_ms=$(( (handoff_end - handoff_start) / 1000000 ))
             ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
             phase=$(get_handoff_phase "$handoff_target")
-                log "  Result: ${handoff_wall_ms}ms thaw (phase=$phase)"
+            log "  Result: ${handoff_wall_ms}ms thaw (phase=$phase)"
             emit_result "$scenario_name" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
         else
             handoff_end=$(date +%s%N)
             handoff_wall_ms=$(( (handoff_end - handoff_start) / 1000000 ))
             ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
             phase=$(get_handoff_phase "$handoff_target")
-                log "  TIMEOUT: ${handoff_wall_ms}ms thaw (phase=$phase)"
+            log "  TIMEOUT: ${handoff_wall_ms}ms thaw (phase=$phase) — recycling..."
             emit_result "$scenario_name" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
+            # Thaw timed out — wait for RSU to settle, then recycle.
+            log "  Waiting 60s for RSU to settle before recycling..."
+            sleep 60
+            if _reprime_target; then
+                log "  Recovery recycle succeeded"
+            else
+                log "  Recovery failed — backing off 5min..."
+                sleep 300
+                _reprime_target || log "  WARNING: recovery still failing"
+            fi
         fi
     done
 }
@@ -1428,15 +1692,24 @@ main() {
     log "  cleanup_interval=$CHECKPOINT_CLEANUP_INTERVAL, freeze_idle_timeout=${FREEZER_IDLE_TIMEOUT}s"
     log "  output=$OUTFILE"
 
-    # Backup EA state and triggers
+    # Backup EA state and triggers (or create from scratch if missing)
     EA_BACKUP=$(kubectl get edgeapplication "$EA_NAME" -n "$NAMESPACE" -o yaml 2>/dev/null || echo "")
     TRIGGERS_BACKUP=$(kubectl get triggers -n "$NAMESPACE" \
         -l "mec.atnog.org/app=$EA_NAME" -o yaml 2>/dev/null || echo "")
     if [[ -z "$EA_BACKUP" ]]; then
-        log "ERROR: EdgeApplication $EA_NAME not found. Apply the YAML first:"
-        log "  kubectl apply -f edgeApplications/retransmitter-handoff-rbac.yaml"
-        log "  kubectl apply -f edgeApplications/retransmitter-handoff.yaml"
-        exit 1
+        log "EdgeApplication $EA_NAME not found — creating RBAC and EA..."
+        create_handoff_resources
+        EA_CREATED_BY_US=true
+        # Wait for the operator to reconcile the EA into a KService
+        log "  Waiting for operator to create KService..."
+        local _ea_deadline=$((SECONDS + 120))
+        while (( SECONDS < _ea_deadline )); do
+            if kubectl get ksvc "$SERVICE_NAME" -n "$NAMESPACE" --no-headers >/dev/null 2>&1; then
+                log "  KService $SERVICE_NAME created."
+                break
+            fi
+            sleep 2
+        done
     fi
 
     resolve_bench_node
@@ -1473,11 +1746,6 @@ main() {
     # Run selected scenarios — each is isolated so one failure doesn't abort the rest.
     local _scenario_failed=0
     case "$SCENARIO" in
-        rsu-cold|rsu|all)
-            run_scenario "rsu-a-coldstart" "false" "rsu-id" "rsu-b" \
-                "rsu-a" '{"rsu-id":"rsu-a"}' "$ITERATIONS" \
-                || { log "ERROR: rsu-a-coldstart scenario failed, continuing..."; _scenario_failed=1; }
-            ;;&
         rsu-freeze|rsu|all)
             local _saved_key="$BENCH_NODE_SELECTOR_KEY" _saved_val="$BENCH_NODE_SELECTOR_VAL"
             BENCH_NODE_SELECTOR_KEY="rsu-id" BENCH_NODE_SELECTOR_VAL="rsu-b"
@@ -1485,6 +1753,11 @@ main() {
                 "rsu-a" '{"rsu-id":"rsu-a"}' "rsu-id" "rsu-a" "$FREEZER_IDLE_TIMEOUT" \
                 || { log "ERROR: rsu-a-freeze scenario failed, continuing..."; _scenario_failed=1; }
             BENCH_NODE_SELECTOR_KEY="$_saved_key" BENCH_NODE_SELECTOR_VAL="$_saved_val"
+            ;;&
+        rsu-cold|rsu|all)
+            run_scenario "rsu-a-coldstart" "false" "rsu-id" "rsu-b" \
+                "rsu-a" '{"rsu-id":"rsu-a"}' "$ITERATIONS" \
+                || { log "ERROR: rsu-a-coldstart scenario failed, continuing..."; _scenario_failed=1; }
             ;;&
         worker1-cold|all)
             run_scenario "worker1-coldstart" "false" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
