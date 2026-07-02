@@ -931,47 +931,89 @@ cleanup_node_disk_light() {
 
 # ---- EA patching -----------------------------------------------------------
 
-patch_ea() {
-    local freeze="$1" node_key="$2" node_val="$3" target_replica="$4" node_selector_json="$5"
-    local cleanup_on_delete="${6:-true}"
-    local clear_triggers="${7:-false}"
-    local idle_timeout="${8:-$FREEZER_IDLE_TIMEOUT}"
+ea_yaml() {
+    local freeze="$1" node_key="$2" node_val="$3"
+    local target_replica="$4" node_selector_json="$5"
+    local cleanup_on_delete="${6:-true}" idle_timeout="${7:-$FREEZER_IDLE_TIMEOUT}"
+    cat <<EOFEA
+apiVersion: mec.atnog.org/v1alpha1
+kind: EdgeApplication
+metadata:
+  name: $EA_NAME
+  namespace: $NAMESPACE
+spec:
+  dId: "retransmitter-handoff-appd-v1"
+  name: "retransmitter-handoff"
+  provider: "example.mec"
+  softVersion: "1.0.0"
+  dVersion: "1.0.0"
+  infoName: "Retransmitter with handoff"
+  description: "Retransmits packet then triggers an EdgeApplicationHandoff to a target replica"
+  service:
+    freezeEnabled: $freeze
+    freezeIdleTimeout: $idle_timeout
+    nodeSelector:
+      $node_key: "$node_val"
+    container:
+      image: ghcr.io/pmacoutinho/retransmitter-handoff:latest
+      env:
+        - name: FORWARD_URL
+          value: "http://http-sink.default.svc.cluster.local"
+        - name: HOP_NAME
+          value: "retransmitter-handoff"
+        - name: HANDOFF_EA_NAME
+          value: "$EA_NAME"
+        - name: HANDOFF_TARGET_REPLICA
+          value: "$target_replica"
+        - name: HANDOFF_NAMESPACE
+          value: "$NAMESPACE"
+        - name: HANDOFF_CLEANUP_ON_DELETE
+          value: "$cleanup_on_delete"
+        - name: HANDOFF_NODE_SELECTOR
+          value: '$node_selector_json'
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+      securityContext:
+        runAsUser: 0
+    serviceAccountName: retransmitter-handoff-sa
+    triggerFilters: []
+EOFEA
+}
 
-    # Single atomic JSON patch to avoid multiple reconciliation cycles.
-    # Multiple sequential patches cause the operator to create a new Knative
-    # revision for each change, leading to reconciliation storms.
-    local json_ops
-    json_ops=$(python3 -c "
-import json
-envs = [
-    {'name':'FORWARD_URL','value':'http://http-sink.default.svc.cluster.local'},
-    {'name':'HOP_NAME','value':'retransmitter-handoff'},
-    {'name':'HANDOFF_EA_NAME','value':'$EA_NAME'},
-    {'name':'HANDOFF_TARGET_REPLICA','value':'$target_replica'},
-    {'name':'HANDOFF_NAMESPACE','value':'$NAMESPACE'},
-    {'name':'HANDOFF_CLEANUP_ON_DELETE','value':'$cleanup_on_delete'},
-    {'name':'HANDOFF_NODE_SELECTOR','value':json.dumps(json.loads('$node_selector_json')) if '$node_selector_json' else ''},
-]
-ops = [
-    {'op': 'replace', 'path': '/spec/service/nodeSelector', 'value': {'$node_key': '$node_val'}},
-    {'op': 'replace', 'path': '/spec/service/freezeEnabled', 'value': '$freeze' == 'true'},
-    {'op': 'replace', 'path': '/spec/service/freezeIdleTimeout', 'value': $idle_timeout},
-    {'op': 'replace', 'path': '/spec/service/container/env', 'value': envs},
-]
-if '$clear_triggers' == 'true':
-    ops.append({'op': 'replace', 'path': '/spec/service/triggerFilters', 'value': []})
-print(json.dumps(ops))
-")
-    kubectl_retry 3 kubectl patch edgeapplication "$EA_NAME" -n "$NAMESPACE" --type=json \
-        -p "$json_ops" >/dev/null 2>&1
-
-    sleep 5
+delete_ea_and_wait() {
+    log "  Deleting EdgeApplication and waiting for cleanup..."
+    kubectl delete edgeapplication "$EA_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
+    sleep 3
+    kubectl delete pods -n "$NAMESPACE" \
+        -l "serving.knative.dev/service=$SERVICE_NAME" \
+        --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
+    local deadline=$((SECONDS + 120))
+    while (( SECONDS < deadline )); do
+        local count
+        count=$(kubectl get pods -n "$NAMESPACE" \
+            -l "serving.knative.dev/service=$SERVICE_NAME" \
+            --no-headers 2>/dev/null | wc -l)
+        if [[ "$count" -eq 0 ]]; then
+            if ! kubectl get ksvc "$SERVICE_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
+                log "  Clean slate."
+                return 0
+            fi
+        fi
+        sleep 3
+    done
+    log "  WARNING: cleanup timed out"
 }
 
 # ---- self-contained resource creation --------------------------------------
 
-create_handoff_resources() {
+ensure_handoff_rbac() {
     # Create the RBAC resources needed by the retransmitter-handoff service account.
+    # Idempotent — safe to call multiple times.
     kubectl_apply_retry "$(cat <<'RBAC_EOF'
 apiVersion: v1
 kind: ServiceAccount
@@ -1002,60 +1044,7 @@ subjects:
     namespace: default
 RBAC_EOF
 )" 5
-    log "  RBAC resources created."
-
-    # Create the EdgeApplication CR.
-    kubectl_apply_retry "$(cat <<'EA_EOF'
-apiVersion: mec.atnog.org/v1alpha1
-kind: EdgeApplication
-metadata:
-  name: retransmitter-handoff
-  namespace: default
-spec:
-  dId: "retransmitter-handoff-appd-v1"
-  name: "retransmitter-handoff"
-  provider: "example.mec"
-  softVersion: "1.0.0"
-  dVersion: "1.0.0"
-  infoName: "Retransmitter with handoff"
-  description: "Retransmits packet then triggers an EdgeApplicationHandoff to a target replica"
-  service:
-    freezeEnabled: true
-    freezeIdleTimeout: 5
-    nodeSelector:
-      rsu-id: "rsu-b"
-    container:
-      image: ghcr.io/pmacoutinho/retransmitter-handoff:latest
-      env:
-        - name: FORWARD_URL
-          value: "http://http-sink.default.svc.cluster.local"
-        - name: HOP_NAME
-          value: "retransmitter-handoff"
-        - name: HANDOFF_EA_NAME
-          value: "retransmitter-handoff"
-        - name: HANDOFF_TARGET_REPLICA
-          value: "rsu-a"
-        - name: HANDOFF_NAMESPACE
-          value: "default"
-        - name: HANDOFF_CLEANUP_ON_DELETE
-          value: "true"
-        - name: HANDOFF_NODE_SELECTOR
-          value: ""
-      resources:
-        requests:
-          cpu: 50m
-          memory: 64Mi
-        limits:
-          cpu: 250m
-          memory: 128Mi
-      securityContext:
-        runAsUser: 0
-    serviceAccountName: retransmitter-handoff-sa
-    triggerFilters:
-      - type: its.cam
-EA_EOF
-)" 5
-    log "  EdgeApplication $EA_NAME created."
+    log "  RBAC resources ensured."
 }
 
 delete_handoff_resources() {
@@ -1223,14 +1212,10 @@ run_scenario() {
     log "  Measures full cold start handoff latency (direct CR apply)"
     log "  Source: $node_key=$node_val, Target: $handoff_target (node: ${target_node_name:-unknown})"
 
-    if ! patch_ea "$freeze" "$node_key" "$node_val" "$handoff_target" "$handoff_node_selector"; then
-        log "  ERROR: patch_ea failed, retrying once..."
-        sleep 5
-        patch_ea "$freeze" "$node_key" "$node_val" "$handoff_target" "$handoff_node_selector" || {
-            log "  ERROR: patch_ea failed twice, aborting scenario $scenario"
-            return 1
-        }
-    fi
+    delete_ea_and_wait
+    log "  Creating EA (freezeEnabled=$freeze)..."
+    ea_yaml "$freeze" "$node_key" "$node_val" "$handoff_target" "$handoff_node_selector" "true" \
+        | kubectl apply -f - >/dev/null 2>&1
 
     # Source pod rollout is not waited on — we apply the handoff CR directly
     # so the source pod is unused. Let it stabilize in the background.
@@ -1328,62 +1313,23 @@ run_freeze_scenario() {
     log "  Measures full handoff latency with CRIU-frozen target"
     log "  Target KService: $target_svc (node: $target_node_name, daemon: $_TARGET_FREEZE_DAEMON)"
 
-    # Step 1: Patch EA — freeze=true, clear triggerFilters.
-    # triggerFilters must be empty to prevent the broker from dispatching
-    # events to the target pod (which would keep it awake and prevent freeze).
+    # Step 1: Delete EA and recreate with the right config from the start.
+    # triggerFilters=[] prevents the broker from waking frozen pods.
     # cleanupOnDelete=false so the target KService survives handoff CR deletion.
-    if ! patch_ea "true" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
-        "$handoff_target" "$handoff_node_selector" "false" "true" "$idle_timeout"; then
-        log "  ERROR: patch_ea failed, retrying once..."
-        sleep 5
-        patch_ea "true" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
-            "$handoff_target" "$handoff_node_selector" "false" "true" "$idle_timeout" || {
-            log "  ERROR: patch_ea failed twice, aborting scenario $scenario_name"
-            return 1
-        }
-    fi
-
-    kubectl delete trigger -n "$NAMESPACE" \
-        -l "mec.atnog.org/app=$EA_NAME" --ignore-not-found >/dev/null 2>&1
-
-    # Source pod rollout is not waited on — we apply the handoff CR directly
-    # so the source pod is unused. Let it stabilize in the background.
-
-    # Step 2: Apply Kyverno policy BEFORE the target KService exists.
-    # This ensures the first pod created gets restartPolicy=Never via the
-    # admission webhook on Deployment CREATE. Applying it after causes
-    # a rollout fight: Kyverno changes the pod template → new ReplicaSet
-    # → new pod freezes → 1/2 Error → deployment replaces it → loop.
+    delete_ea_and_wait
     ensure_restart_policy_kyverno "$target_svc"
+    log "  Creating EA (freezeEnabled=true, idle=${idle_timeout}s)..."
+    ea_yaml "true" "$BENCH_NODE_SELECTOR_KEY" "$BENCH_NODE_SELECTOR_VAL" \
+        "$handoff_target" "$handoff_node_selector" "false" "$idle_timeout" \
+        | kubectl apply -f - >/dev/null 2>&1
 
-    # Step 3: Clean slate — delete any lingering target state from previous
-    # runs. Create a temporary CR with cleanupOnDelete=true to properly
-    # remove the replica from the EA spec, then delete it.
-    log "  Cleaning lingering target state..."
+    # Step 2: Clean any lingering target state from previous runs.
     delete_handoff_cr "$handoff_target"
     kubectl delete ksvc "$target_svc" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    kubectl apply -f - >/dev/null 2>&1 <<CLEANUP || true
-apiVersion: mec.atnog.org/v1alpha1
-kind: EdgeApplicationHandoff
-metadata:
-  name: ${HANDOFF_CR_PREFIX}${handoff_target}
-  namespace: ${NAMESPACE}
-spec:
-  edgeApplicationName: ${EA_NAME}
-  targetReplicaName: ${handoff_target}
-  cleanupOnDelete: true
-  nodeSelector:
-    ${target_node_key}: ${target_node_val}
-CLEANUP
-    sleep 1
-    delete_handoff_cr "$handoff_target"
     kubectl wait ksvc "$target_svc" -n "$NAMESPACE" --for=delete --timeout=30s >/dev/null 2>&1 || true
-    # Wait for ALL pods to fully terminate — on RSU, concurrent pods cause
-    # I/O contention that prevents the warmup pod from starting cleanly.
     kubectl wait pods -n "$NAMESPACE" \
         -l "serving.knative.dev/service=$target_svc" \
         --for=delete --timeout=90s >/dev/null 2>&1 || true
-    log "  Clean slate established."
 
     # Step 4: Warmup — create the target KService via direct handoff CR.
     # The Kyverno policy is already in place, so the first pod will have
@@ -1426,7 +1372,15 @@ EOF
             sleep 2
             continue
         fi
-        log "  Target pod: $warmup_pod — waiting for freeze..."
+        # Wait for the pod to be ready (2/2) before expecting a freeze.
+        # The idle timeout only starts once the container is serving.
+        log "  Target pod: $warmup_pod — waiting for ready..."
+        if kubectl wait pod "$warmup_pod" -n "$NAMESPACE" \
+            --for=condition=Ready --timeout=120s >/dev/null 2>&1; then
+            log "  Target pod ready — waiting for freeze..."
+        else
+            log "  Target pod did not reach Ready, waiting for freeze anyway..."
+        fi
         if wait_for_target_freeze "$warmup_pod" "" "$target_node_name"; then
             freeze_ok=true
             break
@@ -1692,25 +1646,15 @@ main() {
     log "  cleanup_interval=$CHECKPOINT_CLEANUP_INTERVAL, freeze_idle_timeout=${FREEZER_IDLE_TIMEOUT}s"
     log "  output=$OUTFILE"
 
-    # Backup EA state and triggers (or create from scratch if missing)
+    # Backup EA state and triggers if they exist; ensure RBAC is in place.
     EA_BACKUP=$(kubectl get edgeapplication "$EA_NAME" -n "$NAMESPACE" -o yaml 2>/dev/null || echo "")
     TRIGGERS_BACKUP=$(kubectl get triggers -n "$NAMESPACE" \
         -l "mec.atnog.org/app=$EA_NAME" -o yaml 2>/dev/null || echo "")
     if [[ -z "$EA_BACKUP" ]]; then
-        log "EdgeApplication $EA_NAME not found — creating RBAC and EA..."
-        create_handoff_resources
         EA_CREATED_BY_US=true
-        # Wait for the operator to reconcile the EA into a KService
-        log "  Waiting for operator to create KService..."
-        local _ea_deadline=$((SECONDS + 120))
-        while (( SECONDS < _ea_deadline )); do
-            if kubectl get ksvc "$SERVICE_NAME" -n "$NAMESPACE" --no-headers >/dev/null 2>&1; then
-                log "  KService $SERVICE_NAME created."
-                break
-            fi
-            sleep 2
-        done
     fi
+    # Ensure RBAC exists (idempotent). Each scenario creates the EA itself.
+    ensure_handoff_rbac
 
     resolve_bench_node
 
