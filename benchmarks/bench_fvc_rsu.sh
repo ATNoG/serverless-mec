@@ -654,6 +654,17 @@ while (( SECONDS < warmup_deadline )); do
     if [[ -n "$pod" ]]; then
         pod_ip=$(get_pod_ip "$pod")
         if [[ -n "$pod_ip" ]]; then
+            # Verify Kyverno injected restartPolicy=Never. If not (e.g. Kyverno
+            # webhook was briefly down), delete the pod and wait for a new one.
+            _rp=$(kubectl get pod "$pod" -n "$NAMESPACE" \
+                -o jsonpath='{.spec.containers[?(@.name=="user-container")].restartPolicy}' 2>/dev/null)
+            if [[ "$_rp" != "Never" ]]; then
+                log "  WARNING: pod $pod missing restartPolicy=Never ($_rp), recycling..."
+                kubectl delete pod "$pod" -n "$NAMESPACE" --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
+                pod="" ; pod_ip=""
+                sleep 5
+                continue
+            fi
             log "  Pod found: $pod ($pod_ip)"
             break
         fi
