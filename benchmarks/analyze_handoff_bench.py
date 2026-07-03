@@ -261,10 +261,6 @@ PIPELINE_PHASES_COLDSTART = [
     ("micro_applied_to_ready_ms", "Applied -> Ready (µs)"),
     ("micro_reconcile_to_ready_ms", "Reconcile -> Ready (µs)"),
     ("handoff_wall_ms", "Handoff Wall Clock"),
-    ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
-    ("ksvc_to_pod_ms", "KSvc -> Pod Created (k8s ts)"),
-    ("container_startup_ms", "Container Startup (k8s ts)"),
-    ("pod_total_startup_ms", "Pod Total Startup (k8s ts)"),
 ]
 PIPELINE_PHASES_FREEZE = [
     ("micro_reconcile_to_applied_ms", "Reconcile -> Applied (µs)"),
@@ -274,7 +270,6 @@ PIPELINE_PHASES_FREEZE = [
     ("micro_ksvc_to_ready_ms", "KSvc Ready -> Ready (µs)"),
     ("micro_reconcile_to_ready_ms", "Reconcile -> Ready (µs)"),
     ("handoff_wall_ms", "Handoff Wall Clock"),
-    ("cr_to_ready_ms", "CR -> Ready (k8s ts)"),
 ]
 
 
