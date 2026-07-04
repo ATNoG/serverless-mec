@@ -528,13 +528,23 @@ _refresh_target_daemon() {
 }
 
 _LOAD_CHECK_POD=""
+_LOAD_CHECK_NODE_VAL=""
 
 setup_load_check_pod() {
     # Launch a lightweight busybox pod on the target node for load monitoring.
     # The freeze daemon is a distroless image with no shell, so we can't exec into it.
+    # Reuses existing pod if already on the same target node.
     local node_key="$1" node_val="$2"
+    if [[ "$_LOAD_CHECK_NODE_VAL" == "$node_val" ]] && [[ -n "$_LOAD_CHECK_POD" ]]; then
+        # Already have a load-check pod on this node — verify it's still running
+        if kubectl get pod "$_LOAD_CHECK_POD" -n "$NAMESPACE" --no-headers 2>/dev/null | grep -q Running; then
+            log "  Load-check pod $_LOAD_CHECK_POD already running on $node_key=$node_val"
+            return 0
+        fi
+    fi
     local pod_name="bench-load-${node_val}"
     _LOAD_CHECK_POD="$pod_name"
+    _LOAD_CHECK_NODE_VAL="$node_val"
     kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
     kubectl run "$pod_name" -n "$NAMESPACE" --image=busybox --restart=Never \
         --overrides="{\"spec\":{\"nodeSelector\":{\"$node_key\":\"$node_val\"}}}" \
@@ -1226,6 +1236,12 @@ run_scenario() {
     log "  Measures full cold start handoff latency (direct CR apply)"
     log "  Source: $node_key=$node_val, Target: $handoff_target (node: ${target_node_name:-unknown})"
 
+    # Set up load-check pod on the target node and wait for it to settle.
+    if [[ -n "$_sel_key" && -n "$_sel_val" ]]; then
+        setup_load_check_pod "$_sel_key" "$_sel_val"
+        check_target_load
+    fi
+
     delete_ea_and_wait
     log "  Creating EA (freezeEnabled=$freeze)..."
     ea_yaml "$freeze" "$node_key" "$node_val" "$handoff_target" "$handoff_node_selector" "true" \
@@ -1266,9 +1282,16 @@ run_scenario() {
         -l "serving.knative.dev/service=$target_svc" \
         --for=delete --timeout=90s >/dev/null 2>&1 || true
 
+    # Wait for load to settle after warmup before starting measured iterations
+    log "  Waiting for load to settle after warmup..."
+    check_target_load
+
     local i
     for (( i=1; i<=iterations; i++ )); do
         log "--- $scenario iteration $i/$iterations ---"
+
+        # Pre-check: wait for target node load to settle
+        check_target_load
 
         # Pre-check: ensure operator is running before starting iteration
         if ! wait_for_operator; then
@@ -1414,7 +1437,9 @@ EOF
         log "  ERROR: target did not freeze after warmup within 300s, aborting"
         return
     fi
-    log "  Target frozen — starting measured iterations"
+    log "  Target frozen — waiting for load to settle after warmup..."
+    check_target_load
+    log "  Starting measured iterations"
 
     local _consec_freeze_fails=0
 
