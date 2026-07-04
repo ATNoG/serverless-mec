@@ -280,12 +280,8 @@ def _get_phase_values(rows: List[dict], scenario: str, phase_key: str,
         if r.get("scenario") != scenario:
             continue
         hp = r.get("handoff_phase", "")
-        if "freeze" in scenario:
-            if hp not in ("Ready", "Applied"):
-                continue
-        else:
-            if hp != "Ready":
-                continue
+        if hp != "Ready":
+            continue
         phases = computed.get(idx, {})
         v = phases.get(phase_key)
         if isinstance(v, (int, float)) and v >= 0:
