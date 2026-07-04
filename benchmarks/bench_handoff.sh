@@ -527,19 +527,32 @@ _refresh_target_daemon() {
     fi
 }
 
-get_target_node_load() {
-    [[ -z "$_TARGET_FREEZE_DAEMON" ]] && return
-    local _val
-    _val=$(kubectl exec "$_TARGET_FREEZE_DAEMON" -n knative-serving -- cat /proc/loadavg 2>/dev/null \
-        | awk '{print $1}')
-    if [[ -n "$_val" ]]; then
-        echo "$_val"
-        return
+_LOAD_CHECK_POD=""
+
+setup_load_check_pod() {
+    # Launch a lightweight busybox pod on the target node for load monitoring.
+    # The freeze daemon is a distroless image with no shell, so we can't exec into it.
+    local node_key="$1" node_val="$2"
+    local pod_name="bench-load-${node_val}"
+    _LOAD_CHECK_POD="$pod_name"
+    kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
+    kubectl run "$pod_name" -n "$NAMESPACE" --image=busybox --restart=Never \
+        --overrides="{\"spec\":{\"nodeSelector\":{\"$node_key\":\"$node_val\"}}}" \
+        --command -- sleep 86400 >/dev/null 2>&1
+    kubectl wait --for=condition=Ready "pod/$pod_name" -n "$NAMESPACE" --timeout=60s >/dev/null 2>&1
+    log "  Load-check pod $pod_name ready on $node_key=$node_val"
+}
+
+cleanup_load_check_pod() {
+    if [[ -n "$_LOAD_CHECK_POD" ]]; then
+        kubectl delete pod "$_LOAD_CHECK_POD" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+        _LOAD_CHECK_POD=""
     fi
-    # exec failed — daemon pod may have been replaced. Re-resolve and retry.
-    _refresh_target_daemon
-    [[ -z "$_TARGET_FREEZE_DAEMON" ]] && return
-    kubectl exec "$_TARGET_FREEZE_DAEMON" -n knative-serving -- cat /proc/loadavg 2>/dev/null \
+}
+
+get_target_node_load() {
+    [[ -z "$_LOAD_CHECK_POD" ]] && return
+    kubectl exec "$_LOAD_CHECK_POD" -n "$NAMESPACE" -- cat /proc/loadavg 2>/dev/null \
         | awk '{print $1}'
 }
 
@@ -1080,6 +1093,7 @@ cleanup() {
         fi
     done
     kubectl delete pod bench-curl -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    cleanup_load_check_pod
     kubectl delete clusterpolicy bench-restart-policy-never --ignore-not-found >/dev/null 2>&1 || true
     kubectl delete clusterpolicy bench-freeze-idle-timeout --ignore-not-found >/dev/null 2>&1 || true
     restore_queue_proxy_image
@@ -1313,6 +1327,10 @@ run_freeze_scenario() {
     log "  Measures full handoff latency with CRIU-frozen target"
     log "  Target KService: $target_svc (node: $target_node_name, daemon: $_TARGET_FREEZE_DAEMON)"
 
+    # Step 0: Launch load-check pod and wait for RSU to settle before proceeding.
+    setup_load_check_pod "$target_node_key" "$target_node_val"
+    check_target_load
+
     # Step 1: Delete EA and recreate with the right config from the start.
     # triggerFilters=[] prevents the broker from waking frozen pods.
     # cleanupOnDelete=false so the target KService survives handoff CR deletion.
@@ -1407,6 +1425,9 @@ EOF
     local i
     for (( i=1; i<=iterations; i++ )); do
         log "--- $scenario_name iteration $i/$iterations ---"
+
+        # Pre-check: wait for RSU load to settle
+        check_target_load
 
         # Pre-check: ensure operator is running before starting iteration
         if ! wait_for_operator; then
