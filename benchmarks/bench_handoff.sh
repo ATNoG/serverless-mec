@@ -1493,9 +1493,12 @@ EOF
 
         # Helper: wait for ALL pods on the target KService to fully terminate.
         # Prevents pod pile-up that overwhelms the RSU.
+        # Force-deletes Terminating pods after 60s — CRIU-frozen containers
+        # have no meaningful graceful shutdown, and stuck Terminating pods
+        # cause I/O contention that spirals into RSU overload.
         _wait_all_target_pods_gone() {
             log "  Waiting for all target pods to terminate..."
-            local _gone_deadline=$((SECONDS + 180))
+            local _gone_deadline=$((SECONDS + 180)) _force_deleted=false
             while (( SECONDS < _gone_deadline )); do
                 local _count
                 _count=$(kubectl get pods -n "$NAMESPACE" \
@@ -1503,6 +1506,14 @@ EOF
                     --no-headers 2>/dev/null | wc -l)
                 if (( _count == 0 )); then
                     return 0
+                fi
+                # After 60s, force-delete any remaining pods (likely stuck Terminating)
+                if (( SECONDS > _gone_deadline - 120 )) && [[ "$_force_deleted" != "true" ]]; then
+                    log "  Force-deleting stuck pods on target KService..."
+                    kubectl delete pods -n "$NAMESPACE" \
+                        -l "serving.knative.dev/service=$target_svc" \
+                        --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
+                    _force_deleted=true
                 fi
                 sleep 5
             done
@@ -1520,6 +1531,9 @@ EOF
             # On RSU, Terminating pods cause I/O contention that prevents new
             # pods from freezing, creating a death spiral.
             _wait_all_target_pods_gone
+            # Wait for RSU load to settle before creating a new pod.
+            # The recycle itself (pod deletion, CRIU cleanup) spikes load.
+            check_target_load
             local _reprime_cr
             _reprime_cr=$(_build_handoff_cr "$handoff_target" "false" "$handoff_node_selector")
             if ! kubectl_apply_retry "$_reprime_cr"; then
@@ -1549,13 +1563,14 @@ EOF
 
         # Proactive pod recycling: CRIU on ARM64 RSU degrades after ~70-80
         # checkpoint cycles. Recycle before that and clean up disk.
-        local _skip_freeze_wait=false
+        local _skip_freeze_wait=false _skip_measurement=false
         if (( i % CHECKPOINT_CLEANUP_INTERVAL == 0 )); then
             log "  Proactive pod recycle (every ${CHECKPOINT_CLEANUP_INTERVAL} iterations)..."
             cleanup_node_disk_light "$target_node_name"
             if _reprime_target; then
                 log "  Proactive recycle complete — pod frozen and ready"
                 _skip_freeze_wait=true
+                _skip_measurement=true
             else
                 log "  WARNING: proactive recycle failed, continuing with current pod"
             fi
@@ -1570,6 +1585,7 @@ EOF
                 continue
             fi
             log "  Target re-primed and frozen — resuming iterations"
+            _skip_measurement=true
         else
             log "  Waiting for target to re-freeze ($target_pod)..."
             if ! wait_for_target_freeze "$target_pod" "$freeze_baseline" "$target_node_name"; then
@@ -1595,6 +1611,7 @@ EOF
                             log "  SKIPPED: recycle failed"
                             continue
                         fi
+                        _skip_measurement=true
                     fi
                 else
                     # Genuine freeze failure — recycle with backoff.
@@ -1602,11 +1619,13 @@ EOF
                     sleep 60
                     if _reprime_target; then
                         log "  Target recycled and frozen — resuming"
+                        _skip_measurement=true
                     else
                         log "  Recycle failed — backing off 5min to let RSU recover..."
                         sleep 300
                         if _reprime_target; then
                             log "  Recovery succeeded after backoff"
+                            _skip_measurement=true
                         else
                             log "  SKIPPED: RSU still not recovering"
                             continue
@@ -1614,6 +1633,9 @@ EOF
                     fi
                 fi
             fi
+        fi
+        if $_skip_measurement; then
+            log "  Post-recycle warmup — skipping measurement this iteration"
         fi
         log "  Container frozen (confirmed by freeze daemon)."
 
@@ -1652,15 +1674,21 @@ EOF
             handoff_wall_ms=$(( (handoff_end - handoff_start) / 1000000 ))
             ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
             phase=$(get_handoff_phase "$handoff_target")
-            log "  Result: ${handoff_wall_ms}ms thaw (phase=$phase)"
-            emit_result "$scenario_name" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
+            if $_skip_measurement; then
+                log "  WARMUP (post-recycle): ${handoff_wall_ms}ms thaw — not recorded"
+            else
+                log "  Result: ${handoff_wall_ms}ms thaw (phase=$phase)"
+                emit_result "$scenario_name" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
+            fi
         else
             handoff_end=$(date +%s%N)
             handoff_wall_ms=$(( (handoff_end - handoff_start) / 1000000 ))
             ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
             phase=$(get_handoff_phase "$handoff_target")
             log "  TIMEOUT: ${handoff_wall_ms}ms thaw (phase=$phase) — recycling..."
-            emit_result "$scenario_name" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
+            if ! $_skip_measurement; then
+                emit_result "$scenario_name" "$i" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
+            fi
             # Thaw timed out — wait for RSU to settle, then recycle.
             log "  Waiting 60s for RSU to settle before recycling..."
             sleep 60
