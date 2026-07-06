@@ -1551,7 +1551,12 @@ EOF
             # Wait for ALL pods to be fully gone — not just the target pod.
             # On RSU, Terminating pods cause I/O contention that prevents new
             # pods from freezing, creating a death spiral.
-            _wait_all_target_pods_gone
+            # Do NOT proceed if pods are still stuck — creating new ones on top
+            # causes the load to spiral out of control.
+            if ! _wait_all_target_pods_gone; then
+                log "  ERROR: cannot reprime — old pods still present on RSU"
+                return 1
+            fi
             # Wait for RSU load to settle before creating a new pod.
             # The recycle itself (pod deletion, CRIU cleanup) spikes load.
             check_target_load
@@ -1620,19 +1625,22 @@ EOF
                     -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
                 if [[ -n "$_new_pod" && "$_new_pod" != "$target_pod" ]]; then
                     log "  Pod replaced by Kyverno rollout: $target_pod → $_new_pod"
-                    target_pod="$_new_pod"
-                    # The new pod may already be frozen — check directly
-                    if wait_for_target_freeze "$target_pod" "" "$target_node_name"; then
-                        freeze_baseline=$(get_target_freeze_count "$target_pod" "$_TARGET_FREEZE_DAEMON")
-                        log "  Replacement pod already frozen — continuing"
-                    else
-                        log "  Replacement pod failed to freeze — recycling..."
-                        sleep 60
-                        if ! _reprime_target; then
-                            log "  SKIPPED: recycle failed"
-                            continue
-                        fi
-                        _skip_measurement=true
+                    # Force-delete ALL target pods (old + Kyverno replacement)
+                    # to clear the RSU before re-priming with a clean pod.
+                    log "  Force-deleting all target pods..."
+                    kubectl delete pods -n "$NAMESPACE" \
+                        -l "serving.knative.dev/service=$target_svc" \
+                        --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
+                    kubectl wait pods -n "$NAMESPACE" \
+                        -l "serving.knative.dev/service=$target_svc" \
+                        --for=delete --timeout=120s >/dev/null 2>&1 || true
+                    # Wait for RSU load to settle after pod churn
+                    check_target_load
+                    _skip_measurement=true
+                    # Re-prime from scratch on a clean RSU
+                    if ! _reprime_target; then
+                        log "  SKIPPED: recycle after Kyverno rollout failed"
+                        continue
                     fi
                 else
                     # Genuine freeze failure — recycle with backoff.
