@@ -1163,10 +1163,7 @@ run_handoff_iteration() {
 
     # Wait for target KService and pods cleanup (operator deletes via cleanupOnDelete)
     local target_svc="${EA_NAME}-${handoff_target}"
-    kubectl wait ksvc "$target_svc" -n "$NAMESPACE" --for=delete --timeout=60s >/dev/null 2>&1 || true
-    kubectl wait pods -n "$NAMESPACE" \
-        -l "serving.knative.dev/service=$target_svc" \
-        --for=delete --timeout=90s >/dev/null 2>&1 || true
+    _wait_coldstart_pods_gone "$target_svc"
 
     # Build and apply handoff CR — measure from CR apply to CR Ready
     local _cr_yaml
@@ -1195,8 +1192,7 @@ run_handoff_iteration() {
         handoff_wall_ms=$(( (handoff_end - handoff_start) / 1000000 ))
         ts_after=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
         phase=$(get_handoff_phase "$handoff_target")
-        log "  TIMEOUT: ${handoff_wall_ms}ms (phase=$phase)"
-        emit_result "$scenario" "$iteration" "0,0,0,0,0" "$ts_before" "$ts_after" "$phase" "$handoff_target" "$handoff_wall_ms"
+        log "  TIMEOUT: ${handoff_wall_ms}ms (phase=$phase) — not recorded"
     fi
 
     # Cleanup handoff CR so next iteration starts fresh
@@ -1206,10 +1202,35 @@ run_handoff_iteration() {
     # On I/O-constrained nodes (RSU ARM64), a Terminating pod causes severe
     # contention with the next iteration's pod creation, inflating times.
     log "  Waiting for scale to zero..."
-    kubectl wait ksvc "$target_svc" -n "$NAMESPACE" --for=delete --timeout=60s >/dev/null 2>&1 || true
-    kubectl wait pods -n "$NAMESPACE" \
-        -l "serving.knative.dev/service=$target_svc" \
-        --for=delete --timeout=90s >/dev/null 2>&1 || true
+    _wait_coldstart_pods_gone "$target_svc"
+}
+
+# Helper: wait for all pods on a cold-start target KService to terminate.
+# Force-deletes stuck Terminating pods after 60s to prevent pile-up on RSU.
+_wait_coldstart_pods_gone() {
+    local svc="$1"
+    kubectl wait ksvc "$svc" -n "$NAMESPACE" --for=delete --timeout=60s >/dev/null 2>&1 || true
+    local _deadline=$((SECONDS + 180)) _force_deleted=false
+    while (( SECONDS < _deadline )); do
+        local _count
+        _count=$(kubectl get pods -n "$NAMESPACE" \
+            -l "serving.knative.dev/service=$svc" \
+            --no-headers 2>/dev/null | wc -l)
+        if (( _count == 0 )); then
+            return 0
+        fi
+        if (( SECONDS > _deadline - 120 )) && [[ "$_force_deleted" != "true" ]]; then
+            log "  Force-deleting stuck pods ($svc)..."
+            kubectl delete pods -n "$NAMESPACE" \
+                -l "serving.knative.dev/service=$svc" \
+                --grace-period=0 --force --wait=false >/dev/null 2>&1 || true
+            _force_deleted=true
+        fi
+        sleep 5
+    done
+    log "  WARNING: pods still present after 180s ($svc)"
+    # Last resort: wait for load to settle before next iteration
+    check_target_load
 }
 
 # ---- scenario runners -------------------------------------------------------
