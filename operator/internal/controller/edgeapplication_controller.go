@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -79,11 +80,38 @@ type desiredService struct {
 
 const (
 	defaultPinByLabelKey = "kubernetes.io/hostname"
+
+	// checkpointSupportLabel is set to "true" by the freeze daemon on nodes
+	// whose kernel/CRIU support process-level checkpoint/restore. The operator
+	// only enables checkpoint-based idling (freeze) on nodes carrying it.
+	checkpointSupportLabel = "mec.atnog.org/checkpoint-support"
 )
 
 var (
 	reNonDNS = regexp.MustCompile(`[^a-z0-9-]+`)
 )
+
+// nodeSelectorSupportsCheckpoint reports whether every node matching sel carries
+// the checkpointSupportLabel. It fails safe: an empty match set, a node missing
+// the label, or a List error all yield false, so freeze is never enabled on a
+// node that cannot honor it (avoiding a freeze-enabled pod stuck always-on).
+// A nil/empty selector matches all nodes, so freeze is enabled only if the whole
+// cluster is checkpoint-capable.
+func (r *EdgeApplicationReconciler) nodeSelectorSupportsCheckpoint(ctx context.Context, sel map[string]string) bool {
+	var nodes corev1.NodeList
+	if err := r.List(ctx, &nodes, client.MatchingLabels(sel)); err != nil {
+		return false
+	}
+	if len(nodes.Items) == 0 {
+		return false
+	}
+	for i := range nodes.Items {
+		if nodes.Items[i].Labels[checkpointSupportLabel] != "true" {
+			return false
+		}
+	}
+	return true
+}
 
 func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
@@ -165,14 +193,22 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	createTriggers := len(baseFilters) > 0
 
 	// Background app readiness probe when no trigger exists.
+	// Use a TCP-socket probe on the user port (Knative default 8080), NOT an
+	// exec probe: exec probes stay on the user-container and kubelet runs them
+	// directly, so they fail once the container is CRIU-frozen ("cannot exec in
+	// a stopped state"), driving the pod NotReady and eventually causing Knative
+	// to roll/replace the frozen pod. A TCP probe is aggregated into the
+	// queue-proxy, where the freezer plugin's fake listener answers it while
+	// frozen, keeping the pod Ready. FailureThreshold is relaxed so the brief
+	// thaw transition (fake listener stopped, real app starting) does not flap.
 	if !createTriggers {
 		basePodSpec.Containers[0].ReadinessProbe = &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
-				Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", "exit 0"}},
+				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(8080)},
 			},
 			PeriodSeconds:    5,
 			TimeoutSeconds:   1,
-			FailureThreshold: 1,
+			FailureThreshold: 3,
 		}
 	}
 
@@ -321,8 +357,18 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	// which the fake listener does not produce, so without minScale>=1
 	// the pod is torn down before any event can reach the plugin.
 	// Force minScale>=1 in this case, regardless of what the user set.
+	//
+	// Checkpoint-based idling is only enabled on nodes that actually support
+	// checkpoint/restore. On a non-supporting node the runtime freeze would
+	// fail and the pod would be pinned always-on; instead we withhold the
+	// freeze annotation and the minScale>=1 force, so the service degrades
+	// gracefully to conventional scale-to-zero and cold start. The service's
+	// node selector encodes its target node for base, replica, and zone
+	// services alike.
+	freezeViable := d.FreezeEnabled && r.nodeSelectorSupportsCheckpoint(ctx, d.PodSpec.NodeSelector)
+
 	effectiveMinScale := d.MinScale
-	if d.FreezeEnabled {
+	if freezeViable {
 		one := int32(1)
 		if effectiveMinScale == nil || *effectiveMinScale < 1 {
 			effectiveMinScale = &one
@@ -333,7 +379,7 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	if effectiveMinScale != nil {
 		templateAnnotations["autoscaling.knative.dev/minScale"] = strconv.FormatInt(int64(*effectiveMinScale), 10)
 	}
-	if d.FreezeEnabled {
+	if freezeViable {
 		templateAnnotations["qpoption.knative.dev/freezer-activate"] = "enable"
 		if d.FreezeIdleTimeout != nil {
 			templateAnnotations["qpoption.knative.dev/freezer-idle-timeout"] = strconv.FormatInt(int64(*d.FreezeIdleTimeout), 10)
@@ -344,7 +390,7 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	}
 
 	// Inject HOST_IP env var via Downward API when freeze is enabled
-	if d.FreezeEnabled {
+	if freezeViable {
 		hostIPEnv := corev1.EnvVar{
 			Name: "HOST_IP",
 			ValueFrom: &corev1.EnvVarSource{
@@ -434,7 +480,7 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	} else {
 		delete(updated.Spec.ConfigurationSpec.Template.Annotations, "autoscaling.knative.dev/minScale")
 	}
-	if d.FreezeEnabled {
+	if freezeViable {
 		updated.Spec.ConfigurationSpec.Template.Annotations["qpoption.knative.dev/freezer-activate"] = "enable"
 		if d.FreezeIdleTimeout != nil {
 			updated.Spec.ConfigurationSpec.Template.Annotations["qpoption.knative.dev/freezer-idle-timeout"] = strconv.FormatInt(int64(*d.FreezeIdleTimeout), 10)
@@ -708,9 +754,15 @@ func min(a, b int) int {
 	return b
 }
 
-// When a Node is added/removed or its labels change, requeue all EdgeApplications
-// that are in daemon mode (have spec.zones set).
-func (r *EdgeApplicationReconciler) nodeToDaemonEdgeApps(ctx context.Context, obj client.Object) []reconcile.Request {
+// When a Node is added/removed or its labels change, requeue every
+// freeze-enabled EdgeApplication so it re-evaluates node checkpoint capability.
+// This covers base, replica, and zone apps alike: a base/replica app pins its
+// pod via nodeSelector and a zone app via per-zone hostnames, and either can
+// gain or lose the mec.atnog.org/checkpoint-support label as a daemon comes and
+// goes. Only freeze-enabled apps are enqueued (others ignore the label), and the
+// reconcile is a no-op when nothing actually changed, so a cluster-wide requeue
+// on a node event is cheap for the small app counts typical of a MEC cluster.
+func (r *EdgeApplicationReconciler) nodeToFreezeEdgeApps(ctx context.Context, obj client.Object) []reconcile.Request {
 	if _, ok := obj.(*corev1.Node); !ok {
 		return nil
 	}
@@ -723,10 +775,8 @@ func (r *EdgeApplicationReconciler) nodeToDaemonEdgeApps(ctx context.Context, ob
 	reqs := make([]reconcile.Request, 0, len(apps.Items))
 	for i := range apps.Items {
 		a := &apps.Items[i]
-		if a.Spec.Service == nil {
-			continue
-		}
-		if len(a.Spec.Zones) == 0 {
+		if a.Spec.Service == nil ||
+			a.Spec.Service.FreezeEnabled == nil || !*a.Spec.Service.FreezeEnabled {
 			continue
 		}
 		reqs = append(reqs, reconcile.Request{
@@ -757,14 +807,18 @@ func (r *EdgeApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		},
 	}
 
+	// GenerationChangedPredicate is scoped to the EdgeApplication source only.
+	// As a global WithEventFilter it also gated the Node watch, and a label-only
+	// change on a Node does not bump metadata.generation, so node capability
+	// drift was silently dropped before nodePred could see it.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&mecv1alpha1.EdgeApplication{}).
-		WithEventFilter(predicate.GenerationChangedPredicate{}).
+		For(&mecv1alpha1.EdgeApplication{},
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&servingv1.Service{}).
 		Owns(&eventingv1.Trigger{}).
 		Watches(
 			&corev1.Node{},
-			handler.EnqueueRequestsFromMapFunc(r.nodeToDaemonEdgeApps),
+			handler.EnqueueRequestsFromMapFunc(r.nodeToFreezeEdgeApps),
 			builder.WithPredicates(nodePred),
 		).
 		Named("edgeapplication").

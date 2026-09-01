@@ -10,7 +10,7 @@ spec:
         autoscaling.knative.dev/minScale: "1"
     spec:
       nodeSelector:
-        kubernetes.io/hostname: rsu-mk6-a-db7f2d0f
+        kubernetes.io/hostname: rsu-mk6-a
       containers:
         - image: ghcr.io/pmacoutinho/benchmark-hop:latest
           imagePullPolicy: Always
