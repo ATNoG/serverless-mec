@@ -1,3 +1,0 @@
-{"mode":"criu_thaw","iteration":1,"t_dns_s":0.000261,"t_connect_s":0.001123,"t_ttfb_s":0.889925,"t_total_s":0.890066,"http_code":422,"ts_before":"2026-05-01T13:37:29.704Z","ts_after":"2026-05-01T13:37:32.982Z"}
-{"mode":"criu_thaw","iteration":2,"t_dns_s":0.000113,"t_connect_s":0.000633,"t_ttfb_s":1.038675,"t_total_s":1.038752,"http_code":422,"ts_before":"2026-05-01T13:37:50.140Z","ts_after":"2026-05-01T13:37:52.644Z"}
-{"mode":"cold_start","iteration":2,"t_dns_s":0.009032,"t_connect_s":0.010229,"t_ttfb_s":10.894804,"t_total_s":10.894938,"http_code":422,"ts_before":"2026-05-01T13:42:48.518Z","ts_after":"2026-05-01T13:43:00.064Z"}

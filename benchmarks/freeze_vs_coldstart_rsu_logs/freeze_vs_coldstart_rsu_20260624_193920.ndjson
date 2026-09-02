@@ -1,3 +1,0 @@
-{"mode":"criu_thaw","iteration":1,"t_dns_s":0.000219,"t_connect_s":0.003233,"t_ttfb_s":11.492300,"t_total_s":11.494186,"http_code":422,"ts_before":"2026-06-24T18:40:36.191Z","ts_after":"2026-06-24T18:40:48.510Z","node":"rsu-mk6-a","label":""}
-{"mode":"criu_thaw","iteration":2,"t_dns_s":0.000087,"t_connect_s":0.003236,"t_ttfb_s":10.950715,"t_total_s":10.952659,"http_code":422,"ts_before":"2026-06-24T18:40:54.874Z","ts_after":"2026-06-24T18:41:06.605Z","node":"rsu-mk6-a","label":""}
-{"mode":"criu_thaw","iteration":3,"t_dns_s":0.000059,"t_connect_s":0.003168,"t_ttfb_s":10.877764,"t_total_s":10.879558,"http_code":422,"ts_before":"2026-06-24T18:41:10.641Z","ts_after":"2026-06-24T18:41:22.277Z","node":"rsu-mk6-a","label":""}

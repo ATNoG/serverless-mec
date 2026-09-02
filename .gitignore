@@ -2,3 +2,9 @@ sniffer/rust/Cargo.lock
 sniffer/rust/target/
 benchmarks/benchlog/
 benchmarks/*.ndjson
+# Raw benchmark result logs (regenerate figures via generate_plots.py)
+benchmarks/*_logs/
+# Generated figures
+benchmarks/figures/
+benchmarks/figures_no_filter/
+benchmarks/__pycache__/

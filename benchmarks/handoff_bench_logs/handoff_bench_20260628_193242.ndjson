@@ -1,1 +1,0 @@
-{"scenario":"rsu-a-freeze","iteration":3,"t_dns_s":0.0,"t_connect_s":0.0,"t_ttfb_s":0.0,"t_total_s":0.0,"http_code":"0","ts_before":"2026-06-28T18:36:58.944Z","ts_after":"2026-06-28T18:37:08.378Z","handoff_phase":"Unknown","pipeline":{},"handoff_wall_ms":9429.0}
