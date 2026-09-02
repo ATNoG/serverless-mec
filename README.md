@@ -9,8 +9,8 @@ This project implements the application lifecycle management layer of an ETSI ME
 - An **EdgeApplication CRD** aligned with ETSI MEC 010-2, with a vendor-specific extension that maps to Knative Services and Triggers
 - A **Kubernetes operator** that reconciles EdgeApplications into Knative Services, Triggers, and per-node replicas
 - An **ITS packet capture pipeline** that sniffs ETSI ITS CAM/DENM frames from RSU network interfaces, converts them to CloudEvents, and routes them through a Kafka-backed Knative Broker
-- **CRIU-based container freezing** to checkpoint idle serverless functions and restore them on demand, freeing RAM on resource-constrained edge nodes
-- **Application handoff** between edge nodes via the EdgeApplicationHandoff CRD
+- **CRIU-based container checkpoint/restore** to freeze idle serverless functions and restore them on demand, freeing RAM on both x86 and ARM64 edge nodes, with per-node capability detection so freeze is enabled only where CRIU is available (degrading gracefully to cold starts elsewhere)
+- **Application handoff** (make-before-break) between edge nodes via the EdgeApplicationHandoff CRD
 
 ## Architecture
 
@@ -18,40 +18,40 @@ This project implements the application lifecycle management layer of an ETSI ME
 ┌─────────────────────────────────────────────────────────────────────┐
 │  RSU / Edge Node                                                    │
 │                                                                     │
-│  ┌─────────────┐    CloudEvents     ┌──────────────────────┐       │
-│  │ ITS Sniffer  │──────────────────►│  Kafka-backed Broker  │       │
-│  │ (DaemonSet)  │   type=its.cam    │  (Knative Eventing)   │       │
-│  │ hostNetwork  │   type=its.denm   └──────────┬───────────┘       │
-│  └─────────────┘                               │                    │
-│                                          Knative Triggers           │
-│                                       (attribute filtering)         │
-│                                                │                    │
-│                        ┌───────────────────────┼──────────┐        │
-│                        ▼                       ▼          ▼        │
-│                 ┌─────────────┐    ┌──────────────┐  ┌────────┐   │
-│                 │Retransmitter│    │  CAM Logger   │  │  MQTT  │   │
-│                 │  (KService) │    │  (KService)   │  │Forwarder│  │
-│                 └──────┬──────┘    └──────────────┘  └────────┘   │
-│                        │                                            │
-│                        ▼                                            │
-│             ┌─────────────────────┐                                 │
-│             │ Queue-Proxy Plugin  │  idle timeout → freeze          │
-│             │ (freezer plugin)    │  new request  → thaw            │
-│             └─────────┬───────────┘                                 │
-│                       │ HTTP                                        │
-│                       ▼                                             │
-│             ┌─────────────────────┐                                 │
-│             │ Freeze Daemon       │  CRIU checkpoint/restore        │
-│             │ (DaemonSet)         │  via containerd                 │
-│             └─────────────────────┘                                 │
+│  ┌─────────────┐    CloudEvents      ┌─────────────────────┐        │
+│  │ ITS Sniffer │────────────────────►│ Kafka-backed Broker │        │
+│  │ (DaemonSet) │    type=its.cam     │ (Knative Eventing)  │        │
+│  │ hostNetwork │    type=its.denm    └──────────┬──────────┘        │
+│  └─────────────┘                                │                   │
+│                                         Knative Triggers            │
+│                                      (attribute filtering)          │
+│                                                 │                   │
+│                ┌──────────────────┬─────────────┴────┐              │
+│                ▼                  ▼                  ▼              │
+│        ┌───────────────┐   ┌─────────────┐   ┌───────────────┐      │
+│        │ Retransmitter │   │ CAM Logger  │   │MQTT Forwarder │      │
+│        │  (KService)   │   │ (KService)  │   │  (KService)   │      │
+│        └───────┬───────┘   └─────────────┘   └───────────────┘      │
+│                │                                                    │
+│                ▼                                                    │
+│        ┌───────────────────────┐                                    │
+│        │  Queue-Proxy Plugin   │  idle timeout → freeze             │
+│        │   (freezer plugin)    │  new request  → thaw               │
+│        └───────────┬───────────┘                                    │
+│                    │ HTTP                                           │
+│                    ▼                                                │
+│        ┌───────────────────────┐                                    │
+│        │     Freeze Daemon     │  CRIU checkpoint/restore           │
+│        │      (DaemonSet)      │  via containerd                    │
+│        └───────────────────────┘                                    │
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
 │  MEC Operator (runs in cluster)                                     │
 │                                                                     │
-│  EdgeApplication CR ──► Knative Service(s) + Trigger(s)            │
-│  Zones             ──► one KService per matching node              │
-│  Handoff CR        ──► migrate app instance between nodes          │
+│  EdgeApplication CR ──► Knative Service(s) + Trigger(s)             │
+│  Zones             ──► one KService per matching node               │
+│  Handoff CR        ──► migrate app instance between nodes           │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -67,8 +67,10 @@ A Go operator (Kubebuilder) that reconciles `EdgeApplication` custom resources i
 - **`triggerFilters`:** list of CloudEvent attribute maps. Each entry creates a Knative Trigger pointing to the service
 - **`replicas`:** additional named instances on specific nodes
 - **`zones`:** daemon mode. Each zone is a node label selector (e.g., `road-rsu: "true"`); the operator creates one KService per node matching the zone's `matchNodes`
+- **`freezeEnabled`:** enables CRIU checkpoint/restore idling for the service (via the knative-freezer-plugin). Freeze is only activated on nodes the freeze daemon has labeled checkpoint-capable; otherwise the service falls back to standard scale-to-zero cold starts
+- **`freezeIdleTimeout`:** seconds of inactivity before a container is checkpointed (plugin default: 30s), applied as the `qpoption.knative.dev/freezer-idle-timeout` annotation
 
-**EdgeApplicationHandoff CRD:** manages migration of application instances between edge nodes.
+**EdgeApplicationHandoff CRD:** manages make-before-break migration of application instances between edge nodes. The target is deployed and checkpointed in place; on handoff the target is restored while the source is retained until the target is Ready.
 
 Example EdgeApplication:
 ```yaml
@@ -104,10 +106,10 @@ spec:
 A C-based ITS packet sniffer and producer that processes all packet layers in sequence (GeoNetworking, BTP, CAM/DENM). Uses raw sockets for capture with no external dependencies (no tshark/pyshark needed), making it suitable for resource-constrained RSU nodes.
 
 Components:
-- **`its_sniffer`** — captures GeoNetworking frames (`ether proto 0x8947`) from the network interface, decodes the full ITS stack, and posts CloudEvents to the Knative Broker
-- **`its_producer`** — generates synthetic CAM/DENM packets for testing and benchmarking
-- **`cloudevent_sender`** — shared CloudEvent HTTP posting library
-- **`logger`** — shared logging utilities
+- **`its_sniffer`**: captures GeoNetworking frames (`ether proto 0x8947`) from the network interface, decodes the full ITS stack, and posts CloudEvents to the Knative Broker
+- **`its_producer`**: generates synthetic CAM/DENM packets for testing and benchmarking
+- **`cloudevent_sender`**: shared CloudEvent HTTP posting library
+- **`logger`**: shared logging utilities
 
 The sniffer runs as a DaemonSet with `hostNetwork: true` and `NET_ADMIN`/`NET_RAW` capabilities. Events are posted to a Kafka-backed Knative Broker via `K_SINK` (injected by SinkBinding).
 
@@ -115,32 +117,32 @@ The sniffer runs as a DaemonSet with `hostNetwork: true` and `NET_ADMIN`/`NET_RA
 
 Two companion repositories handle checkpoint/restore of idle containers:
 
-- **[container-freezer-criu](https://github.com/pmacoutinho/container-freezer-criu)** — DaemonSet that performs CRIU checkpoint (freeze) and restore (thaw) via containerd. Dumps full process state to disk, frees RAM, restores in ~641ms vs ~5258ms cold start (8.2x speedup).
-- **[knative-freezer-plugin](https://github.com/pmacoutinho/knative-freezer-plugin)** — Custom queue-proxy that detects idle containers (30s default) and triggers freeze/thaw automatically. Thaws transparently on incoming requests.
+- **[container-freezer](https://github.com/ATNoG/container-freezer)**: DaemonSet that performs CRIU checkpoint (freeze) and restore (thaw) via containerd on both x86 and ARM64 nodes (on arm64 it checkpoints to a filesystem path to bypass the overlay/xattr limits of older kernels). It also **self-labels each node** with `mec.atnog.org/checkpoint-support` (probing the kernel and the host's CRIU binary) so the operator enables freeze only where it works. On x86 VMs, restore takes ~731ms vs ~5978ms cold start (8.2x); on ARM64 RSUs, ~10.9s vs ~25.6s (2.3x).
+- **[knative-freezer-plugin](https://github.com/ATNoG/knative-freezer-plugin)**: Custom queue-proxy that checkpoints idle containers (default 30s, configurable per-app via `freezeIdleTimeout`) and thaws them transparently on the next request.
 
 Both are included as **git submodules** in this repo.
 
-Additionally, `kyverno/inject-restart-policy-never.yaml` provides a Kyverno ClusterPolicy that injects `restartPolicy: Never` on Knative user containers to prevent kubelet from restarting containers after CRIU checkpoint kills them.
+Additionally, `kyverno/inject-restart-policy-never.yaml` provides a Kyverno ClusterPolicy that injects `restartPolicy: Never` on freeze-enabled Knative user containers, preventing kubelet from restarting them after CRIU checkpoint kills them. (The idle timeout is now a first-class CRD field, `freezeIdleTimeout`, rather than a Kyverno policy.)
 
 ### Knative Services (`knativeServices/`)
 
-- **Event Display** — simple CloudEvent logger for debugging
-- **MQTT Forwarder** — receives CloudEvents via HTTP and republishes to MQTT topics (e.g., `its/{type}/st{stationtype}`)
-- **Retransmitter** — forwards events between brokers/hops for multi-tier edge architectures and benchmarking
+- **Event Display**: simple CloudEvent logger for debugging
+- **MQTT Forwarder**: receives CloudEvents via HTTP and republishes to MQTT topics (e.g., `its/{type}/st{stationtype}`)
+- **Retransmitter**: forwards events between brokers/hops for multi-tier edge architectures and benchmarking
 
 ### Event Routing
 
-- **Brokers** (`brokers/`) — Kafka-backed Knative Broker (Strimzi) and optional Mosquitto MQTT broker
-- **Triggers** (`triggers/`) — attribute-based routing examples (e.g., `type=its.cam`, `stationtype=5`)
-- **SinkBinding** (`sinkBinding/`) — injects `K_SINK` into sniffer DaemonSets
+- **Brokers** (`brokers/`): Kafka-backed Knative Broker (Strimzi) and optional Mosquitto MQTT broker
+- **Triggers** (`triggers/`): attribute-based routing examples (e.g., `type=its.cam`, `stationtype=5`)
+- **SinkBinding** (`sinkBinding/`): injects `K_SINK` into sniffer DaemonSets
 
 ## Prerequisites
 
 - **K3s** (or Kubernetes) cluster with `kubectl` access
 - **Knative Serving + Eventing** installed ([install guide](https://knative.dev/docs/install/yaml-install/))
 - **Strimzi** (Kafka) for the Knative Kafka Broker
-- **Kyverno** (if using CRIU container freezing)
-- **CRIU** installed on worker nodes (if using container freezing, amd64 only)
+- **Kyverno** (if using CRIU container freezing, to inject `restartPolicy: Never`)
+- **CRIU** installed on worker nodes that should support freezing (x86 and ARM64; the freeze daemon auto-detects per-node support and labels nodes accordingly)
 
 ## Quick Start
 
@@ -235,16 +237,23 @@ kubectl exec -it pcap-replayer -- tcpreplay --intf1=eth0 /tmp/output.pcap
 
 ## Benchmarking
 
-Latency benchmarks correlate sniffer and retransmitter NDJSON logs:
+The `benchmarks/` folder contains the checkpoint/restore, migration, and pipeline benchmarks:
 
 ```bash
-python3 benchmarks/analyze_bench.py
+# Checkpoint/restore vs cold start
+./benchmarks/bench_freeze_vs_coldstart.sh        # x86 VMs
+./benchmarks/bench_fvc_rsu.sh                     # ARM64 RSUs
+
+# Migration (handoff) latency, e.g. RSU freeze scenario
+./benchmarks/bench_handoff.sh --scenario rsu-freeze --iterations 20
+
+# End-to-end ITS pipeline latency (sniffer -> broker -> retransmitter)
+./benchmarks/capture_pipeline_bench.sh
 ```
 
-CRIU benchmark (cold start vs checkpoint/restore, 50 iterations):
-```bash
-cd container-freezer && ./benchmark-integration.sh 50
-```
+Each script writes NDJSON logs to a `*_logs/` folder. The `analyze_*.py` scripts
+summarize a run, and `generate_plots.py` renders the evaluation figures. (The
+logs and generated figures are gitignored and not tracked.)
 
 ## Project Structure
 
@@ -274,8 +283,8 @@ knative-freezer-plugin/    # [submodule] Queue-proxy freezer plugin
 
 ## Related Repositories
 
-- [container-freezer-criu](https://github.com/pmacoutinho/container-freezer-criu) — CRIU checkpoint/restore daemon for Knative containers
-- [knative-freezer-plugin](https://github.com/pmacoutinho/knative-freezer-plugin) — Queue-proxy plugin for automatic idle freeze/thaw
+- [container-freezer](https://github.com/ATNoG/container-freezer): CRIU checkpoint/restore daemon for Knative containers (per-node capability detection, x86 + ARM64)
+- [knative-freezer-plugin](https://github.com/ATNoG/knative-freezer-plugin): Queue-proxy plugin for automatic idle freeze/thaw
 
 ## License
 
