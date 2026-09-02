@@ -4,6 +4,7 @@
 import json
 import glob
 import os
+import re
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -29,6 +30,18 @@ BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 FIGURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'figures')
 palette = sns.color_palette("colorblind")
 
+# The paper's checkpoint/restore results were measured on data collected up to
+# this date; later runs are excluded so the figure matches the reported means.
+PAPER_DATA_CUTOFF = '20260629'
+
+
+def paper_files(pattern):
+    """Sorted files whose filename date is within the paper's data window."""
+    def fdate(p):
+        m = re.findall(r'20\d{6}', p)
+        return m[-1] if m else '99999999'
+    return [f for f in sorted(glob.glob(pattern)) if fdate(f) <= PAPER_DATA_CUTOFF]
+
 ANNOT_SIZE = BASE_FONT  # annotation font size, consistent across all plots
 
 
@@ -52,25 +65,25 @@ def se(data):
 def plot_freeze_vs_coldstart():
     # VM data
     vm_thaw, vm_cold = [], []
-    for f in sorted(glob.glob(f'{BENCH_DIR}/freeze_vs_coldstart_logs/*.ndjson')):
+    for f in paper_files(f'{BENCH_DIR}/freeze_vs_coldstart_logs/*.ndjson'):
         with open(f) as fh:
             for line in fh:
                 d = json.loads(line)
                 if d.get('mode') == 'criu_thaw' and 't_ttfb_s' in d:
-                    vm_thaw.append(d['t_ttfb_s'] * 1000)
+                    vm_thaw.append(d['t_ttfb_s'])
                 elif d.get('mode') == 'cold_start' and 't_ttfb_s' in d:
-                    vm_cold.append(d['t_ttfb_s'] * 1000)
+                    vm_cold.append(d['t_ttfb_s'])
 
     # RSU data
     rsu_thaw, rsu_cold = [], []
-    for f in sorted(glob.glob(f'{BENCH_DIR}/freeze_vs_coldstart_rsu_logs/*.ndjson')):
+    for f in paper_files(f'{BENCH_DIR}/freeze_vs_coldstart_rsu_logs/*.ndjson'):
         with open(f) as fh:
             for line in fh:
                 d = json.loads(line)
                 if d.get('mode') == 'criu_thaw' and 't_ttfb_s' in d:
-                    rsu_thaw.append(d['t_ttfb_s'] * 1000)
+                    rsu_thaw.append(d['t_ttfb_s'])
                 elif d.get('mode') == 'cold_start' and 't_ttfb_s' in d:
-                    rsu_cold.append(d['t_ttfb_s'] * 1000)
+                    rsu_cold.append(d['t_ttfb_s'])
 
     vm_cold_f = sigma2_filter(vm_cold)[:2000]
     vm_thaw_f = sigma2_filter(vm_thaw)[:2000]
@@ -101,14 +114,14 @@ def plot_freeze_vs_coldstart():
         anchor, xoff, yoff = annot_cfg[i]
         y_anchor = max(d) if anchor == 'top' else min(d)
         va = 'bottom' if anchor == 'top' else 'top'
-        ax.annotate(f'{mean:.0f} $\\pm$ {s:.2f} ms',
+        ax.annotate(f'{mean:.2f} $\\pm$ {s:.2f} s',
                     xy=(i + 1, y_anchor),
                     xytext=(xoff, yoff), textcoords='offset points',
                     fontsize=fs_fvc, ha='center', va=va)
 
     ymax = max(max(d) for d in all_data)
     ax.set_ylim(top=ymax * 1.15)
-    ax.set_ylabel('TTFB (ms)', fontsize=fs_fvc)
+    ax.set_ylabel('TTFB (s)', fontsize=fs_fvc)
     ax.tick_params(axis='both', labelsize=fs_fvc)
     ax.grid(axis='y', alpha=0.3)
     ax.text(0.01, 0.99, 'Labels report mean ± standard error',
@@ -119,7 +132,7 @@ def plot_freeze_vs_coldstart():
 
     for label, d in zip(all_labels, all_data):
         l = label.replace('\n', ' ')
-        print(f'{l:20s}: n={len(d)}, mean={np.mean(d):.0f}ms, se={se(d):.1f}ms')
+        print(f'{l:20s}: n={len(d)}, mean={np.mean(d):.2f}s, se={se(d):.3f}s')
     print(f'VM Speedup:  {np.mean(vm_cold_f)/np.mean(vm_thaw_f):.1f}x')
     print(f'RSU Speedup: {np.mean(rsu_cold_f)/np.mean(rsu_thaw_f):.1f}x')
 
