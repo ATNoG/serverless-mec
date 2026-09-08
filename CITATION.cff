@@ -1,0 +1,14 @@
+cff-version: 1.1.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: Coutinho
+  given-names: Pedro
+  orcid: https://orcid.org/0009-0009-5862-897X
+- family-names: Escaleira
+  given-names: Pedro
+  orcid: https://orcid.org/0000-0001-9080-6080
+title:Serverless MEC
+version: cnsm-paper
+date-released: 2026-09-08
+doi: 10.5281/zenodo.22663443
+url: https://github.com/ATNoG/serverless-mec
