@@ -1,0 +1,82 @@
+# File: mec-dnsrules.yaml
+# DNSRule (ETSI MEC DNSRule IOC), updated to reference the EdgeApplication CRD.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: dnsrules.mec.etsi.org
+spec:
+  group: mec.etsi.org
+  scope: Namespaced
+  names:
+    plural: dnsrules
+    singular: dnsrule
+    kind: DNSRule
+    shortNames: [drule, dnsr]
+    categories: [mec]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: App
+          type: string
+          jsonPath: .spec.applicationRef.name
+        - name: Domain
+          type: string
+          jsonPath: .spec.domainName
+        - name: IP
+          type: string
+          jsonPath: .spec.ipAddress
+        - name: IPType
+          type: string
+          jsonPath: .spec.ipAddressType
+        - name: State
+          type: string
+          jsonPath: .spec.state
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              description: "DNS rule specifying domain resolution toward an EdgeApplication."
+              required: [dnsRuleId, domainName, ipAddressType, ipAddress, applicationRef]
+              properties:
+                dnsRuleId:
+                  type: string
+                  description: "Identifier of the DNS rule."
+                domainName:
+                  type: string
+                  description: "FQDN of the DNS rule."
+                ipAddressType:
+                  type: string
+                  enum: ["IPv4", "IPv6"]
+                  description: "Type of the IP address."
+                ipAddress:
+                  type: string
+                  description: "Address to which the domain resolves."
+                timeToLive:
+                  type: integer
+                  minimum: 0
+                  description: "Time to live of the DNS rule, in seconds (optional)."
+                state:
+                  type: string
+                  enum: ["ACTIVE", "INACTIVE"]
+                  default: "INACTIVE"
+                  description: "Administrative state of the DNS rule."
+                applicationRef:
+                  type: object
+                  description: "The EdgeApplication this DNSRule is associated with."
+                  required: [name]
+                  properties:
+                    name: { type: string }
+                    namespace: { type: string }
+            status:
+              type: object
+              properties:
+                active:
+                  type: boolean
+                  description: "Set true by the operator when the rule is applied."
