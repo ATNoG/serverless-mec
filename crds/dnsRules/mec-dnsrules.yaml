@@ -53,7 +53,7 @@ spec:
                   description: "FQDN of the DNS rule."
                 ipAddressType:
                   type: string
-                  enum: ["IPv4", "IPv6"]
+                  enum: ["IP_V4", "IP_V6"]
                   description: "Type of the IP address."
                 ipAddress:
                   type: string
