@@ -16,7 +16,6 @@ spec:
     protocol:
       - "UDP"
     dscp: []
-    direction: "BIDIRECTIONAL"
     tunnelInfo: {}
   action: "DUPLICATE_AS_IS"
   dstInterface:
