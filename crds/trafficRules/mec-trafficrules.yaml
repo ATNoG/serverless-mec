@@ -9,17 +9,18 @@ spec:
   filterType: "FLOW"
   priority: 200
   trafficFilter:
-    srcAddress: []
-    dstAddress: []
-    srcPort: []
-    dstPort: []
-    protocol:
-      - "UDP"
-    dscp: []
-    tunnelInfo: {}
-  action: "DUPLICATE_AS_IS"
+    - srcAddress: []
+      dstAddress: []
+      srcPort: []
+      dstPort: []
+      protocol:
+        - "UDP"
+      dscp: []
+  action: "DUPLICATE_DECAPSULATED"
+  # DUPLICATE_* actions require two destination interfaces (ETSI: client side and core side)
   dstInterface:
-    interfaceType: "TRUSTED"
+    - interfaceType: "MAC"
+    - interfaceType: "MAC"
   applicationRef:
     name: "live-capture"
     namespace: "default"
