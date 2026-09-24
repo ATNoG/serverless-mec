@@ -1,0 +1,117 @@
+# File: mec-trafficrules-crd.yaml
+# TrafficRule (ETSI MEC TrafficRuleDescriptor IOC), updated to reference the EdgeApplication CRD.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: trafficrules.mec.etsi.org
+spec:
+  group: mec.etsi.org
+  scope: Namespaced
+  names:
+    plural: trafficrules
+    singular: trafficrule
+    kind: TrafficRule
+    shortNames: [trule, trafrule]
+    categories: [mec]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: App
+          type: string
+          jsonPath: .spec.applicationRef.name
+        - name: Priority
+          type: integer
+          jsonPath: .spec.priority
+        - name: FilterType
+          type: string
+          jsonPath: .spec.filterType
+        - name: Action
+          type: string
+          jsonPath: .spec.action
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              description: "Traffic rule specifying which packets are steered toward an EdgeApplication."
+              required: [trafficRuleId, filterType, priority, trafficFilter, action, dstInterface, applicationRef]
+              properties:
+                trafficRuleId:
+                  type: string
+                  description: "Identifier of the traffic rule."
+                filterType:
+                  type: string
+                  enum: ["FLOW", "PACKET"]
+                  description: "Definition of filter type: per FLOW or PACKET."
+                priority:
+                  type: integer
+                  minimum: 0
+                  maximum: 255
+                  description: "Priority in the range 0 to 255; on conflict the higher priority takes precedence."
+                trafficFilter:
+                  type: object
+                  description: "Filter identifying the flow/packets handled by the MEC host (ETSI TrafficFilter)."
+                  properties:
+                    direction:
+                      type: string
+                      description: "Data flow direction when filterType is FLOW; ETSI permits Downlink and Uplink."
+                    srcAddress:
+                      type: array
+                      items: { type: string }
+                    dstAddress:
+                      type: array
+                      items: { type: string }
+                    srcPort:
+                      type: array
+                      items: { type: string, pattern: "^[0-9]+(-[0-9]+)?$" }
+                    dstPort:
+                      type: array
+                      items: { type: string, pattern: "^[0-9]+(-[0-9]+)?$" }
+                    protocol:
+                      type: array
+                      items: { type: string }
+                    dscp:
+                      type: array
+                      items:
+                        type: integer
+                        minimum: 0
+                        maximum: 63
+                action:
+                  type: string
+                  description: "Action when a packet matches; ETSI example values: DROP, FORWARD_DECAPSULATED, FORWARD_ENCAPSULATED, PASSTHROUGH, DUPLICATE_DECAPSULATED, DUPLICATE_ENCAPSULATED."
+                dstInterface:
+                  type: object
+                  description: "Destination interface (ETSI InterfaceDescriptor)."
+                  required: [interfaceType]
+                  properties:
+                    interfaceType:
+                      type: string
+                      description: "Type of interface, e.g. TUNNEL, MAC, IP."
+                    tunnelInfo:
+                      type: object
+                      properties:
+                        tunnelType: { type: string }
+                        tunnelDstAddress: { type: string }
+                        tunnelSrcAddress: { type: string }
+                    srcMACAddress: { type: string }
+                    dstMACAddress: { type: string }
+                    dstIPAddress: { type: string }
+                applicationRef:
+                  type: object
+                  description: "The EdgeApplication this TrafficRule is associated with."
+                  required: [name]
+                  properties:
+                    name: { type: string }
+                    namespace: { type: string }
+            status:
+              type: object
+              properties:
+                active:
+                  type: boolean
+                  description: "Set true by the operator when the rule is applied."
