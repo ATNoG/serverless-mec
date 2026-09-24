@@ -58,7 +58,7 @@ spec:
                 ipAddress:
                   type: string
                   description: "Address to which the domain resolves."
-                timeToLive:
+                ttl:
                   type: integer
                   minimum: 0
                   description: "Time to live of the DNS rule, in seconds (optional)."
