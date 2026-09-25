@@ -382,7 +382,7 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	if freezeViable {
 		templateAnnotations["qpoption.knative.dev/freezer-activate"] = "enable"
 		if d.FreezeIdleTimeout != nil {
-			templateAnnotations["qpoption.knative.dev/freezer-idle-timeout"] = strconv.FormatInt(int64(*d.FreezeIdleTimeout), 10)
+			templateAnnotations["qpoption.knative.dev/freezer-config-idle-timeout"] = strconv.FormatInt(int64(*d.FreezeIdleTimeout), 10)
 		}
 	}
 	if len(templateAnnotations) > 0 {
@@ -483,13 +483,13 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	if freezeViable {
 		updated.Spec.ConfigurationSpec.Template.Annotations["qpoption.knative.dev/freezer-activate"] = "enable"
 		if d.FreezeIdleTimeout != nil {
-			updated.Spec.ConfigurationSpec.Template.Annotations["qpoption.knative.dev/freezer-idle-timeout"] = strconv.FormatInt(int64(*d.FreezeIdleTimeout), 10)
+			updated.Spec.ConfigurationSpec.Template.Annotations["qpoption.knative.dev/freezer-config-idle-timeout"] = strconv.FormatInt(int64(*d.FreezeIdleTimeout), 10)
 		} else {
-			delete(updated.Spec.ConfigurationSpec.Template.Annotations, "qpoption.knative.dev/freezer-idle-timeout")
+			delete(updated.Spec.ConfigurationSpec.Template.Annotations, "qpoption.knative.dev/freezer-config-idle-timeout")
 		}
 	} else {
 		delete(updated.Spec.ConfigurationSpec.Template.Annotations, "qpoption.knative.dev/freezer-activate")
-		delete(updated.Spec.ConfigurationSpec.Template.Annotations, "qpoption.knative.dev/freezer-idle-timeout")
+		delete(updated.Spec.ConfigurationSpec.Template.Annotations, "qpoption.knative.dev/freezer-config-idle-timeout")
 	}
 	if len(updated.Spec.ConfigurationSpec.Template.Annotations) == 0 {
 		updated.Spec.ConfigurationSpec.Template.Annotations = nil
