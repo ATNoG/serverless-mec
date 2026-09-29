@@ -2489,15 +2489,16 @@ spec:
                   freezeEnabled:
                     description: |-
                       freezeEnabled enables the knative-freezer-plugin for this service.
-                      When true, the operator adds the qpoption.knative.dev/freezer-activate annotation
-                      and injects the HOST_IP environment variable via the Downward API.
+                      When true, and every node matched by the node selector reports checkpoint
+                      support, the operator adds the qpoption.knative.dev/freezer-activate annotation.
                     type: boolean
                   freezeIdleTimeout:
                     description: |-
                       freezeIdleTimeout is the number of seconds a container must be idle
                       before the freezer plugin checkpoints it. Propagated to the pod via
-                      the qpoption.knative.dev/freezer-idle-timeout annotation, which the
-                      plugin reads from the Downward API volume at /etc/podinfo/annotations.
+                      the qpoption.knative.dev/freezer-config-idle-timeout annotation, which the
+                      QPOption gate reads from the Downward API volume at /etc/podinfo/annotations
+                      and passes to the plugin as its idle-timeout config value.
                       Defaults to 30 if unset.
                     format: int32
                     minimum: 1

@@ -240,9 +240,8 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			svcName := fmt.Sprintf("%s-%s", app.Name, rep.Name)
 
 			repPod := basePodSpec
-			// Deep-copy the Containers slice so that appending env vars
-			// (e.g. HOST_IP) in reconcileKService does not mutate the
-			// shared backing array and cause duplicates.
+			// Deep-copy the Containers slice so that per-replica changes
+			// never mutate the base spec's shared backing array.
 			repContainers := make([]corev1.Container, len(basePodSpec.Containers))
 			for ci := range basePodSpec.Containers {
 				repContainers[ci] = *basePodSpec.Containers[ci].DeepCopy()
@@ -387,19 +386,6 @@ func (r *EdgeApplicationReconciler) reconcileKService(ctx context.Context, app *
 	}
 	if len(templateAnnotations) > 0 {
 		templateMeta.Annotations = templateAnnotations
-	}
-
-	// Inject HOST_IP env var via Downward API when freeze is enabled
-	if freezeViable {
-		hostIPEnv := corev1.EnvVar{
-			Name: "HOST_IP",
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{
-					FieldPath: "status.hostIP",
-				},
-			},
-		}
-		d.PodSpec.Containers[0].Env = append(d.PodSpec.Containers[0].Env, hostIPEnv)
 	}
 
 	desiredSvc := &servingv1.Service{
