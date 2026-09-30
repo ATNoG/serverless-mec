@@ -155,7 +155,10 @@ def plot_pipeline():
                 elif d.get('component') == 'retransmitter':
                     retransmitter[k] = d
 
-    keys = set(sniffer.keys()) & set(retransmitter.keys())
+    # Latest 20000 matched pairs (untrimmed, by capture time), then 2-sigma filter,
+    # matching the latest-N-then-filter selection of the other experiments.
+    keys = sorted(set(sniffer.keys()) & set(retransmitter.keys()),
+                  key=lambda k: sniffer[k].get('t_capture_unix_ns') or 0)[-20000:]
 
     sn_processing = []  # capture -> send_end
     network = []        # send_end -> recv
@@ -186,10 +189,10 @@ def plot_pipeline():
             if 0 < v < 10000:
                 e2e.append(v)
 
-    sn_f = sigma2_filter(sn_processing)[:20000]
-    net_f = sigma2_filter(network)[:20000]
-    rt_f = sigma2_filter(rt_processing)[:20000]
-    e2e_f = sigma2_filter(e2e)[:20000]
+    sn_f = sigma2_filter(sn_processing)
+    net_f = sigma2_filter(network)
+    rt_f = sigma2_filter(rt_processing)
+    e2e_f = sigma2_filter(e2e)
 
     fig, ax = plt.subplots(figsize=(COL_WIDTH, 2.4))
     data = [sn_f, net_f, rt_f, e2e_f]
