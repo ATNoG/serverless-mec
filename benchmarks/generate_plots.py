@@ -60,39 +60,40 @@ def se(data):
     return np.std(data, ddof=1) / np.sqrt(len(data))
 
 
-# ── 1. Checkpoint/Restore vs Cold Start Box Plot ──
+# ── 1. Checkpoint/Restore vs Cold-Start Box Plot ──
 # Shows VM and RSU results side by side, ordered worst to best
 def plot_freeze_vs_coldstart():
-    # VM data
-    vm_thaw, vm_cold = [], []
-    for f in paper_files(f'{BENCH_DIR}/freeze_vs_coldstart_logs/*.ndjson'):
-        with open(f) as fh:
-            for line in fh:
-                d = json.loads(line)
-                if d.get('mode') == 'criu_thaw' and 't_ttfb_s' in d:
-                    vm_thaw.append(d['t_ttfb_s'])
-                elif d.get('mode') == 'cold_start' and 't_ttfb_s' in d:
-                    vm_cold.append(d['t_ttfb_s'])
+    # Latest 2000 samples per scenario (untrimmed), then 2-sigma filter.
+    def collect(pattern):
+        thaw, cold = [], []
+        for f in sorted(glob.glob(pattern)):
+            with open(f) as fh:
+                for line in fh:
+                    d = json.loads(line)
+                    t = d.get('t_ttfb_s') or 0
+                    if t <= 0:
+                        continue
+                    ts = d.get('ts_before', '')
+                    if d.get('mode') == 'criu_thaw':
+                        thaw.append((ts, t))
+                    elif d.get('mode') == 'cold_start':
+                        cold.append((ts, t))
+        return thaw, cold
 
-    # RSU data
-    rsu_thaw, rsu_cold = [], []
-    for f in paper_files(f'{BENCH_DIR}/freeze_vs_coldstart_rsu_logs/*.ndjson'):
-        with open(f) as fh:
-            for line in fh:
-                d = json.loads(line)
-                if d.get('mode') == 'criu_thaw' and 't_ttfb_s' in d:
-                    rsu_thaw.append(d['t_ttfb_s'])
-                elif d.get('mode') == 'cold_start' and 't_ttfb_s' in d:
-                    rsu_cold.append(d['t_ttfb_s'])
+    def latest_filter(pairs, n=2000):
+        vals = [v for _, v in sorted(pairs)[-n:]]
+        return sigma2_filter(vals)
 
-    vm_cold_f = sigma2_filter(vm_cold)[:2000]
-    vm_thaw_f = sigma2_filter(vm_thaw)[:2000]
-    rsu_cold_f = sigma2_filter(rsu_cold)[:1000]
-    rsu_thaw_f = sigma2_filter(rsu_thaw)[:1000]
+    vm_thaw, vm_cold = collect(f'{BENCH_DIR}/freeze_vs_coldstart_logs/*.ndjson')
+    rsu_thaw, rsu_cold = collect(f'{BENCH_DIR}/freeze_vs_coldstart_rsu_logs/*.ndjson')
+    vm_cold_f = latest_filter(vm_cold)
+    vm_thaw_f = latest_filter(vm_thaw)
+    rsu_cold_f = latest_filter(rsu_cold)
+    rsu_thaw_f = latest_filter(rsu_thaw)
 
     # Grouped by platform: VM first, then RSU
     all_data = [vm_cold_f, vm_thaw_f, rsu_cold_f, rsu_thaw_f]
-    all_labels = ['VM\nCold Start', 'VM\nCheckpoint', 'RSU\nCold Start', 'RSU\nCheckpoint']
+    all_labels = ['VM\nCold-Start', 'VM\nCheckpoint', 'RSU\nCold-Start', 'RSU\nCheckpoint']
     all_colors = [palette[2], palette[4], palette[1], palette[0]]
 
     fig, ax = plt.subplots(figsize=(COL_WIDTH, 2.4))
@@ -105,9 +106,9 @@ def plot_freeze_vs_coldstart():
     for i, patch in enumerate(bp['boxes']):
         patch.set_facecolor(all_colors[i])
 
-    fs_fvc = ANNOT_SIZE * 1.1
+    fs_fvc = BASE_FONT
     # (anchor, xoff, yoff): 'top' anchors to max(d), 'bot' anchors to min(d)
-    annot_cfg = [('top', 13, 8), ('top', 0, 20), ('bot', 0, -10), ('bot', -15, -2)]
+    annot_cfg = [('top', 6, 8), ('top', 0, 7), ('bot', 0, -7), ('bot', -8, -4)]
     for i, d in enumerate(all_data):
         mean = np.mean(d)
         s = se(d)
@@ -122,7 +123,8 @@ def plot_freeze_vs_coldstart():
     ymax = max(max(d) for d in all_data)
     ax.set_ylim(top=ymax * 1.15)
     ax.set_ylabel('TTFB (s)', fontsize=fs_fvc)
-    ax.tick_params(axis='both', labelsize=fs_fvc)
+    ax.tick_params(axis='y', labelsize=BASE_FONT)
+    ax.tick_params(axis='x', labelsize=BASE_FONT * 0.94)
     ax.grid(axis='y', alpha=0.3)
     ax.text(0.01, 0.99, 'Labels report mean ± standard error',
             transform=ax.transAxes, fontsize=BASE_FONT * 0.85,
@@ -200,7 +202,7 @@ def plot_pipeline():
 
     # Annotate means: stages above worst result, E2E below best result
     # Sniffer and Network Transit need horizontal offsets to avoid overlap
-    stage_offsets = [(10, 8), (0, 18), (0, 8)]  # (x_offset, y_offset) for first 3 stages
+    stage_offsets = [(7, 8), (0, 16), (0, 8)]  # (x_offset, y_offset) for first 3 stages
     stage_ha = ['center', 'center', 'center']
     for i, d in enumerate(data, 1):
         mean = np.mean(d)
@@ -234,26 +236,20 @@ def plot_pipeline():
 def plot_handoff():
     files = sorted(glob.glob(f'{BENCH_DIR}/handoff_bench_logs/*.ndjson') +
                     glob.glob(f'{BENCH_DIR}/handoff_bench_logs/old_metrics/*.ndjson'))
-    # For RSU scenarios, only use recent samples (last 3 days) to match
-    # the current testbed configuration.
-    RSU_DATE_CUTOFF = '2026-06-26'
+    # Both VMs (worker1, worker2) are grouped as VM; rsu-a as RSU.
     scenarios = {}
     for f in files:
         with open(f) as fh:
             for line in fh:
                 d = json.loads(line)
-                if d.get('handoff_phase') == 'Ready' and 'handoff_wall_ms' in d:
-                    sc = d.get('scenario', 'unknown')
-                    if sc.startswith('rsu-'):
-                        ts = d.get('ts_before', '')
-                        if ts < RSU_DATE_CUTOFF:
-                            continue
-                    scenarios.setdefault(sc, []).append(d['handoff_wall_ms'])
+                if d.get('handoff_phase') == 'Ready' and (d.get('handoff_wall_ms') or 0) > 0:
+                    sc = d.get('scenario', 'unknown').replace('worker2-', 'worker1-')
+                    scenarios.setdefault(sc, []).append((d.get('ts_before', ''), d['handoff_wall_ms']))
 
     labels_map = {
-        'rsu-a-coldstart': 'RSU\nCold Start',
+        'rsu-a-coldstart': 'RSU\nCold-Start',
         'rsu-a-freeze': 'RSU\nCheckpoint',
-        'worker1-coldstart': 'VM\nCold Start',
+        'worker1-coldstart': 'VM\nCold-Start',
         'worker1-freeze': 'VM\nCheckpoint',
     }
     # Grouped by platform: VM first, then RSU
@@ -264,9 +260,8 @@ def plot_handoff():
     stats = []
     for sc in order:
         if sc in scenarios:
-            raw = scenarios[sc]
-            cap = 500 if sc.startswith('rsu-') else 1000
-            filt = [x / 1000 for x in sigma2_filter(raw)][:cap]
+            raw = [v for _, v in sorted(scenarios[sc])[-2000:]]
+            filt = [x / 1000 for x in sigma2_filter(raw)]
             data.append(filt)
             labels.append(labels_map.get(sc, sc))
             mean = np.mean(filt)
@@ -284,7 +279,7 @@ def plot_handoff():
     ax.tick_params(axis='y', labelsize=BASE_FONT)
     ax.tick_params(axis='x', labelsize=BASE_FONT * 0.94)
 
-    annot_off = [(0, 8), (0, 16), (0, 6), (0, 8)]
+    annot_off = [(0, 8), (0, 10), (0, 4), (-2, 8)]
     for i, (d, (mean, s)) in enumerate(zip(data, stats), 1):
         xoff, yoff = annot_off[i - 1]
         ax.annotate(f'{mean:.1f} $\\pm$ {s:.2f} s',
