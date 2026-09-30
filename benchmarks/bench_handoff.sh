@@ -1334,30 +1334,32 @@ run_scenario() {
 
 # ---- freeze scenario --------------------------------------------------------
 #
-# This scenario measures full handoff latency when the target pod is frozen
-# via CRIU. Like cold-start scenarios, each iteration does a complete handoff:
-#   event → retransmitter → handoff CR → operator detects frozen target →
-#   CRIU thaw → handoff Ready.
+# This scenario measures handoff latency when the target pod is frozen via
+# CRIU. Like cold-start scenarios, each iteration applies the handoff CR
+# directly with kubectl (the source pod is left running but unused):
+#   CR apply → operator detects frozen target → CRIU thaw → thawCompleted.
 #
-# The target KService is pre-created (primed) and its pod freezes after ~30s
-# idle. cleanupOnDelete=false keeps the KService alive across iterations.
-# Between iterations, we wait for the target to re-freeze.
+# The target KService is pre-created (primed) and its pod freezes after the
+# idle timeout (FREEZER_IDLE_TIMEOUT, default 5s). cleanupOnDelete=false
+# keeps the KService alive across iterations. Between iterations, we wait
+# for the target to re-freeze.
 #
 # triggerFilters are cleared so broker traffic doesn't wake frozen pods.
 #
 # Flow:
-#   1) Apply kyverno restartPolicy=Never (required for CRIU)
-#   2) Patch EA: freeze=true, triggerFilters=[], cleanupOnDelete=false
-#   3) Warmup: send event → handoff CR → target KService created → Ready
-#   4) Delete warmup CR, wait for target to freeze
-#   5) For each iteration:
+#   0) Start the load-check pod and wait for the target node to settle
+#   1) Recreate EA: freeze=true, triggerFilters=[], cleanupOnDelete=false,
+#      after applying the kyverno restartPolicy=Never policy (required for CRIU)
+#   2) Clean any target KService/pods left from previous runs
+#   3) Warmup: apply handoff CR → target KService created → wait for its pod
+#      to freeze (not for CR Ready, which a short idle timeout can pre-empt)
+#   4) For each iteration:
 #      a) Delete old handoff CR (KService survives)
-#      b) Scale source to zero
-#      c) Verify target is frozen
-#      d) Send event → retransmitter creates handoff CR
-#      e) Operator thaws frozen target → handoff Ready
-#      f) Measure time
-#      g) Wait for target to re-freeze (~30s)
+#      b) Wait for the target pod to re-freeze, recycling it if needed
+#      c) Apply the handoff CR with kubectl and start the timer
+#      d) Operator thaws the frozen target
+#      e) Stop the timer when thawCompleted appears in the CR status
+#         (polled every 0.5s)
 
 run_freeze_scenario() {
     local scenario_name="$1" iterations="$2" handoff_target="$3"
