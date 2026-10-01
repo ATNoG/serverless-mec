@@ -438,25 +438,32 @@ wait_for_handoff_thaw() {
     # the CR status timestamps. After CRIU restore, the container state in
     # kubelet still shows Terminated/Error so the KService never reaches Ready
     # and the CR stays at Applied. thawCompleted is the correct success signal.
+    #
+    # Watches the CR (kubectl get -w) instead of polling it, so completion is
+    # detected as soon as the operator writes it, without a polling interval
+    # added to the measured latency. Each watch event prints one line
+    # "<thawCompleted>|<phase>"; the watch is restarted if it ends early (e.g.
+    # the CR was not visible yet or the API connection dropped).
     local target="$1"
     local timeout="${2:-$HANDOFF_POLL_TIMEOUT}"
     local cr_name="${HANDOFF_CR_PREFIX}${target}"
     local deadline=$((SECONDS + timeout))
+    local fd pid rc thaw_ts phase
     while (( SECONDS < deadline )); do
-        local thaw_ts
-        thaw_ts=$(kubectl get edgeapplicationhandoff "$cr_name" -n "$NAMESPACE" \
-            -o jsonpath='{.status.timestamps.thawCompleted}' 2>/dev/null)
-        if [[ -n "$thaw_ts" ]]; then
-            return 0
-        fi
-        # Also check for failure
-        local phase
-        phase=$(kubectl get edgeapplicationhandoff "$cr_name" -n "$NAMESPACE" \
-            -o jsonpath='{.status.phase}' 2>/dev/null)
-        if [[ "$phase" == "Failed" ]]; then
-            return 1
-        fi
-        sleep 0.5
+        rc=2
+        exec {fd}< <(exec timeout "$((deadline - SECONDS))" \
+            kubectl get edgeapplicationhandoff "$cr_name" -n "$NAMESPACE" -w \
+            -o jsonpath='{.status.timestamps.thawCompleted}{"|"}{.status.phase}{"\n"}' 2>/dev/null)
+        pid=$!
+        while IFS='|' read -r -u "$fd" thaw_ts phase; do
+            if [[ -n "$thaw_ts" ]]; then rc=0; break; fi
+            if [[ "$phase" == "Failed" ]]; then rc=1; break; fi
+        done
+        kill "$pid" 2>/dev/null || true
+        exec {fd}<&-
+        (( rc != 2 )) && return "$rc"
+        # Watch ended without a result: brief pause before re-establishing it.
+        sleep 0.2
     done
     return 2  # timeout
 }
@@ -1359,7 +1366,7 @@ run_scenario() {
 #      c) Apply the handoff CR with kubectl and start the timer
 #      d) Operator thaws the frozen target
 #      e) Stop the timer when thawCompleted appears in the CR status
-#         (polled every 0.5s)
+#         (detected through a watch on the CR)
 
 run_freeze_scenario() {
     local scenario_name="$1" iterations="$2" handoff_target="$3"
