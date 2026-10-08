@@ -93,7 +93,7 @@ def plot_freeze_vs_coldstart():
 
     # Grouped by platform: VM first, then RSU
     all_data = [vm_cold_f, vm_thaw_f, rsu_cold_f, rsu_thaw_f]
-    all_labels = ['VM\nCold-Start', 'VM\nCheckpoint', 'RSU\nCold-Start', 'RSU\nCheckpoint']
+    all_labels = ['VM\nCold-Start', 'VM\nRestore', 'RSU\nCold-Start', 'RSU\nRestore']
     all_colors = [palette[2], palette[4], palette[1], palette[0]]
 
     fig, ax = plt.subplots(figsize=(COL_WIDTH, 2.4))
@@ -107,18 +107,17 @@ def plot_freeze_vs_coldstart():
         patch.set_facecolor(all_colors[i])
 
     fs_fvc = BASE_FONT
-    # (anchor, xoff, yoff): 'top' anchors to max(d), 'bot' anchors to min(d)
-    annot_cfg = [('top', 6, 8), ('top', 0, 7), ('bot', 0, -7), ('bot', -8, -4)]
+    # Labels centered on each box: 'top' above the highest point, 'bot' below
+    # the lowest point
+    annot_anchor = ['top', 'top', 'bot', 'top']
     for i, d in enumerate(all_data):
         mean = np.mean(d)
         s = se(d)
-        anchor, xoff, yoff = annot_cfg[i]
-        y_anchor = max(d) if anchor == 'top' else min(d)
-        va = 'bottom' if anchor == 'top' else 'top'
-        ax.annotate(f'{mean:.2f} $\\pm$ {s:.2f} s',
-                    xy=(i + 1, y_anchor),
-                    xytext=(xoff, yoff), textcoords='offset points',
-                    fontsize=fs_fvc, ha='center', va=va)
+        top = annot_anchor[i] == 'top'
+        ax.annotate(f'{mean:.2f}\n$\\pm$ {s:.2f} s',
+                    xy=(i + 1, max(d) if top else min(d)),
+                    xytext=(0, 3 if top else -3), textcoords='offset points',
+                    fontsize=fs_fvc, ha='center', va='bottom' if top else 'top')
 
     ymax = max(max(d) for d in all_data)
     ax.set_ylim(top=ymax * 1.15)
@@ -140,7 +139,7 @@ def plot_freeze_vs_coldstart():
 
 
 # ── 2. Pipeline Latency Stage Boxplot ──
-def plot_pipeline():
+def load_pipeline_pairs():
     files = sorted(glob.glob(f'{BENCH_DIR}/pipeline_logs/*.ndjson'))
     sniffer, retransmitter = {}, {}
     for f in files:
@@ -159,6 +158,11 @@ def plot_pipeline():
     # matching the latest-N-then-filter selection of the other experiments.
     keys = sorted(set(sniffer.keys()) & set(retransmitter.keys()),
                   key=lambda k: sniffer[k].get('t_capture_unix_ns') or 0)[-20000:]
+    return sniffer, retransmitter, keys
+
+
+def plot_pipeline():
+    sniffer, retransmitter, keys = load_pipeline_pairs()
 
     sn_processing = []  # capture -> send_end
     network = []        # send_end -> recv
@@ -203,24 +207,16 @@ def plot_pipeline():
     for i, patch in enumerate(bp['boxes']):
         patch.set_facecolor(palette[i])
 
-    # Annotate means: stages above worst result, E2E below best result
-    # Sniffer and Network Transit need horizontal offsets to avoid overlap
-    stage_offsets = [(7, 8), (0, 16), (0, 8)]  # (x_offset, y_offset) for first 3 stages
-    stage_ha = ['center', 'center', 'center']
+    # Labels centered on each box: stages above the highest point, E2E below
+    # the lowest point
     for i, d in enumerate(data, 1):
         mean = np.mean(d)
         s = se(d)
-        if i < len(data):  # stages: above worst result
-            xoff, yoff = stage_offsets[i - 1]
-            ax.annotate(f'{mean:.1f} $\\pm$ {s:.2f} ms',
-                        xy=(i, max(d)),
-                        xytext=(xoff, yoff), textcoords='offset points',
-                        fontsize=ANNOT_SIZE, ha=stage_ha[i - 1])
-        else:  # E2E: below best result
-            ax.annotate(f'{mean:.1f} $\\pm$ {s:.2f} ms',
-                        xy=(i, min(d)),
-                        xytext=(-10, -10), textcoords='offset points',
-                        fontsize=ANNOT_SIZE, ha='center', va='top')
+        top = i < len(data)
+        ax.annotate(f'{mean:.2f}\n$\\pm$ {s:.2f} ms',
+                    xy=(i, max(d) if top else min(d)),
+                    xytext=(0, 3 if top else -3), textcoords='offset points',
+                    fontsize=ANNOT_SIZE, ha='center', va='bottom' if top else 'top')
 
     ax.set_ylabel('Latency (ms)')
     ax.grid(axis='y', alpha=0.3)
@@ -232,6 +228,78 @@ def plot_pipeline():
 
     for label, d in zip(['Sniffer', 'Network', 'Retransmitter', 'E2E'], data):
         print(f'Pipeline {label}: n={len(d)}, mean={np.mean(d):.1f}ms, se={se(d):.2f}ms')
+
+
+# ── 2b. Pipeline Step Breakdown Box Plot ──
+# Splits the sniffer and retransmitter stages at the intermediate timestamps they
+# record. Network transit has no intermediate timestamps, so it is left to the
+# stage plot.
+def plot_pipeline_breakdown():
+    sniffer, retransmitter, keys = load_pipeline_pairs()
+    # (stage, step label, start record, start field, end record, end field)
+    steps = [
+        ('Sniffer', 'CE\nidentifier', 's', 't_capture_unix_ns', 's', 't_ce_built_unix_ns'),
+        ('Sniffer', 'CE\nbody', 's', 't_ce_built_unix_ns', 's', 't_enqueue_unix_ns'),
+        ('Sniffer', 'Sender\nhandoff', 's', 't_enqueue_unix_ns', 's', 't_send_start_unix_ns'),
+        ('Sniffer', 'HTTP\nrequest', 's', 't_send_start_unix_ns', 's', 't_send_end_unix_ns'),
+        ('Retransmitter', 'Body\nread', 'r', 't_recv_unix_ns', 'r', 't_body_unix_ns'),
+        ('Retransmitter', 'CE\nparse', 'r', 't_body_unix_ns', 'r', 't_parsed_unix_ns'),
+        ('Retransmitter', 'Frame\nextract', 'r', 't_parsed_unix_ns', 'r', 't_forward_start_unix_ns'),
+    ]
+    data = []
+    for _, _, ra, fa, rb, fb in steps:
+        vals = []
+        for k in keys:
+            recs = {'s': sniffer[k], 'r': retransmitter[k]}
+            a, b = recs[ra].get(fa), recs[rb].get(fb)
+            if a and b:
+                v = (b - a) / 1e6
+                if 0 < v < 10000:
+                    vals.append(v)
+        data.append(sigma2_filter(vals))
+
+    stages = []
+    for i, st in enumerate(s[0] for s in steps):
+        if not stages or stages[-1][0] != st:
+            stages.append([st, i, i])
+        stages[-1][2] = i
+    stage_color = {st: palette[j] for j, (st, _, _) in enumerate(stages)}
+
+    fig, ax = plt.subplots(figsize=(4.4, 2.1))
+    bp = ax.boxplot(data, tick_labels=[s[1] for s in steps], widths=0.55,
+                    patch_artist=True,
+                    boxprops=dict(linewidth=0.6),
+                    whiskerprops=dict(linewidth=0.6),
+                    capprops=dict(linewidth=0.6),
+                    medianprops=dict(color='black', linewidth=1.0),
+                    flierprops=dict(marker='.', markersize=1.5, alpha=0.15,
+                                    markeredgecolor='none', markerfacecolor='0.3'))
+    for patch, st in zip(bp['boxes'], (s[0] for s in steps)):
+        patch.set_facecolor(stage_color[st])
+    top = max(max(d) for d in data)
+    ax.set_ylim(0, top * 1.3)
+
+    for i, d in enumerate(data, 1):
+        ax.annotate(f'{np.mean(d):.2f}\n$\\pm$ {se(d):.2f} ms', xy=(i, max(d)), xytext=(0, 3),
+                    textcoords='offset points', fontsize=ANNOT_SIZE * 0.9,
+                    ha='center', va='bottom')
+    for st, a, b in stages:
+        ax.axvspan(a + 0.5, b + 1.5, color=stage_color[st], alpha=0.12, linewidth=0)
+        ax.text((a + b) / 2 + 1, top * 1.27, st, ha='center', va='top',
+                fontsize=BASE_FONT, fontweight='bold')
+
+    ax.set_ylabel('Latency (ms)')
+    ax.tick_params(axis='x', labelsize=BASE_FONT * 0.85)
+    ax.grid(axis='y', alpha=0.3)
+    ax.text(0.01, 0.66, 'Labels report mean ± standard error',
+            transform=ax.transAxes, fontsize=BASE_FONT * 0.85,
+            ha='left', va='top', style='italic', color='0.4')
+    fig.savefig(f'{FIGURES_DIR}/pipeline_breakdown.pdf')
+    plt.close()
+
+    for (st, lab, *_), d in zip(steps, data):
+        name = f"{st} / {lab}".replace('\n', ' ')
+        print(f'{name:40s}: n={len(d)}, mean={np.mean(d):.3f}ms, se={se(d):.4f}ms')
 
 
 # ── 3. Migration Box Plot ──
@@ -251,9 +319,9 @@ def plot_handoff():
 
     labels_map = {
         'rsu-a-coldstart': 'RSU\nCold-Start',
-        'rsu-a-freeze': 'RSU\nCheckpoint',
+        'rsu-a-freeze': 'RSU\nRestore',
         'worker1-coldstart': 'VM\nCold-Start',
-        'worker1-freeze': 'VM\nCheckpoint',
+        'worker1-freeze': 'VM\nRestore',
     }
     # Grouped by platform: VM first, then RSU
     order = ['worker1-coldstart', 'worker1-freeze', 'rsu-a-coldstart', 'rsu-a-freeze']
@@ -282,13 +350,16 @@ def plot_handoff():
     ax.tick_params(axis='y', labelsize=BASE_FONT)
     ax.tick_params(axis='x', labelsize=BASE_FONT * 0.94)
 
-    annot_off = [(0, 8), (0, 10), (0, 4), (-2, 8)]
-    for i, (d, (mean, s)) in enumerate(zip(data, stats), 1):
-        xoff, yoff = annot_off[i - 1]
-        ax.annotate(f'{mean:.1f} $\\pm$ {s:.2f} s',
-                    xy=(i, max(d)),
-                    xytext=(xoff, yoff), textcoords='offset points',
-                    fontsize=BASE_FONT, ha='center')
+    # Labels centered above each box, except RSU cold-start, which goes below
+    # its lower whisker to stay clear of the top of the plot.
+    below = {'rsu-a-coldstart'}
+    for i, (sc, d, (mean, s)) in enumerate(zip(order, data, stats), 1):
+        under = sc in below
+        ax.annotate(f'{mean:.2f}\n$\\pm$ {s:.2f} s',
+                    xy=(i, min(d) if under else max(d)),
+                    xytext=(0, -3 if under else 3), textcoords='offset points',
+                    fontsize=BASE_FONT, ha='center',
+                    va='top' if under else 'bottom')
 
     all_vals = [v for sublist in data for v in sublist]
     ax.set_ylim(top=max(all_vals) * 1.18)
@@ -304,5 +375,6 @@ def plot_handoff():
 if __name__ == '__main__':
     plot_freeze_vs_coldstart()
     plot_pipeline()
+    plot_pipeline_breakdown()
     plot_handoff()
     print('All plots generated.')
