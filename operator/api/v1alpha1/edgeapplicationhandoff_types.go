@@ -27,6 +27,13 @@ type EdgeApplicationHandoffSpec struct {
 	// If true, deleting this handoff object removes the target replica from EdgeApplication.spec.replicas.
 	// +optional
 	CleanupOnDelete bool `json:"cleanupOnDelete,omitempty"`
+
+	// If false (default), the source is terminated once the target is Ready:
+	// the replica named by sourceReplicaName is removed from EdgeApplication.spec.replicas,
+	// or, when sourceReplicaName is empty, the EdgeApplication's base service is disabled
+	// (EdgeApplication.spec.disableBaseService). If true, the source keeps running.
+	// +optional
+	KeepSource bool `json:"keepSource,omitempty"`
 }
 
 // HandoffTimestamps records microsecond-precision timestamps at each phase

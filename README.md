@@ -66,11 +66,12 @@ A Go operator (Kubebuilder) that reconciles `EdgeApplication` custom resources i
 - **Vendor-specific service block:** container image, env, resources, securityContext, volumes, nodeSelector, affinity, tolerations, hostNetwork
 - **`triggerFilters`:** list of CloudEvent attribute maps. Each entry creates a Knative Trigger pointing to the service
 - **`replicas`:** additional named instances on specific nodes
+- **`disableBaseService`:** skip (and remove) the base service built from the service block, deploying only `replicas`. Set by a handoff that terminates its source
 - **`zones`:** daemon mode. Each zone is a node label selector (e.g., `road-rsu: "true"`); the operator creates one KService per node matching the zone's `matchNodes`
 - **`freezeEnabled`:** enables CRIU checkpoint/restore idling for the service (via the knative-freezer-plugin). Freeze is only activated on nodes the freeze daemon has labeled checkpoint-capable; otherwise the service falls back to standard scale-to-zero cold starts
 - **`freezeIdleTimeout`:** seconds of inactivity before a container is checkpointed (plugin default: 30s), applied as the `qpoption.knative.dev/freezer-idle-timeout` annotation
 
-**EdgeApplicationHandoff CRD:** manages make-before-break migration of application instances between edge nodes. The target is deployed and checkpointed in place; on handoff the target is restored while the source is retained until the target is Ready.
+**EdgeApplicationHandoff CRD:** manages make-before-break migration of application instances between edge nodes. The target is deployed and checkpointed in place; on handoff the target is restored while the source is retained until the target is Ready. Once the target is Ready, the source is terminated by default: the replica named by `sourceReplicaName` is removed, or, if no source replica is named, the base service is disabled. Set `keepSource: true` to keep the source running.
 
 Example EdgeApplication:
 ```yaml

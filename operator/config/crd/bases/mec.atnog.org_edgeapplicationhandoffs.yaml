@@ -960,6 +960,13 @@ spec:
               edgeApplicationName:
                 minLength: 1
                 type: string
+              keepSource:
+                description: |-
+                  If false (default), the source is terminated once the target is Ready:
+                  the replica named by sourceReplicaName is removed from EdgeApplication.spec.replicas,
+                  or, when sourceReplicaName is empty, the EdgeApplication's base service is disabled
+                  (EdgeApplication.spec.disableBaseService). If true, the source keeps running.
+                type: boolean
               nodeSelector:
                 additionalProperties:
                   type: string

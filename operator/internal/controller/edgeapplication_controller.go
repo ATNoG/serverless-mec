@@ -220,20 +220,24 @@ func (r *EdgeApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			"zones", len(app.Spec.Zones))
 	}
 
-	// Normal mode: create base service + explicit replicas
+	// Normal mode: create base service (unless disabled) + explicit replicas.
+	// A disabled base service is left out of desired, so the orphan cleanup
+	// below removes its KService and Triggers.
 	if !daemonMode {
-		baseSvcName := app.Name
-		desired[baseSvcName] = desiredService{
-			Name:              baseSvcName,
-			Namespace:         app.Namespace,
-			PodSpec:           basePodSpec,
-			MinScale:          baseMinScale,
-			FreezeEnabled:     baseFreezeEnabled,
-			FreezeIdleTimeout: baseFreezeIdleTimeout,
-			CreateTrigger:     createTriggers,
-			TriggerNs:         brokerNamespace,
-			TriggerBroker:     brokerName,
-			TriggerFilters:    baseFilters,
+		if !app.Spec.DisableBaseService {
+			baseSvcName := app.Name
+			desired[baseSvcName] = desiredService{
+				Name:              baseSvcName,
+				Namespace:         app.Namespace,
+				PodSpec:           basePodSpec,
+				MinScale:          baseMinScale,
+				FreezeEnabled:     baseFreezeEnabled,
+				FreezeIdleTimeout: baseFreezeIdleTimeout,
+				CreateTrigger:     createTriggers,
+				TriggerNs:         brokerNamespace,
+				TriggerBroker:     brokerName,
+				TriggerFilters:    baseFilters,
+			}
 		}
 
 		for _, rep := range app.Spec.Replicas {

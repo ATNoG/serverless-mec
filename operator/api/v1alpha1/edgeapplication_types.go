@@ -245,6 +245,13 @@ type EdgeApplicationSpec struct {
 	// +optional
 	Replicas []KnativeServiceReplicaSpec `json:"replicas,omitempty"`
 
+	// disableBaseService stops the operator from creating the base Knative Service
+	// (and its Triggers) built from spec.service; only spec.replicas are deployed.
+	// An existing base service is removed. Set by an EdgeApplicationHandoff that
+	// terminates its source when no sourceReplicaName is given.
+	// +optional
+	DisableBaseService bool `json:"disableBaseService,omitempty"`
+
 	// zones creates one KService per node that matches each zone's matchNodes.
 	// If zones is set (non-empty), the controller runs in daemon mode
 	// (no base service + no replicas).

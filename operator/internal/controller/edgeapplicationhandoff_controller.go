@@ -24,8 +24,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,16 +37,16 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
-	servingv1 "knative.dev/serving/pkg/apis/serving/v1"
 	"knative.dev/pkg/apis"
+	servingv1 "knative.dev/serving/pkg/apis/serving/v1"
 
 	mecv1alpha1 "github.com/ATNoG/serverless-mec/operator/api/v1alpha1"
 )
 
 const (
-	handoffFinalizer      = "mec.atnog.org/handoff-finalizer"
-	defaultRSULabelKeyHO  = "mec.atnog.org/rsu"
-	queueProxyPort        = 8012
+	handoffFinalizer     = "mec.atnog.org/handoff-finalizer"
+	defaultRSULabelKeyHO = "mec.atnog.org/rsu"
+	queueProxyPort       = 8012
 )
 
 // EdgeApplicationHandoffReconciler reconciles EdgeApplicationHandoff objects.
@@ -225,7 +225,16 @@ func (r *EdgeApplicationHandoffReconciler) Reconcile(ctx context.Context, req ct
 		if ho.Status.Timestamps.Ready == nil {
 			ho.Status.Timestamps.Ready = microNow()
 		}
-		r.setReady(ctx, &ho, "Ready", "target replica is ready")
+		// Make-before-break: the source is only terminated after the target is Ready.
+		if !ho.Spec.KeepSource {
+			if err := r.terminateSource(ctx, &app, &ho); err != nil {
+				logger.Error(err, "terminateSource failed")
+				return ctrl.Result{}, err
+			}
+			r.setReady(ctx, &ho, "Ready", "target replica is ready; source terminated")
+			return ctrl.Result{}, nil
+		}
+		r.setReady(ctx, &ho, "Ready", "target replica is ready; source kept")
 		return ctrl.Result{}, nil
 	}
 
@@ -312,6 +321,46 @@ func upsertReplica(list *[]mecv1alpha1.KnativeServiceReplicaSpec, desired mecv1a
 
 	*list = append(*list, desired)
 	return true
+}
+
+// Terminate the source once the target is Ready: remove the source replica from
+// EdgeApplication.spec.replicas, or disable the base service when no source replica
+// is named. The EdgeApplication controller then deletes the source KService and
+// Triggers as orphans. Idempotent, so it is safe on every Ready reconcile.
+func (r *EdgeApplicationHandoffReconciler) terminateSource(
+	ctx context.Context,
+	app *mecv1alpha1.EdgeApplication,
+	ho *mecv1alpha1.EdgeApplicationHandoff,
+) error {
+	orig := app.DeepCopy()
+
+	if ho.Spec.SourceReplicaName == "" {
+		if app.Spec.DisableBaseService {
+			return nil
+		}
+		app.Spec.DisableBaseService = true
+		return r.Patch(ctx, app, client.MergeFrom(orig))
+	}
+
+	// Never remove the replica the handoff just made Ready.
+	if ho.Spec.SourceReplicaName == ho.Spec.TargetReplicaName {
+		return nil
+	}
+
+	out := make([]mecv1alpha1.KnativeServiceReplicaSpec, 0, len(app.Spec.Replicas))
+	removed := false
+	for _, rep := range app.Spec.Replicas {
+		if rep.Name == ho.Spec.SourceReplicaName {
+			removed = true
+			continue
+		}
+		out = append(out, rep)
+	}
+	if !removed {
+		return nil
+	}
+	app.Spec.Replicas = out
+	return r.Patch(ctx, app, client.MergeFrom(orig))
 }
 
 // Cleanup target replica from EdgeApplication.spec.replicas when handoff is deleted (optional)

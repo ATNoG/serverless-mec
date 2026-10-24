@@ -20,6 +20,8 @@ set -euo pipefail
 #
 #  The source pod (on RSU-B or worker-1) is unused — the handoff CR is
 #  applied directly via kubectl, bypassing the retransmission event path.
+#  The CRs set keepSource: true so the source is not terminated between
+#  iterations (the operator terminates it by default once the target is Ready).
 #
 #  Freeze scenarios use CRIU checkpoint/restore. After warmup, the target
 #  pod freezes via idle timeout. Each iteration thaws the frozen pod and
@@ -143,6 +145,7 @@ spec:
   edgeApplicationName: ${EA_NAME}
   targetReplicaName: ${target}
   cleanupOnDelete: ${cleanup}
+  keepSource: true
 EOF
     if [[ -n "$ns_json" ]]; then
         echo "  nodeSelector:"
