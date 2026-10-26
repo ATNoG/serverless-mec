@@ -84,3 +84,26 @@ func TestTerminateSource(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckThawResponse(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		body    string
+		wantErr bool
+	}{
+		{"restore failed in the plugin", 502, "freezer: restore failed: freezer daemon returned 500 for action resume\n", true},
+		{"application not accepting connections", 502, "dial tcp 127.0.0.1:8080: connect: connection refused\n", true},
+		{"application answered OK", 200, "", false},
+		{"application rejected the request", 405, "Method Not Allowed", false},
+		{"application error", 500, "Internal Server Error", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkThawResponse("pod", tc.status, []byte(tc.body))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("checkThawResponse(%d) error = %v, wantErr %v", tc.status, err, tc.wantErr)
+			}
+		})
+	}
+}

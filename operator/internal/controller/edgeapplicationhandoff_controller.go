@@ -19,8 +19,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -458,7 +460,12 @@ func (r *EdgeApplicationHandoffReconciler) ensureTargetThawed(ctx context.Contex
 		if err != nil {
 			return false, fmt.Errorf("thaw request to pod %s failed: %w", pod.Name, err)
 		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		resp.Body.Close()
+
+		if err := checkThawResponse(pod.Name, resp.StatusCode, body); err != nil {
+			return false, err
+		}
 
 		if ho.Status.Timestamps.ThawCompleted == nil {
 			ho.Status.Timestamps.ThawCompleted = microNow()
@@ -470,6 +477,22 @@ func (r *EdgeApplicationHandoffReconciler) ensureTargetThawed(ctx context.Contex
 
 	// No running pods found — nothing to thaw
 	return true, nil
+}
+
+// checkThawResponse decides whether the response to a thaw request shows the
+// target application serving. The queue-proxy answers 502 when it cannot hand
+// the request to the application: either the freezer plugin failed to restore
+// it (body starts with "freezer: restore failed") or the application is not
+// accepting connections. In both cases the target is not serving, so the
+// handoff must not proceed (and the source must not be terminated); the next
+// pass retries the restore. Any other status means the application itself
+// answered.
+func checkThawResponse(podName string, status int, body []byte) error {
+	if status == http.StatusBadGateway {
+		return fmt.Errorf("target pod %s is not serving after the thaw request: %s",
+			podName, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 // --- Pod lifecycle observation ---
