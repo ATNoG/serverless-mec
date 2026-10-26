@@ -246,17 +246,30 @@ def plot_pipeline_breakdown():
         ('Retransmitter', 'CE\nparse', 'r', 't_body_unix_ns', 'r', 't_parsed_unix_ns'),
         ('Retransmitter', 'Frame\nextract', 'r', 't_parsed_unix_ns', 'r', 't_forward_start_unix_ns'),
     ]
+    # Outliers are excluded per stage, as in the stage plot, and every step is
+    # computed over the samples its stage retains, so the step means of a stage
+    # add up to that stage's mean.
+    stage_span = {'Sniffer': ('s', 't_capture_unix_ns', 's', 't_send_end_unix_ns'),
+                  'Retransmitter': ('r', 't_recv_unix_ns', 'r', 't_forward_start_unix_ns')}
+
+    def span(k, ra, fa, rb, fb):
+        recs = {'s': sniffer[k], 'r': retransmitter[k]}
+        a, b = recs[ra].get(fa), recs[rb].get(fb)
+        if a and b:
+            v = (b - a) / 1e6
+            if 0 < v < 10000:
+                return v
+        return None
+
+    retained = {}
+    for st, sp in stage_span.items():
+        vals = {k: v for k in keys if (v := span(k, *sp)) is not None}
+        kept = set(sigma2_filter(list(vals.values())))
+        retained[st] = [k for k, v in vals.items() if v in kept]
+
     data = []
-    for _, _, ra, fa, rb, fb in steps:
-        vals = []
-        for k in keys:
-            recs = {'s': sniffer[k], 'r': retransmitter[k]}
-            a, b = recs[ra].get(fa), recs[rb].get(fb)
-            if a and b:
-                v = (b - a) / 1e6
-                if 0 < v < 10000:
-                    vals.append(v)
-        data.append(sigma2_filter(vals))
+    for st, _, ra, fa, rb, fb in steps:
+        data.append([v for k in retained[st] if (v := span(k, ra, fa, rb, fb)) is not None])
 
     stages = []
     for i, st in enumerate(s[0] for s in steps):
@@ -279,8 +292,14 @@ def plot_pipeline_breakdown():
     top = max(max(d) for d in data)
     ax.set_ylim(0, top * 1.3)
 
+    # The steps keep the outliers of their stage-retained samples, so a label
+    # placed at the maximum would float far above a small box. Small boxes are
+    # labeled above their upper whisker; a tall box is labeled above its
+    # outliers, which would otherwise run through the label.
     for i, d in enumerate(data, 1):
-        ax.annotate(f'{np.mean(d):.2f}\n$\\pm$ {se(d):.2f} ms', xy=(i, max(d)), xytext=(0, 3),
+        whisker_top = bp['caps'][2 * i - 1].get_ydata()[0]
+        y = max(d) if whisker_top > 0.25 * top else whisker_top
+        ax.annotate(f'{np.mean(d):.2f}\n$\\pm$ {se(d):.2f} ms', xy=(i, y), xytext=(0, 3),
                     textcoords='offset points', fontsize=ANNOT_SIZE * 0.9,
                     ha='center', va='bottom')
     for st, a, b in stages:
